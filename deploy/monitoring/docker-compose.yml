@@ -29,6 +29,21 @@ services:
       - /:/host:ro,rslave
       - /var/lib/xdp-sentinel/textfile:/textfile:ro
 
+  snmp-exporter:
+    # Polls the managed switch (ZyXEL GS1900-24HP) over SNMP v2c and exposes
+    # IF-MIB interface metrics on 127.0.0.1:9116/snmp. Host networking so it
+    # reaches the switch on the LAN (192.168.1.50) via br0. The read community
+    # lives in snmp-exporter/snmp.yml (gitignored); see snmp-exporter/README.md.
+    image: prom/snmp-exporter:v0.26.0
+    network_mode: host
+    read_only: true
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/snmp_exporter/snmp.yml
+      - --web.listen-address=127.0.0.1:9116
+    volumes:
+      - ./snmp-exporter/snmp.yml:/etc/snmp_exporter/snmp.yml:ro
+
   prometheus:
     image: prom/prometheus:v3.15.0
     network_mode: host

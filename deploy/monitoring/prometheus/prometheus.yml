@@ -17,3 +17,27 @@ scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: ["127.0.0.1:9091"]
+
+  # Managed switch via SNMP. Prometheus asks the snmp_exporter to poll each
+  # target; the relabeling turns the switch IP into ?target= and points the
+  # actual scrape at the exporter on 127.0.0.1:9116. SNMP is slow, so poll at
+  # 30s rather than the global 5s. Add more switches by listing their IPs.
+  - job_name: snmp-switch
+    scrape_interval: 30s
+    scrape_timeout: 20s
+    metrics_path: /snmp
+    params:
+      module: [if_mib]
+      auth: [switch_v2]
+    static_configs:
+      - targets:
+          - 192.168.1.50          # ZyXEL GS1900-24HP
+        labels:
+          device: gs1900-24hp
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9116   # the snmp_exporter, not the switch

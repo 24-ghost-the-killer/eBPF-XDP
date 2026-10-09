@@ -9,3 +9,7 @@ __pycache__/
 /dashboard/.next/
 /ml/datasets/*
 !/ml/datasets/README.md
+
+# Local secrets for the monitoring stack (templates with .example are tracked).
+/deploy/monitoring/.env
+/deploy/monitoring/snmp-exporter/snmp.yml

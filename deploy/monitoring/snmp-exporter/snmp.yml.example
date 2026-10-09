@@ -1,0 +1,160 @@
+# prometheus/snmp_exporter config for the ZyXEL GS1900-24HP switch.
+#
+# This is a TEMPLATE. Copy it to snmp.yml (which is gitignored) and put the
+# switch's real SNMP read community in the `community:` field below:
+#
+#   cp snmp.yml.example snmp.yml
+#   # edit snmp.yml -> auths.switch_v2.community = <your read community>
+#   chmod 600 snmp.yml
+#
+# snmp_exporter polls the switch over SNMP v2c and exposes the standard IF-MIB
+# interface counters on 127.0.0.1:9116/snmp. Prometheus scrapes it with
+# ?target=192.168.1.50&module=if_mib&auth=switch_v2 (see prometheus.yml).
+#
+# Config format: snmp_exporter >= v0.23 (top-level `auths` + `modules`).
+
+auths:
+  # SNMP v2c with a read-only community string. Matches the community you set
+  # on the switch under Management > SNMP (see snmp-exporter/README.md).
+  switch_v2:
+    community: REPLACE_WITH_SWITCH_SNMP_COMMUNITY
+    version: 2
+
+modules:
+  # Standard IF-MIB: per-interface octet/packet counters, errors, discards,
+  # link status and speed. ifName/ifDescr are attached as labels via lookups
+  # so graphs read "GigabitEthernet0/3" instead of a bare ifIndex.
+  if_mib:
+    walk:
+      - 1.3.6.1.2.1.2.2        # ifTable
+      - 1.3.6.1.2.1.31.1.1     # ifXTable (HC counters, ifName, ifAlias)
+    get:
+      - 1.3.6.1.2.1.1.3.0      # sysUpTime
+    metrics:
+      - name: sysUpTime
+        oid: 1.3.6.1.2.1.1.3
+        type: gauge
+        help: Time since the switch management plane last re-initialized, in 1/100 s - 1.3.6.1.2.1.1.3
+
+      # --- label sources (strings), consumed by the lookups below ---
+      - name: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+        help: Interface description - 1.3.6.1.2.1.2.2.1.2
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+      - name: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+        help: Interface short name - 1.3.6.1.2.1.31.1.1.1.1
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+      - name: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+        help: Interface alias / admin-assigned description - 1.3.6.1.2.1.31.1.1.1.18
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+
+      # --- status / speed ---
+      - name: ifAdminStatus
+        oid: 1.3.6.1.2.1.2.2.1.7
+        type: gauge
+        help: Desired interface state (1=up 2=down 3=testing) - 1.3.6.1.2.1.2.2.1.7
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: &iflookups
+          - labels: [ifIndex]
+            labelname: ifName
+          - labels: [ifIndex]
+            labelname: ifDescr
+          - labels: [ifIndex]
+            labelname: ifAlias
+      - name: ifOperStatus
+        oid: 1.3.6.1.2.1.2.2.1.8
+        type: gauge
+        help: Current interface state (1=up 2=down 3=testing ...) - 1.3.6.1.2.1.2.2.1.8
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifHighSpeed
+        oid: 1.3.6.1.2.1.31.1.1.1.15
+        type: gauge
+        help: Interface speed in Mbps - 1.3.6.1.2.1.31.1.1.1.15
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+
+      # --- 64-bit throughput counters ---
+      - name: ifHCInOctets
+        oid: 1.3.6.1.2.1.31.1.1.1.6
+        type: counter
+        help: Octets received, 64-bit - 1.3.6.1.2.1.31.1.1.1.6
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifHCOutOctets
+        oid: 1.3.6.1.2.1.31.1.1.1.10
+        type: counter
+        help: Octets transmitted, 64-bit - 1.3.6.1.2.1.31.1.1.1.10
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifHCInUcastPkts
+        oid: 1.3.6.1.2.1.31.1.1.1.7
+        type: counter
+        help: Unicast packets received, 64-bit - 1.3.6.1.2.1.31.1.1.1.7
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifHCOutUcastPkts
+        oid: 1.3.6.1.2.1.31.1.1.1.11
+        type: counter
+        help: Unicast packets transmitted, 64-bit - 1.3.6.1.2.1.31.1.1.1.11
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+
+      # --- errors and discards ---
+      - name: ifInErrors
+        oid: 1.3.6.1.2.1.2.2.1.14
+        type: counter
+        help: Inbound packets with errors - 1.3.6.1.2.1.2.2.1.14
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifOutErrors
+        oid: 1.3.6.1.2.1.2.2.1.20
+        type: counter
+        help: Outbound packets that could not be sent due to errors - 1.3.6.1.2.1.2.2.1.20
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifInDiscards
+        oid: 1.3.6.1.2.1.2.2.1.13
+        type: counter
+        help: Inbound packets discarded (no error) - 1.3.6.1.2.1.2.2.1.13
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
+      - name: ifOutDiscards
+        oid: 1.3.6.1.2.1.2.2.1.19
+        type: counter
+        help: Outbound packets discarded (no error) - 1.3.6.1.2.1.2.2.1.19
+        indexes:
+          - labelname: ifIndex
+            type: gauge
+        lookups: *iflookups
