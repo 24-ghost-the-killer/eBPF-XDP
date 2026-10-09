@@ -1,0 +1,11 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus (xdp-sentinel)
+    uid: xs-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9091
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

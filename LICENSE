@@ -1,0 +1,12 @@
+xdp-sentinel is licensed per directory:
+
+  ebpf/, tests/common/, tests/parser/, tests/bpf/, benchmarks/xdp/*.c
+      GPL-2.0-only OR BSD-2-Clause (SPDX: GPL-2.0-only OR BSD-2-Clause)
+      The BPF program must be GPL-compatible to use GPL-only kernel helpers;
+      the BSD option keeps the ABI headers usable from non-GPL code.
+
+  everything else (userspace/, ml/, dashboard/, scripts/, docs/, ...)
+      Apache License 2.0 (SPDX: Apache-2.0)
+
+Full texts: LICENSES/GPL-2.0-only.txt, LICENSES/BSD-2-Clause.txt,
+LICENSES/Apache-2.0.txt. Each source file carries an SPDX-License-Identifier.

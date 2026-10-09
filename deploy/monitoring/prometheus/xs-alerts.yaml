@@ -1,0 +1,70 @@
+# xdp-sentinel alerting rules (Phase 7). Load from prometheus.yml:
+#   rule_files: [ "xs-alerts.yaml" ]
+# Metrics are the xs_* families exported by sentinel-agent /metrics.
+groups:
+  - name: xdp-sentinel.dataplane
+    rules:
+      - alert: XdpSentinelAgentDown
+        expr: up{job="sentinel-agent"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "sentinel-agent on {{ $labels.instance }} is not scrapeable"
+          description: "The dataplane may be unprotected or the agent has crashed."
+
+      - alert: XdpSentinelNotAttached
+        expr: xs_attached == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "XDP program not attached on {{ $labels.iface }}"
+
+      - alert: XdpSentinelGenericMode
+        expr: xs_attach_mode{mode="generic"} == 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "XDP running in GENERIC mode on {{ $labels.iface }}"
+          description: "Generic XDP runs after skb allocation and cannot protect the CPU under a flood; move to a native-XDP NIC."
+
+  - name: xdp-sentinel.traffic
+    rules:
+      - alert: XdpSentinelHighDropRate
+        expr: |
+          sum by (iface) (rate(xs_verdict_packets_total{verdict="drop"}[1m]))
+            / clamp_min(sum by (iface) (rate(xs_rx_packets_total[1m])), 1) > 0.5
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.iface }} dropping >50% of packets (possible attack or misconfig)"
+
+      - alert: XdpSentinelRateLimiterActive
+        expr: rate(xs_policy_event_packets_total{event="rate_limited"}[1m]) > 1000
+        for: 1m
+        labels: { severity: info }
+        annotations:
+          summary: "Per-source rate limiter shedding >1000 pps on {{ $labels.iface }}"
+
+      - alert: XdpSentinelMalformedFlood
+        expr: rate(xs_parse_outcome_packets_total{outcome="malformed"}[1m]) > 5000
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Malformed-packet flood on {{ $labels.iface }}"
+
+  - name: xdp-sentinel.telemetry
+    rules:
+      - alert: XdpSentinelSampleRingbufDrops
+        expr: rate(xs_sample_packets_total{event="dropped"}[5m]) > 0
+        for: 5m
+        labels: { severity: info }
+        annotations:
+          summary: "Sample ring buffer overflowing on {{ $labels.iface }}"
+          description: "The collector is falling behind; feature coverage is reduced."
+
+      - alert: XdpSentinelClickHouseDrops
+        expr: rate(xs_clickhouse_dropped_rows_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "ClickHouse write buffer overflowing (history being lost)"

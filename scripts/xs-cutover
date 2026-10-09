@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# xs-cutover - move this box between plain-LAN-client mode and VLAN-bridge
+# mode (router on VLAN 10, LAN switch on VLAN 20, both tagged on one trunk
+# NIC; see docs/deployment.md). Every switch is verified by pinging the
+# gateway and rolled back automatically if that fails.
+#
+#   xs-cutover             bridge mode now (safe to run over SSH: it runs
+#                          detached and rolls back if the network breaks)
+#   xs-cutover --auto      bridge mode only if the gateway is unreachable AND
+#                          tagged frames arrive on the trunk, i.e. the switch
+#                          has just been reconfigured (run by xs-cutover-auto.timer)
+#   xs-cutover --rollback  back to plain mode
+#
+# Site settings: /etc/xdp-sentinel/cutover.env (XS_TRUNK, XS_GW).
+set -euo pipefail
+XS_TRUNK=enp1s0
+XS_GW=192.168.1.1
+# shellcheck disable=SC1091
+[ -r /etc/xdp-sentinel/cutover.env ] && . /etc/xdp-sentinel/cutover.env
+
+ETC=/etc/xdp-sentinel
+STAGED=$ETC/staged
+NP_PLAIN=/etc/netplan/00-installer-config.yaml
+NP_BRIDGE=/etc/netplan/01-xdp-vlan-bridge.yaml
+DONE=$ETC/.cutover-done
+
+log() { echo "xs-cutover: $*"; logger -t xs-cutover -- "$*" 2>/dev/null || true; }
+
+# Detach from the terminal so a dropped SSH session cannot kill us halfway.
+if [ -z "${INVOCATION_ID:-}" ] && [ "${1:-}" != --auto ]; then
+	[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+	log "running as a transient systemd unit; follow with: journalctl -fu xs-cutover-run"
+	exec systemd-run --unit=xs-cutover-run --collect --quiet "$(readlink -f "$0")" "$@"
+fi
+
+exec 9>/run/xs-cutover.lock
+flock -n 9 || { log "another xs-cutover is running"; exit 0; }
+
+gw_ok() {
+	for _ in 1 2 3 4 5; do
+		ping -c1 -W2 "$XS_GW" >/dev/null 2>&1 && return 0
+		sleep 2
+	done
+	return 1
+}
+
+agent_ifaces() { awk -F'"' '/^[[:space:]]*name[[:space:]]*=/{print $2}' "$ETC/config.toml"; }
+
+# use_agent_config <file> <xdp_iface>: re-point the agent at a new interface set.
+use_agent_config() {
+	systemctl stop sentinel-agent
+	for i in $(agent_ifaces); do sentinelctl detach -i "$i" >/dev/null 2>&1 || true; done
+	install -m 0644 "$1" "$ETC/config.toml"
+	systemctl start sentinel-agent
+	systemctl restart xs-baseline
+	sed -i "s/^export XDP_IFACE=[^ ]*/export XDP_IFACE=$2/" /etc/profile.d/xdp-sentinel.sh
+	# Grafana is bound to the host IP, which moved between interfaces.
+	docker compose --project-directory /opt/xdp-sentinel/monitoring restart grafana >/dev/null 2>&1 || true
+}
+
+net_plain() {
+	rm -f "$NP_BRIDGE"
+	[ -e "$STAGED/00-installer-config.yaml.orig" ] && mv "$STAGED/00-installer-config.yaml.orig" "$NP_PLAIN"
+	for d in br0 vlan10 vlan20; do ip link del "$d" 2>/dev/null || true; done
+	netplan apply
+	sleep 3
+}
+
+net_bridge() {
+	[ -e "$NP_PLAIN" ] && mv "$NP_PLAIN" "$STAGED/00-installer-config.yaml.orig"
+	install -m 0600 "$STAGED/01-xdp-vlan-bridge.yaml" "$NP_BRIDGE"
+	netplan apply
+	sleep 3
+}
+
+to_bridge() {
+	log "switching $XS_TRUNK to VLAN bridge mode"
+	net_bridge
+	if ! gw_ok; then
+		log "gateway $XS_GW unreachable through br0: rolling back to plain mode"
+		net_plain
+		gw_ok && log "rolled back, network OK" || log "rolled back, but gateway still unreachable"
+		exit 1
+	fi
+	use_agent_config "$STAGED/config.toml" vlan10
+	touch "$DONE"
+	systemctl disable --now xs-cutover-auto.timer >/dev/null 2>&1 || true
+	log "bridge mode active: XDP on vlan10 (from internet) and vlan20 (from LAN)"
+}
+
+to_plain() {
+	log "switching back to plain mode on $XS_TRUNK"
+	net_plain
+	use_agent_config "$STAGED/config.plain.toml" "$XS_TRUNK"
+	rm -f "$DONE"
+	log "plain mode active"
+}
+
+case "${1:-}" in
+"")
+	[ -e "$DONE" ] && { log "already in bridge mode"; exit 0; }
+	to_bridge
+	;;
+--auto)
+	[ -e "$DONE" ] && exit 0
+	gw_ok && exit 0
+	[ -e "$NP_BRIDGE" ] && exit 0
+	# Inbound tagged frames mean the switch port is now a VLAN trunk (-Q in:
+	# our own tagged frames during a manual cutover must not count).
+	timeout 15 tcpdump -nn -Q in -i "$XS_TRUNK" -c 1 vlan >/dev/null 2>&1 || exit 0
+	log "gateway lost and VLAN-tagged frames seen on $XS_TRUNK: switch reconfigured"
+	to_bridge
+	;;
+--rollback) to_plain ;;
+*)
+	echo "usage: xs-cutover [--auto|--rollback]" >&2
+	exit 2
+	;;
+esac

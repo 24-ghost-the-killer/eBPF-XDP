@@ -1,0 +1,14 @@
+# Re-applies /etc/xdp-sentinel/allowlist.conf to the agent's interfaces on
+# boot (pinned allowlist maps do not survive a reboot). See scripts/xs-baseline.
+[Unit]
+Description=xdp-sentinel operator allowlist
+After=sentinel-agent.service docker.service
+Wants=sentinel-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/xs-baseline
+
+[Install]
+WantedBy=multi-user.target

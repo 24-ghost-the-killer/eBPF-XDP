@@ -1,0 +1,15 @@
+# xdp-sentinel agent configuration.
+# Installed to /etc/xdp-sentinel/config.toml.
+
+# Prometheus /metrics listen address. Keep on localhost; scrape via a tunnel
+# or a co-located Prometheus. Also serves /healthz and /readyz.
+metrics_addr = "127.0.0.1:9464"
+
+pin_root = "/sys/fs/bpf/xdp-sentinel"
+bpf_obj  = "/usr/lib/xdp-sentinel/xdp_main.bpf.o"
+
+# One block per interface the agent manages.
+[[interface]]
+name   = "wlo1"
+mode   = "generic"   # this box's Wi-Fi NIC has no native XDP; "native" on a server NIC
+attach = true        # attach on start (adopts an existing attachment); false = metrics only

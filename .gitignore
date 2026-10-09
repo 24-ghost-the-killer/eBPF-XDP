@@ -1,0 +1,11 @@
+/target/
+/build/
+/ebpf/build/
+# generated from the build host's kernel BTF (make -C ebpf vmlinux)
+/ebpf/vmlinux.h
+__pycache__/
+*.pyc
+/dashboard/node_modules/
+/dashboard/.next/
+/ml/datasets/*
+!/ml/datasets/README.md

@@ -1,0 +1,124 @@
+# xdp-sentinel feature schema v1
+# schema_hash: a0c637eb8eb2826a36f12a9d083268bbd98ba59593eed67030806e51fb53217e
+version: v1
+features:
+  - name: packets
+    provenance: C
+    definition: "packets in window"
+  - name: bytes
+    provenance: C
+    definition: "L2 bytes in window"
+  - name: pps
+    provenance: C
+    definition: "packets / dt"
+  - name: bps
+    provenance: C
+    definition: "8 * bytes / dt"
+  - name: drop_pps
+    provenance: C
+    definition: "dropped packets / dt"
+  - name: pps_baseline_ratio
+    provenance: D
+    definition: "pps / baseline_pps(scope, hour_of_week)"
+  - name: tcp_syn_rate
+    provenance: C
+    definition: "SYN without ACK per s"
+  - name: tcp_synack_rate
+    provenance: C
+    definition: "SYN+ACK per s"
+  - name: tcp_ack_rate
+    provenance: C
+    definition: "pure ACK per s"
+  - name: tcp_rst_rate
+    provenance: C
+    definition: "RST per s"
+  - name: tcp_fin_rate
+    provenance: C
+    definition: "FIN per s"
+  - name: tcp_syn_ack_ratio
+    provenance: D
+    definition: "syn / (ack + 1)"
+  - name: tcp_syn_share
+    provenance: D
+    definition: "syn / (tcp + 1)"
+  - name: tcp_bad_flags_rate
+    provenance: C
+    definition: "NULL/XMAS/SYN+FIN/... per s"
+  - name: udp_pps
+    provenance: C
+    definition: "UDP packets per s"
+  - name: udp_bps
+    provenance: C
+    definition: "UDP bits per s"
+  - name: udp_dport_top1_share
+    provenance: P
+    definition: "share to the most-hit destination port"
+  - name: udp_len_mismatch_rate
+    provenance: C
+    definition: "UDP length mismatches per s"
+  - name: icmp_pps
+    provenance: C
+    definition: "ICMP+ICMPv6 per s"
+  - name: icmp_share
+    provenance: C
+    definition: "icmp / packets"
+  - name: frag_rate
+    provenance: C
+    definition: "fragments per s"
+  - name: frag_share
+    provenance: C
+    definition: "fragments / packets"
+  - name: unique_src
+    provenance: H
+    definition: "distinct source addresses (HLL)"
+  - name: unique_flows
+    provenance: H
+    definition: "distinct 5-tuples (HLL)"
+  - name: new_src
+    provenance: H
+    definition: "sources not seen in the previous 10 s"
+  - name: flows_per_src
+    provenance: D
+    definition: "unique_flows / unique_src"
+  - name: top1_src_share
+    provenance: C
+    definition: "share from the top source (heavy hitters)"
+  - name: top10_src_share
+    provenance: C
+    definition: "share from the top 10 sources"
+  - name: dport_entropy
+    provenance: P
+    definition: "normalised entropy of the dport histogram"
+  - name: mean_pkt_size
+    provenance: C
+    definition: "bytes / packets"
+  - name: share_tcp
+    provenance: C
+    definition: "tcp / packets"
+  - name: share_udp
+    provenance: C
+    definition: "udp / packets"
+  - name: share_icmp
+    provenance: C
+    definition: "icmp / packets"
+  - name: share_other
+    provenance: C
+    definition: "other L4 / packets"
+  - name: malformed_rate
+    provenance: C
+    definition: "malformed packets per s"
+  - name: unsupported_rate
+    provenance: C
+    definition: "unsupported packets per s"
+  - name: pps_accel
+    provenance: D
+    definition: "(pps_t - pps_{t-1}) / dt"
+  - name: pps_zscore
+    provenance: D
+    definition: "(pps - median) / (1.4826 * MAD)"
+  - name: burstiness_cv
+    provenance: C
+    definition: "CV of the 10 x 100 ms sub-window counts"
+  - name: fano_factor
+    provenance: C
+    definition: "variance / mean of sub-window counts"

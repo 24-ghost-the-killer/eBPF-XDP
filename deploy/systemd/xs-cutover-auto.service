@@ -1,0 +1,8 @@
+# Switches to VLAN-bridge mode once the switch trunk appears (scripts/xs-cutover).
+[Unit]
+Description=xdp-sentinel automatic VLAN bridge cutover check
+ConditionPathExists=!/etc/xdp-sentinel/.cutover-done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xs-cutover --auto

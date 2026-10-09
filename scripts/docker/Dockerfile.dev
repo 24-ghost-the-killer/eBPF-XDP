@@ -1,0 +1,24 @@
+# Reproducible build/test toolchain for xdp-sentinel.
+#
+# The container does NOT emulate a NIC. It is used to:
+#   * compile the BPF object (clang/LLVM) and the Rust userspace
+#   * run the eBPF verifier against the host (VM) kernel
+#   * run BPF_PROG_TEST_RUN based dataplane tests
+#   * run veth-based integration tests
+# BPF loading requires `docker run --privileged` (CAP_BPF, CAP_NET_ADMIN,
+# CAP_PERFMON, CAP_SYS_ADMIN for bpffs). Line-rate benchmarks must be run on
+# real hardware, never in this container.
+FROM rust:1-trixie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang llvm lld libclang-rt-dev \
+        libbpf-dev bpftool \
+        libelf-dev zlib1g-dev libzstd-dev pkg-config \
+        make gcc libc6-dev \
+        iproute2 ethtool iputils-ping procps \
+        python3 python3-pytest \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add clippy rustfmt
+
+WORKDIR /src

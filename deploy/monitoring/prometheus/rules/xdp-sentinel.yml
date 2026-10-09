@@ -1,0 +1,90 @@
+# Phase 1 recording and alert rules (subset of docs/observability.md that the
+# Phase 1 counters support). No Alertmanager is deployed: firing alerts are
+# visible in Prometheus (/alerts) and in Grafana's alerting view.
+groups:
+  - name: xs-recording
+    rules:
+      - record: xs:rx_pps:rate1m
+        expr: sum by (iface) (rate(xs_rx_packets_total[1m]))
+      - record: xs:rx_bps:rate1m
+        expr: 8 * sum by (iface) (rate(xs_rx_bytes_total[1m]))
+      - record: xs:drop_pps:rate1m
+        expr: sum by (iface) (rate(xs_verdict_packets_total{verdict="drop"}[1m]))
+      - record: xs:syn_pps:rate1m
+        expr: sum by (iface) (rate(xs_tcp_flags_packets_total{class="syn"}[1m]))
+      - record: xs:ack_pps:rate1m
+        expr: sum by (iface) (rate(xs_tcp_flags_packets_total{class="ack"}[1m]))
+      - record: xs:udp_pps:rate1m
+        expr: sum by (iface) (rate(xs_l4_packets_total{proto="udp"}[1m]))
+      - record: xs:malformed_pps:rate1m
+        expr: sum by (iface) (rate(xs_parse_outcome_packets_total{class="malformed"}[1m]))
+
+  - name: xs-dataplane
+    rules:
+      - alert: XdpDataplaneNotAttached
+        expr: xs_dataplane_attached == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "xdp-sentinel is not attached on {{ $labels.iface }}"
+          description: "The pinned xdp-sentinel program is not the program attached to the interface (or none is)."
+      - alert: XdpMetricsStale
+        expr: time() - node_textfile_mtime_seconds{file=~".*xdp-sentinel.*"} > 60
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "xdp-sentinel metrics file {{ $labels.file }} not updated for > 60 s"
+      - alert: XdpMetricsMissing
+        expr: absent(xs_rx_packets_total)
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "No xdp-sentinel counters in Prometheus (exporter not running?)"
+
+  - name: xs-traffic
+    rules:
+      - alert: XdpTrafficSpike
+        expr: xs:rx_pps:rate1m > 3 * avg_over_time(xs:rx_pps:rate1m[1h] offset 1d) and xs:rx_pps:rate1m > 100000
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Traffic on {{ $labels.iface }} is > 3x the same hour yesterday"
+      - alert: XdpSynFlood
+        expr: xs:syn_pps:rate1m > 50000 and xs:syn_pps:rate1m > 10 * (xs:ack_pps:rate1m + 1)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "SYN flood pattern on {{ $labels.iface }}: {{ $value | humanize }} SYN/s"
+      - alert: XdpUdpFlood
+        expr: xs:udp_pps:rate1m > 200000 and xs:udp_pps:rate1m > 5 * avg_over_time(xs:udp_pps:rate1m[1h] offset 1h)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "UDP flood pattern on {{ $labels.iface }}: {{ $value | humanize }} pps"
+      - alert: XdpMalformedTraffic
+        expr: xs:malformed_pps:rate1m > 1000 and xs:malformed_pps:rate1m > 0.05 * xs:rx_pps:rate1m
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "> 5% malformed frames on {{ $labels.iface }} ({{ $value | humanize }} pps)"
+      - alert: XdpDropping
+        expr: xs:drop_pps:rate1m > 0
+        for: 1m
+        labels: {severity: info}
+        annotations:
+          summary: "Dataplane is dropping traffic on {{ $labels.iface }} ({{ $value | humanize }} pps)"
+
+  - name: xs-host
+    rules:
+      - alert: RxCpuSaturation
+        expr: max by (instance) (rate(node_cpu_seconds_total{mode="softirq"}[1m])) > 0.9
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "A CPU spends > 90% in softirq (packet processing); packets will be lost before XDP"
+      - alert: HostDroppingPackets
+        expr: sum by (device) (rate(node_network_receive_drop_total{device!~"lo|docker.*|veth.*|br-.*"}[1m])) > 1000
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.device }} is dropping {{ $value | humanize }} received packets/s"

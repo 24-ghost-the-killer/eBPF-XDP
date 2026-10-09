@@ -1,0 +1,31 @@
+# xdp-sentinel agent (Phase 4): owns the dataplane lifecycle and serves the
+# native Prometheus /metrics endpoint. Replaces xs-textfile-exporter.service.
+[Unit]
+Description=xdp-sentinel agent (dataplane + metrics)
+After=network-online.target sys-fs-bpf.mount
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentinel-agent --config /etc/xdp-sentinel/config.toml
+Restart=always
+RestartSec=2
+# Runs as root for access to the bpffs pins (mode 700), but with the
+# capability set bounded to what BPF/XDP need and standard hardening on.
+# Folding in a dedicated DynamicUser (with group-readable pins) is a follow-on.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+LimitMEMLOCK=infinity
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/bpf
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+# The dataplane must survive the agent: never detach on stop.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

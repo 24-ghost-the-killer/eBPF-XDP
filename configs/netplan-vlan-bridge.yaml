@@ -1,0 +1,28 @@
+# xdp-sentinel inline VLAN-bridge netplan (router-on-a-stick / hairpin).
+#
+# Puts the box in-path with a SINGLE trunk NIC: the router sits on VLAN 10,
+# the LAN switch on VLAN 20, both tagged to this box over one cable. The box
+# bridges vlan10 <-> vlan20, so every WAN<->LAN packet traverses XDP first.
+# See docs/deployment.md and docs/architecture.md (deployment topologies).
+#
+# Deploy: copy to /etc/netplan/01-xdp-vlan-bridge.yaml (replacing the plain
+# DHCP/static config), `netplan apply`, then attach XDP to vlan10 and vlan20.
+# The scripts/xs-cutover helper does this atomically with auto-rollback.
+#
+# Adjust `enp1s0`, the IP/route/DNS and the VLAN IDs for your site. Keeping the
+# box's existing management IP on br0 means SSH/Grafana stay at one address.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    enp1s0: {}                         # the trunk NIC (no IP of its own)
+  vlans:
+    vlan10: { id: 10, link: enp1s0 }   # router side: traffic FROM the internet
+    vlan20: { id: 20, link: enp1s0 }   # switch side: traffic FROM your machines
+  bridges:
+    br0:
+      interfaces: [vlan10, vlan20]
+      addresses: [192.168.1.193/24]
+      routes: [{to: default, via: 192.168.1.1}]
+      nameservers: {addresses: [192.168.1.1]}
+      parameters: { stp: false, forward-delay: 0 }

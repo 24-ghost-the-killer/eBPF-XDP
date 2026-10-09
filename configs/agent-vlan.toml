@@ -1,0 +1,18 @@
+# xdp-sentinel agent config for inline VLAN-bridge mode (configs/netplan-vlan-bridge.yaml).
+# Installed to /etc/xdp-sentinel/config.toml after the cutover. XDP runs on
+# both VLAN sub-interfaces so it inspects each direction before the bridge
+# forwards it. VLAN sub-interfaces support generic XDP only.
+
+metrics_addr = "127.0.0.1:9464"
+pin_root = "/sys/fs/bpf/xdp-sentinel"
+bpf_obj  = "/usr/lib/xdp-sentinel/xdp_main.bpf.o"
+
+[[interface]]
+name   = "vlan10"    # from the internet
+mode   = "generic"
+attach = true
+
+[[interface]]
+name   = "vlan20"    # from your machines
+mode   = "generic"
+attach = true

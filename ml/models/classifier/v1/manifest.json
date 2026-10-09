@@ -1,0 +1,32 @@
+{
+  "model": "ddos_classifier_cart",
+  "version": "v1",
+  "schema_hash": "a0c637eb8eb2826a36f12a9d083268bbd98ba59593eed67030806e51fb53217e",
+  "classes": [
+    "ack_flood",
+    "benign",
+    "connection_flood",
+    "dns_amplification",
+    "frag_flood",
+    "icmp_flood",
+    "malformed_flood",
+    "syn_flood",
+    "udp_flood",
+    "udp_reflection"
+  ],
+  "metrics": {
+    "per_class_recall": {
+      "ack_flood": 1.0,
+      "benign": 0.9961832061068703,
+      "connection_flood": 1.0,
+      "dns_amplification": 1.0,
+      "frag_flood": 1.0,
+      "icmp_flood": 1.0,
+      "malformed_flood": 1.0,
+      "syn_flood": 0.9666666666666667,
+      "udp_flood": 0.9964285714285714,
+      "udp_reflection": 1.0
+    },
+    "worst_recall": 0.9666666666666667
+  }
+}

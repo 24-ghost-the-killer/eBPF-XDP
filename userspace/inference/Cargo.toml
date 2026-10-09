@@ -1,0 +1,16 @@
+[package]
+name = "sentinel-inference"
+description = "xdp-sentinel model inference: load a JSON model and score feature vectors (Phase 10-12)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+xs-common.workspace = true
+
+[lints]
+workspace = true

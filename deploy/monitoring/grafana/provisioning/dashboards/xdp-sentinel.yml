@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: xdp-sentinel
+    folder: xdp-sentinel
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

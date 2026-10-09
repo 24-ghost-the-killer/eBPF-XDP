@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s          # matches the textfile exporter's write period
+  evaluation_interval: 5s
+  external_labels:
+    appliance: xdp-sentinel
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: node             # host metrics + xdp-sentinel textfile metrics
+    static_configs:
+      - targets: ["127.0.0.1:9101"]
+  - job_name: xdp-sentinel-agent   # native /metrics from sentinel-agent (Phase 4)
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9091"]

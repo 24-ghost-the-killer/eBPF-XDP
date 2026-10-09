@@ -1,0 +1,17 @@
+{
+  "model": "bot_detector_logistic",
+  "version": "v1",
+  "features": [
+    "src_pps",
+    "src_syn_share",
+    "src_iat_cv",
+    "src_distinct_dports",
+    "src_pkt_size_mode_share",
+    "src_bad_share"
+  ],
+  "threshold": 0.5,
+  "metrics": {
+    "precision": 1.0,
+    "recall": 1.0
+  }
+}

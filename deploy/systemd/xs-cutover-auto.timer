@@ -1,0 +1,10 @@
+# Every 30 s until the cutover has happened; xs-cutover disables it afterwards.
+[Unit]
+Description=xdp-sentinel automatic VLAN bridge cutover check
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=30
+
+[Install]
+WantedBy=timers.target

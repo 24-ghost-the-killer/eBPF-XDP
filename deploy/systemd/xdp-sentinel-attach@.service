@@ -1,0 +1,26 @@
+# Phase 1 boot-time attachment of the xdp-sentinel dataplane to one
+# interface (instance name = interface), e.g. xdp-sentinel-attach@ens1f0.
+# Replaced by sentinel-agent.service in Phase 4.
+#
+# Per-interface overrides in /etc/xdp-sentinel/<iface>.env:
+#   XS_MODE=native|generic   (generic only for NICs without native XDP)
+#
+# Stopping this unit does NOT detach the program (stopping a service must
+# never change forwarding); detach explicitly with
+#   sentinelctl detach -i <iface>
+[Unit]
+Description=xdp-sentinel XDP dataplane on %i
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device sys-fs-bpf.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=XS_MODE=native
+EnvironmentFile=-/etc/xdp-sentinel/%i.env
+# --replace: attach if nothing is attached, atomically upgrade otherwise;
+# pinned counters and config are reused.
+ExecStart=/usr/local/bin/sentinelctl attach -i %i --mode ${XS_MODE} --replace --obj /usr/lib/xdp-sentinel/xdp_main.bpf.o
+
+[Install]
+WantedBy=multi-user.target

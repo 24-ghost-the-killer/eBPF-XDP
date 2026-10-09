@@ -1,0 +1,71 @@
+# xdp-sentinel monitoring stack: node_exporter + Prometheus + Grafana.
+#
+# Independent of any other Prometheus on the host (e.g. GitLab's bundled one
+# on :9090/:9100): own ports, own data volumes. Host networking so
+# node_exporter sees the real interfaces and everything binds explicitly:
+#   node_exporter  127.0.0.1:9101   (host metrics + xdp-sentinel textfile metrics)
+#   Prometheus     127.0.0.1:9091   (15 d / 5 GB retention, alert rules)
+#   Grafana        ${GRAFANA_HTTP_ADDR:-127.0.0.1}:3001 (dashboard; password from .env)
+#
+# Grafana defaults to localhost for SSH-tunnel access. To use Twingate, set
+# GRAFANA_HTTP_ADDR in .env to the server's private IP used by its Twingate
+# resource. Prometheus and node_exporter remain localhost-only.
+#
+#   cp .env.example .env && edit; docker compose up -d
+name: xdp-sentinel-monitoring
+
+services:
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    network_mode: host
+    pid: host
+    read_only: true
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9101
+      - --collector.textfile.directory=/textfile
+    volumes:
+      - /:/host:ro,rslave
+      - /var/lib/xdp-sentinel/textfile:/textfile:ro
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+      - --web.listen-address=127.0.0.1:9091
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      GF_SERVER_HTTP_ADDR: ${GRAFANA_HTTP_ADDR:-127.0.0.1}
+      GF_SERVER_HTTP_PORT: "3001"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Wall-display/kiosk mode: anonymous read-only (Viewer) access.
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_VIEWER:-false}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_HIDE_VERSION: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/xdp-sentinel-dataplane.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  prometheus-data:
+  grafana-data:

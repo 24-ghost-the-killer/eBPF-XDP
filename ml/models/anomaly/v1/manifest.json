@@ -1,0 +1,13 @@
+{
+  "model": "anomaly_isolation_forest",
+  "version": "v1",
+  "schema_hash": "a0c637eb8eb2826a36f12a9d083268bbd98ba59593eed67030806e51fb53217e",
+  "trees": 100,
+  "sample_size": 256,
+  "seed": 1,
+  "data": "synthetic.csv",
+  "metrics": {
+    "pr_auc": 1.0,
+    "pr_auc_baseline_pps": 1.0
+  }
+}

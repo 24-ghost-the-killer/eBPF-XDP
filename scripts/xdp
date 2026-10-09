@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# xdp - friendly wrapper around sentinelctl for day-to-day control of the
+# xdp-sentinel dataplane. Operates on one interface (default wlo1; override
+# with the XDP_IFACE environment variable).
+#
+#   xdp status                 attach state + config
+#   xdp stats [seconds]        live counters (default 1s interval)
+#   xdp list                   blocks, allowlist, rate limiter
+#   xdp reset                  turn OFF everything (flags, rate limit, blocks, allows)
+#   xdp flags <flag> on|off    toggle a drop flag (flag: malformed | bad-tcp-flags |
+#                              fragments | udp-dns | udp | all)
+#   xdp ratelimit <pps>|off    per-source rate limit (0 or off disables)
+#   xdp block <ip> [ttl_s]     block a source (default TTL 600s)
+#   xdp unblock <ip>
+#   xdp allow <cidr> [full|dynamic-exempt]
+#   xdp unallow <cidr>
+set -euo pipefail
+IF="${XDP_IFACE:-wlo1}"
+CTL=(sudo sentinelctl)
+
+die(){ echo "xdp: $*" >&2; exit 1; }
+usage(){ awk 'NR>1{ if($0 !~ /^#/) exit; sub(/^# ?/,""); print }' "$0"; }
+
+flag_opt(){
+  case "$1" in
+    malformed)               echo --drop-malformed ;;
+    bad-tcp-flags|badtcp|tcp) echo --drop-bad-tcp-flags ;;
+    fragments|frag)          echo --drop-fragments ;;
+    udp-dns|dns)             echo --drop-udp-dns ;;
+    udp)                     echo --drop-udp ;;
+    *) die "unknown flag '$1' (malformed|bad-tcp-flags|fragments|udp-dns|all)" ;;
+  esac
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  status)  "${CTL[@]}" status -i "$IF" ;;
+  stats)   "${CTL[@]}" stats  -i "$IF" --interval "${1:-1}" ;;
+  list)    "${CTL[@]}" list   -i "$IF" ;;
+
+  flags)
+    [ $# -ge 2 ] || die "usage: xdp flags <flag> on|off"
+    flag="$1"; state="$2"
+    [ "$state" = on ] || [ "$state" = off ] || die "state must be on|off"
+    if [ "$flag" = all ]; then
+      "${CTL[@]}" config -i "$IF" --drop-malformed "$state" --drop-bad-tcp-flags "$state" \
+                                  --drop-fragments "$state" --drop-udp-dns "$state" --drop-udp "$state"
+    else
+      "${CTL[@]}" config -i "$IF" "$(flag_opt "$flag")" "$state"
+    fi ;;
+
+  ratelimit|rl)
+    [ $# -ge 1 ] || die "usage: xdp ratelimit <pps>|off"
+    v="$1"; [ "$v" = off ] && v=0
+    "${CTL[@]}" ratelimit -i "$IF" --pps "$v" ;;
+
+  block)   [ $# -ge 1 ] || die "usage: xdp block <ip> [ttl_s]"
+           "${CTL[@]}" block -i "$IF" "$1" --ttl "${2:-600}" ;;
+  unblock) [ $# -ge 1 ] || die "usage: xdp unblock <ip>"
+           "${CTL[@]}" unblock -i "$IF" "$1" ;;
+  allow)   [ $# -ge 1 ] || die "usage: xdp allow <cidr> [full|dynamic-exempt]"
+           "${CTL[@]}" allow -i "$IF" "$1" --trust "${2:-full}" ;;
+  unallow) [ $# -ge 1 ] || die "usage: xdp unallow <cidr>"
+           "${CTL[@]}" unallow -i "$IF" "$1" ;;
+
+  reset)
+    "${CTL[@]}" config -i "$IF" --drop-malformed off --drop-bad-tcp-flags off \
+                                --drop-fragments off --drop-udp-dns off --drop-udp off
+    "${CTL[@]}" ratelimit -i "$IF" --pps 0
+    # clear any blocks / allowlist entries
+    "${CTL[@]}" list -i "$IF" --json | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for b in d.get("blocks",[]):     print("unblock", b["ip"])
+for a in d.get("allowlist",[]):  print("unallow", a["cidr"])
+' | while read -r op val; do "${CTL[@]}" "$op" -i "$IF" "$val"; done
+    echo "xdp: reset - all mitigation off on $IF" ;;
+
+  help|-h|--help) usage ;;
+  *) die "unknown command '$cmd' (try: xdp help)" ;;
+esac

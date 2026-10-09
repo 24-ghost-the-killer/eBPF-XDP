@@ -1,0 +1,26 @@
+# Writes xdp-sentinel counters for node_exporter's textfile collector
+# (deploy/monitoring). Phase 1 only; sentinel-agent exports /metrics from
+# Phase 4.
+[Unit]
+Description=xdp-sentinel metrics for the node_exporter textfile collector
+After=sys-fs-bpf.mount
+
+[Service]
+EnvironmentFile=-/etc/xdp-sentinel/exporter.env
+ExecStart=/usr/local/lib/xdp-sentinel/xs-textfile-exporter
+Restart=always
+RestartSec=2
+# Needs only to read pinned maps and query XDP attachment.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+StateDirectory=xdp-sentinel/textfile
+StateDirectoryMode=0755
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

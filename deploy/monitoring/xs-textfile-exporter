@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# Phase 1 metrics bridge: every XS_INTERVAL seconds, write each interface's
+# xdp-sentinel counters (sentinelctl stats --prometheus) to
+# $XS_TEXTFILE_DIR/xdp-sentinel-<iface>.prom for node_exporter's textfile
+# collector. Files are written to a temp name and renamed, so node_exporter
+# never reads a partial file. Replaced by sentinel-agent's /metrics in Phase 4.
+#
+# Environment (systemd: /etc/xdp-sentinel/exporter.env):
+#   XS_IFACES        space-separated interfaces (default: every interface
+#                    with pins under /sys/fs/bpf/xdp-sentinel)
+#   XS_INTERVAL      seconds between writes (default 5)
+#   XS_TEXTFILE_DIR  default /var/lib/xdp-sentinel/textfile
+set -u
+DIR=${XS_TEXTFILE_DIR:-/var/lib/xdp-sentinel/textfile}
+INTERVAL=${XS_INTERVAL:-5}
+CTL=${XS_CTL:-/usr/local/bin/sentinelctl}
+mkdir -p "$DIR"
+
+while :; do
+	ifaces=${XS_IFACES:-$(ls /sys/fs/bpf/xdp-sentinel 2>/dev/null)}
+	for i in $ifaces; do
+		tmp="$DIR/.xdp-sentinel-$i.prom.tmp"
+		if ! "$CTL" stats -i "$i" --prometheus >"$tmp" 2>/dev/null; then
+			# Pins gone or map unreadable: report "not attached" instead of
+			# silently keeping stale counters.
+			printf '%s\n%s\n%s\n' \
+				'# HELP xs_dataplane_attached 1 if the xdp-sentinel program is attached, by XDP mode.' \
+				'# TYPE xs_dataplane_attached gauge' \
+				"xs_dataplane_attached{iface=\"$i\",mode=\"none\"} 0" >"$tmp"
+		fi
+		chmod 0644 "$tmp"
+		mv -f "$tmp" "$DIR/xdp-sentinel-$i.prom"
+	done
+	sleep "$INTERVAL"
+done

@@ -1,0 +1,23 @@
+[package]
+name = "sentinelctl"
+description = "xdp-sentinel dataplane control: attach/detach the XDP program, read counters, set config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+xs-common.workspace = true
+
+# The BPF loader is Linux-only. On other hosts the binary builds but only
+# reports that it must run on Linux, so `cargo check --workspace` works on
+# developer laptops.
+[target.'cfg(target_os = "linux")'.dependencies]
+libbpf-rs.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
