@@ -1,0 +1,65 @@
+# Saturation, collateral and health alerts (see docs/security-audit.md P5).
+# Deploy to the appliance's prometheus/rules/ and reload prometheus.
+groups:
+  - name: xs-saturation
+    rules:
+      - alert: NicRxDrops
+        expr: rate(node_network_receive_drop_total{device=~"enp.*|eth.*|vlan.*"}[2m]) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "NIC RX drops on {{ $labels.device }}"
+          description: "The driver is dropping received frames — the generic-XDP/NIC path is saturating."
+
+      - alert: SoftirqSaturation
+        expr: avg by (cpu) (rate(node_cpu_seconds_total{mode="softirq"}[2m])) > 0.8
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "softirq > 80% on CPU {{ $labels.cpu }}"
+          description: "An RX core is near-saturated in softirq; a flood may be starving the control plane."
+
+      - alert: SampleRingbufDrops
+        expr: rate(xs_sample_packets_total{event="dropped"}[5m]) > 0
+        for: 5m
+        labels: { severity: info }
+        annotations:
+          summary: "Telemetry sampling dropping ({{ $labels.iface }})"
+          description: "The sample ring buffer is full; feature quality is degraded under load (expected during floods)."
+
+      - alert: HighDropRatio
+        expr: >
+          sum by (iface) (rate(xs_verdict_packets_total{verdict="drop"}[5m]))
+          /
+          clamp_min(sum by (iface) (rate(xs_rx_packets_total[5m])), 1) > 0.5
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.iface }} dropping >50% of traffic"
+          description: "Sustained high drop ratio — active mitigation (good) or a false-positive/misconfig (check collateral)."
+
+  - name: xs-health
+    rules:
+      - alert: AgentDown
+        expr: up{job="xdp-sentinel-agent"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "sentinel-agent /metrics unreachable"
+          description: "Control plane down. Dataplane keeps forwarding (fail-open) but no new mitigation/telemetry."
+
+      - alert: SwitchSnmpDown
+        expr: up{job="switch"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Switch SNMP target down"
+          description: "snmp_exporter cannot reach the switch — check IP/community/reachability."
+
+      - alert: FeatureCollectorStalled
+        expr: increase(xs_collector_windows_total[10m]) == 0
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "Real-data collector not writing windows"
+          description: "No new feature windows in 10m — the retrain dataset has stopped growing."

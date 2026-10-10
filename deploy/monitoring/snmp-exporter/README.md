@@ -35,7 +35,7 @@ the GS1900 series keeps SNMP under **Management → SNMP**.
    `1`, **Included**. This is what lets the community read IF-MIB.
 
 3. **Add the read-only community.** `Management → SNMP → Community`:
-   - **Community String:** `Awk22T0tbX09mZQadFw6`
+   - **Community String:** `<SWITCH_SNMP_COMMUNITY>`
    - **Access / Privilege:** **Read-Only**
    - **View:** the read view from step 2 (e.g. `all`)
    - (If the UI asks for a **Group** instead of a view, create a v2c
@@ -58,8 +58,8 @@ the GS1900 series keeps SNMP under **Management → SNMP**.
 ### Quick switch-side test (from the appliance)
 ```sh
 # if net-snmp is installed; confirms the switch answers with your community
-snmpwalk -v2c -c 'Awk22T0tbX09mZQadFw6' 192.168.1.50 1.3.6.1.2.1.1.3.0   # sysUpTime
-snmpwalk -v2c -c 'Awk22T0tbX09mZQadFw6' 192.168.1.50 1.3.6.1.2.1.31.1.1.1.1  # ifName list
+snmpwalk -v2c -c '<SWITCH_SNMP_COMMUNITY>' 192.168.1.50 1.3.6.1.2.1.1.3.0   # sysUpTime
+snmpwalk -v2c -c '<SWITCH_SNMP_COMMUNITY>' 192.168.1.50 1.3.6.1.2.1.31.1.1.1.1  # ifName list
 ```
 No answer → SNMP not enabled, wrong community, or a host allowlist is blocking
 the appliance. Fix that before touching the exporter.
@@ -78,7 +78,7 @@ The monitoring stack (`deploy/monitoring/`) now includes SNMP:
 | `prometheus/prometheus.yml` | new `snmp-switch` scrape job (30 s) targeting `192.168.1.50` |
 | `grafana/dashboards/switch-snmp.json` | the **"Switch (SNMP)"** dashboard (auto-provisioned) |
 
-The real `snmp.yml` (with the community `Awk22T0tbX09mZQadFw6`) has already been
+The real `snmp.yml` (with the community `<SWITCH_SNMP_COMMUNITY>`) has already been
 generated next to the template and is ignored by git. If you ever need to
 recreate it:
 

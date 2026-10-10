@@ -1,0 +1,42 @@
+name: security
+
+# Secret scanning + Rust dependency auditing. Added after an SNMP community
+# string was found committed in deploy/monitoring/snmp-exporter/README.md
+# (see docs/security-audit.md). Fails the build on a new leaked secret or a
+# known-vulnerable / unmaintained crate.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, so advisories land even without a push
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # scan full history, not just the tip
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  cargo-audit:
+    name: dependency audit (cargo-audit + cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit (RUSTSEC advisories)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: cargo deny (bans, licenses, advisories, sources)
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check || true   # advisory-only until deny.toml policy is tuned
