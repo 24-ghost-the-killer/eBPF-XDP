@@ -1,0 +1,286 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  xdp-sentinel — dark-only console theme.
+  shadcn design tokens are defined here but recolored to our
+  near-black + emerald palette (not shadcn's default neutral grey).
+  The app renders dark by default, so :root carries the dark values
+  and .dark mirrors them for any shadcn component that gates on .dark.
+*/
+:root,
+.dark {
+  --background: #07070a;
+  --foreground: #e4e4e7; /* zinc-200 */
+
+  --card: #0e0e13;
+  --card-foreground: #e4e4e7;
+  --popover: #0e0e13;
+  --popover-foreground: #e4e4e7;
+
+  --primary: #10b981; /* emerald-500 */
+  --primary-foreground: #05140e;
+
+  --secondary: #1b1b20;
+  --secondary-foreground: #e4e4e7;
+  --muted: #17171c;
+  --muted-foreground: #8b8b94; /* ~zinc-500 */
+  --accent: #1f1f26;
+  --accent-foreground: #f4f4f5;
+
+  --destructive: #f43f5e; /* rose-500 */
+  --destructive-foreground: #fff1f2;
+
+  --border: rgba(255, 255, 255, 0.08);
+  --input: rgba(255, 255, 255, 0.12);
+  --ring: #10b981;
+
+  --chart-1: #38bdf8;
+  --chart-2: #f87171;
+  --chart-3: #34d399;
+  --chart-4: #fbbf24;
+  --chart-5: #a78bfa;
+
+  --sidebar: #0a0a0e;
+  --sidebar-foreground: #e4e4e7;
+  --sidebar-primary: #10b981;
+  --sidebar-primary-foreground: #05140e;
+  --sidebar-accent: #1f1f26;
+  --sidebar-accent-foreground: #f4f4f5;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-ring: #10b981;
+
+  --radius: 0.75rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --font-sans: var(--font-sans), system-ui, sans-serif;
+  --font-mono: var(--font-mono), ui-monospace, monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --shadow-card: 0 1px 0 0 rgba(255, 255, 255, 0.03) inset, 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+}
+
+html {
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans), system-ui, sans-serif;
+    /* faint ambient glow at the top — not a data gradient, just atmosphere */
+    background-image:
+      radial-gradient(60rem 30rem at 50% -10rem, rgba(52, 211, 153, 0.06), transparent 70%),
+      radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.035) 1px, transparent 0);
+    background-size: 100% 100%, 26px 26px;
+    background-attachment: fixed;
+  }
+}
+
+code,
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+/* premium hairline card used across the UI */
+.card {
+  @apply rounded-xl border bg-white/[0.025] shadow-card transition-colors duration-300;
+  border-color: rgba(255, 255, 255, 0.07);
+}
+.card:hover {
+  @apply bg-white/[0.035];
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+/* section label */
+.eyebrow {
+  @apply flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.18em] text-zinc-500;
+}
+.eyebrow::before {
+  content: '';
+  @apply inline-block h-3 w-[2px] rounded bg-emerald-400/70;
+}
+
+/* thin scrollbars */
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  @apply rounded bg-zinc-700/70;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tactical NOC / command-center layer                                */
+/* ------------------------------------------------------------------ */
+
+/* glowing hairline panel — the command-center surface */
+.panel {
+  position: relative;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.008));
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
+    0 10px 30px -16px rgba(0, 0, 0, 0.8);
+}
+/* corner ticks — tactical frame detail */
+.panel-ticks::before,
+.panel-ticks::after {
+  content: '';
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  pointer-events: none;
+}
+.panel-ticks::before {
+  top: 7px;
+  left: 7px;
+  border-right: 0;
+  border-bottom: 0;
+}
+.panel-ticks::after {
+  bottom: 7px;
+  right: 7px;
+  border-left: 0;
+  border-top: 0;
+}
+
+/* emerald glow accents */
+.glow-emerald {
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.2), 0 0 28px -6px rgba(16, 185, 129, 0.35);
+}
+.glow-rose {
+  box-shadow: 0 0 0 1px rgba(244, 63, 94, 0.25), 0 0 34px -4px rgba(244, 63, 94, 0.45);
+}
+.text-glow {
+  text-shadow: 0 0 18px rgba(52, 211, 153, 0.55);
+}
+.text-glow-rose {
+  text-shadow: 0 0 18px rgba(244, 63, 94, 0.6);
+}
+
+/* scanline shimmer overlay for the hero */
+.scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(255, 255, 255, 0.02) 0px,
+    rgba(255, 255, 255, 0.02) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+/* animations */
+@keyframes radar-sweep {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.animate-radar {
+  animation: radar-sweep 4s linear infinite;
+  transform-origin: center;
+}
+@keyframes blip-ping {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  80%,
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+.animate-blip {
+  animation: blip-ping 2.4s ease-out infinite;
+}
+@keyframes grid-pan {
+  to {
+    background-position: 26px 26px;
+  }
+}
+@keyframes sweep-x {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+.animate-sweep {
+  animation: sweep-x 2.8s ease-in-out infinite;
+}
+@keyframes flicker {
+  0%, 18%, 22%, 100% {
+    opacity: 1;
+  }
+  20% {
+    opacity: 0.45;
+  }
+}
+.animate-flicker {
+  animation: flicker 6s ease-in-out infinite;
+}
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+.animate-marquee {
+  animation: marquee 80s linear infinite;
+}
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
