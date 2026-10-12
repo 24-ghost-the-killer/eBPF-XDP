@@ -23,6 +23,7 @@ interface Attack {
   uniqueSources: number
   attackers: Attacker[]
   target: { iface: string; label: string; rxPackets: number; rxShare: number } | null
+  victims: { ip: string; packets: number; bytes: number }[]
 }
 
 function dur(sec: number) {
@@ -183,19 +184,42 @@ export default function Attacks() {
                 <div className="mt-4">
                   <div className="mb-2 text-[11px] uppercase tracking-wider text-zinc-500">Target</div>
                   <div className="rounded-md border border-cyan-500/20 bg-cyan-500/[0.04] px-3 py-2.5 text-[11px]">
-                    {a.target ? (
-                      <span className="text-zinc-400">
-                        Hit the <span className="mono font-semibold text-cyan-300">{a.target.label}</span> ingress — this interface absorbed{' '}
-                        <span className="mono text-zinc-200">{pps(a.target.rxPackets).replace('p/s', '')}</span> packets (
-                        {(a.target.rxShare * 100).toFixed(0)}% of all traffic on the appliance during the attack).
-                      </span>
+                    {a.victims && a.victims.length > 0 ? (
+                      <>
+                        <div className="text-zinc-400">
+                          Victim{a.victims.length > 1 ? 's' : ''} (exact destination the dropped attack packets were aimed at):
+                        </div>
+                        <div className="mt-1.5 space-y-1">
+                          {a.victims.map((v) => (
+                            <div key={v.ip} className="flex items-center gap-2 font-mono">
+                              <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[12px] font-semibold text-cyan-200 ring-1 ring-inset ring-cyan-500/30">{v.ip}</span>
+                              <span className="text-zinc-500">{compact(v.packets)} dropped attack packets · {bytes(v.bytes)}</span>
+                            </div>
+                          ))}
+                        </div>
+                        {a.target && (
+                          <div className="mt-1.5 text-zinc-500">
+                            Arrived on <span className="mono text-zinc-400">{a.target.label}</span>.
+                          </div>
+                        )}
+                      </>
                     ) : (
-                      <span className="text-zinc-500">Target interface could not be determined for this episode.</span>
+                      <>
+                        {a.target ? (
+                          <span className="text-zinc-400">
+                            Hit the <span className="mono font-semibold text-cyan-300">{a.target.label}</span> ingress — this interface absorbed{' '}
+                            <span className="mono text-zinc-200">{pps(a.target.rxPackets).replace('p/s', '')}</span> packets (
+                            {(a.target.rxShare * 100).toFixed(0)}% of all traffic on the appliance during the attack).
+                          </span>
+                        ) : (
+                          <span className="text-zinc-500">Target interface could not be determined for this episode.</span>
+                        )}
+                        <div className="mt-1.5 text-zinc-500">
+                          No exact victim IP recorded for this episode — per-destination victim tracking in the dataplane
+                          was enabled on 11 Oct 2026, so only attacks after that name the exact victim host.
+                        </div>
+                      </>
                     )}
-                    <div className="mt-1.5 text-zinc-500">
-                      The appliance protects a bridge segment, so the attack is attributed to the targeted <em>interface</em>.
-                      A single destination host isn&apos;t exported by the dataplane metrics (only aggregate per-interface volume).
-                    </div>
                   </div>
                 </div>
 
@@ -203,10 +227,17 @@ export default function Attacks() {
                 <div className="mt-4">
                   <div className="mb-2 text-[11px] uppercase tracking-wider text-zinc-500">Attacker sources</div>
                   {a.attackers.length === 0 ? (
-                    <div className="rounded-md border border-white/[0.06] bg-white/[0.015] px-3 py-2.5 text-[11px] text-zinc-500">
-                      No per-source attribution captured for this episode — the flood was injected on-box / bypassed the per-source talker tap.
-                      Real attacks traversing the WAN interface populate this list.
-                    </div>
+                    a.uniqueSources >= 5 ? (
+                      <div className="rounded-md border border-fuchsia-500/20 bg-fuchsia-500/[0.05] px-3 py-2.5 text-[11px] text-zinc-400">
+                        <span className="font-semibold text-fuchsia-300">Source-spoofed / distributed flood</span> — {a.uniqueSources.toLocaleString('en-US')} distinct source IPs dropped, none dominant.
+                        Individual sources aren&apos;t listed because the flood spreads ~evenly across many forged addresses (exactly why per-source rate-limiting can&apos;t stop it and the aggregate drop does).
+                      </div>
+                    ) : (
+                      <div className="rounded-md border border-white/[0.06] bg-white/[0.015] px-3 py-2.5 text-[11px] text-zinc-500">
+                        No per-source attribution for this episode — per-source attacker tracking in the dataplane was enabled on 12 Oct 2026,
+                        so only attacks after that list the dropped-packet sources.
+                      </div>
+                    )
                   ) : (
                     <table className="w-full text-[11px] font-mono">
                       <thead>

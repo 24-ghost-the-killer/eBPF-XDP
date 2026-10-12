@@ -192,4 +192,35 @@ struct {
 	__uint(max_entries, 4 << 20);
 } xs_samples SEC(".maps");
 
+/* ---- Per-destination victim accounting (dropped packets by dst IPv4) ---- */
+
+/*
+ * Attack packets credited per destination IPv4, updated only on an XDP_DROP
+ * verdict. The destination accumulating the most drops during an episode is
+ * the victim the flood was aimed at. LRU bounds memory (a spoofed-destination
+ * flood churns cold entries while the real victim's hot entry survives); an
+ * appliance protects few destinations, so 4096 is ample. Shared across RX
+ * cores (not per-CPU), updated with __sync_fetch_and_add.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __be32);              /* destination IPv4, network order */
+	__type(value, struct xs_victim);
+} xs_victim_v4 SEC(".maps");
+
+/*
+ * Attack packets credited per SOURCE IPv4, also only on XDP_DROP. The top
+ * sources are the attackers; a fully source-spoofed flood churns many
+ * single-packet sources through the LRU (no source dominates = distributed /
+ * spoofed), while a real botnet's members accumulate. Larger than the victim
+ * map because an attack has many sources but few targets. Same value struct.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __be32);              /* source IPv4, network order */
+	__type(value, struct xs_victim);
+} xs_attacker_v4 SEC(".maps");
+
 #endif /* XS_MAPS_H */

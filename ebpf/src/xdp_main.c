@@ -200,6 +200,36 @@ int xs_xdp_main(struct xdp_md *ctx)
 	xs_count(st, verdict == XDP_DROP ? XS_CNT_VERDICT_DROP : XS_CNT_VERDICT_PASS, len);
 
 	/*
+	 * Per-destination victim accounting. Only on a drop (so an un-attacked
+	 * box never touches this map), credit the targeted IPv4 destination so
+	 * the control plane can name which host the flood was aimed at. IPv6 is
+	 * a later addition.
+	 */
+	if (verdict == XDP_DROP && pkt.l3 == XS_L3_IPV4) {
+		__be32 dkey = pkt.daddr.v4;
+		struct xs_victim *v = bpf_map_lookup_elem(&xs_victim_v4, &dkey);
+		__be32 skey = pkt.saddr.v4;
+		struct xs_victim *a = bpf_map_lookup_elem(&xs_attacker_v4, &skey);
+
+		if (v) {
+			__sync_fetch_and_add(&v->packets, 1);
+			__sync_fetch_and_add(&v->bytes, len);
+		} else {
+			struct xs_victim nv = { .packets = 1, .bytes = len };
+
+			bpf_map_update_elem(&xs_victim_v4, &dkey, &nv, BPF_ANY);
+		}
+		if (a) {
+			__sync_fetch_and_add(&a->packets, 1);
+			__sync_fetch_and_add(&a->bytes, len);
+		} else {
+			struct xs_victim na = { .packets = 1, .bytes = len };
+
+			bpf_map_update_elem(&xs_attacker_v4, &skey, &na, BPF_ANY);
+		}
+	}
+
+	/*
 	 * Phase 5 flow aggregation. Only for fully parsed IP packets, and only
 	 * for the stages the collector has switched on, so an idle system pays
 	 * nothing. The clock is read once, lazily, and only when sampling.

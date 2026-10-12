@@ -19,6 +19,7 @@ import RiskEngine, { type RiskData } from '@/components/wall/RiskEngine'
 import Defenses, { type DefenseData } from '@/components/wall/Defenses'
 import ClassProbs from '@/components/wall/ClassProbs'
 import Attacks from '@/components/wall/Attacks'
+import InterfacePanel from '@/components/wall/InterfacePanel'
 import CommandMenu, { type WallSection } from '@/components/app/CommandMenu'
 import Icon, { type IconName } from '@/components/app/icons'
 
@@ -65,7 +66,7 @@ export default function Page() {
   const status = usePoll(async () => {
     const [up, posture, drop, pass, rl, cap, sw, ingress, syn, conn, anom] = await Promise.all([
       instant('up{job="xdp-sentinel-agent"}'),
-      instant('count(ALERTS{alertstate="firing",severity=~"warning|critical"}) or vector(0)'),
+      instant('max(xs_threat_state) or vector(0)'),
       instant('sum(rate(xs_verdict_packets_total{verdict="drop"}[1m]))'),
       instant('sum(rate(xs_verdict_packets_total{verdict="pass"}[1m]))'),
       instant('sum(rate(xs_policy_event_packets_total{event="rate_limited"}[1m]))'),
@@ -268,7 +269,7 @@ export default function Page() {
   }, 30000)
 
   const s = status.data
-  const attack = (s?.posture ?? 0) > 0
+  const attack = (s?.posture ?? 0) >= 2 // live threat_state: 2 = under attack
   const d = info.data
   const h = health.data
   const sc = sec.data
@@ -335,23 +336,39 @@ export default function Page() {
 
   const traffic = (
     <div className="space-y-4">
-      <Panel title="Per-interface traffic">
-        <LineCard title="Live traffic vs drops (pps) — all interfaces" data={charts.data?.txData ?? []} keys={charts.data?.txKeys ?? []} yfmt={pps} />
-      </Panel>
-      <Panel title="Network breakdown (L2 / L3 / L4)">
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-          <Breakdown title="L2 — VLAN tags" rows={net.data?.l2 ?? []} />
-          <Breakdown title="L3 — network layer" rows={net.data?.l3 ?? []} />
-          <Breakdown title="L4 — transport" rows={net.data?.l4 ?? []} />
+      <Panel title="Per-interface overview">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <InterfacePanel name="VLAN10" role="wan" vlan="v10" rows={counters.data ?? []} />
+          <InterfacePanel name="VLAN20" role="lan" vlan="v20" rows={counters.data ?? []} />
         </div>
       </Panel>
+
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <div className="xl:col-span-2">
+          <Panel title="Traffic over time">
+            <LineCard title="Received vs dropped (pps) — per interface" data={charts.data?.txData ?? []} keys={charts.data?.txKeys ?? []} yfmt={pps} />
+          </Panel>
+        </div>
+        <div className="xl:col-span-1">
+          <Panel title="Protocol mix">
+            <div className="space-y-4">
+              <Breakdown title="L3 — network layer" rows={net.data?.l3 ?? []} />
+              <Breakdown title="L4 — transport" rows={net.data?.l4 ?? []} />
+            </div>
+          </Panel>
+        </div>
+      </div>
+
+      <Panel title="Dataplane counters (per-interface rates)">
+        <RatesTable title="live counter rates" rows={counters.data ?? []} />
+      </Panel>
+
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        <Panel title="Dataplane counters"><RatesTable title="per-interface counter rates" rows={counters.data ?? []} /></Panel>
-        <Panel title="Top talkers">
-          <div className="space-y-4">
-            <TopTalkers title="Top senders" rows={top.data?.tx ?? []} />
-            <TopTalkers title="Top receivers" rows={top.data?.rx ?? []} />
-          </div>
+        <Panel title="Top senders">
+          <TopTalkers title="by upload bandwidth" rows={top.data?.tx ?? []} />
+        </Panel>
+        <Panel title="Top receivers">
+          <TopTalkers title="by download bandwidth" rows={top.data?.rx ?? []} />
         </Panel>
       </div>
     </div>

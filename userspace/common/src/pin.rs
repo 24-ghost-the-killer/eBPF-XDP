@@ -29,6 +29,10 @@ pub const MAP_ALLOW_V6: &str = "xs_allow_v6";
 /// Phase 3 per-source rate-limiter state maps.
 pub const MAP_RL_V4: &str = "xs_rl_v4";
 pub const MAP_RL_V6: &str = "xs_rl_v6";
+/// Per-destination victim accounting (dropped attack packets by dst IPv4).
+pub const MAP_VICTIM_V4: &str = "xs_victim_v4";
+/// Per-source attacker accounting (dropped attack packets by src IPv4).
+pub const MAP_ATTACKER_V4: &str = "xs_attacker_v4";
 
 /// Linux IFNAMSIZ including the terminating NUL.
 const IFNAMSIZ: usize = 16;

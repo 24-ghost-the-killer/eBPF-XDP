@@ -80,7 +80,7 @@ export function useEventLog(intervalMs = 3000) {
           instant('sum(rate(xs_conntrack_packets_total[1m]))'),
           instant('sum(rate(xs_policy_event_packets_total{event="rate_limited"}[1m]))'),
           instant('sum(rate(xs_rate_tracked_packets_total[1m]))'),
-          instant('count(ALERTS{alertstate="firing",severity=~"warning|critical"}) or vector(0)'),
+          instant('max(xs_threat_state) or vector(0)'),
           instant('ALERTS{alertstate="firing"}'),
           instant('xs_collector_suspect_windows_total'),
           instant('topk(1, rate(xs_talker_tx_bytes_total[5m])*8)'),
@@ -104,7 +104,7 @@ export function useEventLog(intervalMs = 3000) {
         const conn = scalar(connI, 0)!
         const rl = scalar(rlI, 0)!
         const rtrack = scalar(rtrackI, 0)!
-        const attack = scalar(postureI, 0)! > 0
+        const attack = scalar(postureI, 0)! >= 2 // live threat_state: 2 = under attack
         const suspn = scalar(suspectI, 0)!
         const xdpSeen = sum(rx)
         const totalDrop = sum(drop)

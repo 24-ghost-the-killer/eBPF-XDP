@@ -27,7 +27,7 @@ use xs_common::features::{self, WindowInput};
 use xs_common::iforest::Forest;
 use xs_common::risk::{Evidence, RiskEngine};
 use xs_common::metrics::prometheus;
-use xs_common::pin::{PinLayout, MAP_CONFIG, MAP_STATS, PROG_NAME};
+use xs_common::pin::{PinLayout, MAP_ATTACKER_V4, MAP_CONFIG, MAP_STATS, MAP_VICTIM_V4, PROG_NAME};
 use xs_common::{Config as DpConfig, ConfigFlags, Snapshot};
 
 use crate::config::{Config, Interface, Mode};
@@ -234,11 +234,17 @@ fn all_metrics(cfg: &Config, analysis: &Mutex<Analysis>) -> String {
         "# HELP xs_agent_up 1 while the agent process is running.\n# TYPE xs_agent_up gauge\nxs_agent_up 1\n",
     );
     for iface in &cfg.interfaces {
-        let block = PinLayout::new(&cfg.pin_root, &iface.name)
-            .map_err(anyhow::Error::from)
-            .and_then(|l| iface_metrics(&iface.name, &l));
-        match block {
-            Ok(b) => body.push_str(&b),
+        match PinLayout::new(&cfg.pin_root, &iface.name) {
+            Ok(layout) => {
+                match iface_metrics(&iface.name, &layout) {
+                    Ok(b) => body.push_str(&b),
+                    Err(_) => body.push_str(&format!(
+                        "xs_dataplane_attached{{iface=\"{}\",mode=\"none\"}} 0\n",
+                        iface.name
+                    )),
+                }
+                body.push_str(&render_victims(&iface.name, &layout));
+            }
             Err(_) => body.push_str(&format!(
                 "xs_dataplane_attached{{iface=\"{}\",mode=\"none\"}} 0\n",
                 iface.name
@@ -250,6 +256,73 @@ fn all_metrics(cfg: &Config, analysis: &Mutex<Analysis>) -> String {
         body.push_str(&render_analysis(&a));
     }
     body
+}
+
+/// Export the top entries of a drop-accounting LRU map (keyed by an IPv4
+/// address) as `<metric>_packets_total` / `<metric>_bytes_total`, labelled by
+/// `label` (dst for victims, src for attackers). The dataplane credits these
+/// maps only on a drop, so when nothing is being mitigated they're empty and
+/// no series is emitted (idle = silent). Cardinality is bounded to the top N.
+fn render_drop_ips(iface: &str, layout: &PinLayout, map_name: &str, metric: &str, label: &str, count_metric: &str) -> String {
+    const TOP_N: usize = 24;
+    let Ok(map) = MapHandle::from_pinned_path(layout.map(map_name)) else {
+        return String::new();
+    };
+    let mut rows: Vec<([u8; 4], u64, u64)> = Vec::new();
+    for key in map.keys() {
+        if key.len() != 4 {
+            continue;
+        }
+        let Ok(Some(val)) = map.lookup(&key, MapFlags::ANY) else {
+            continue;
+        };
+        if val.len() < 16 {
+            continue;
+        }
+        let pkts = u64::from_ne_bytes(val[0..8].try_into().unwrap());
+        let bytes = u64::from_ne_bytes(val[8..16].try_into().unwrap());
+        if pkts == 0 {
+            continue;
+        }
+        rows.push(([key[0], key[1], key[2], key[3]], pkts, bytes));
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    // Total distinct addresses (up to the map's LRU cap) — the spoofed-vs-targeted
+    // signal. A spoofed flood fills this into the thousands; a targeted one is few.
+    let total_distinct = rows.len();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.truncate(TOP_N);
+
+    let mut s = String::new();
+    s.push_str(&format!("# HELP {count_metric} Distinct addresses seen in the drop-accounting map (up to its LRU cap).\n"));
+    s.push_str(&format!("# TYPE {count_metric} gauge\n"));
+    s.push_str(&format!("{count_metric}{{iface=\"{iface}\"}} {total_distinct}\n"));
+    s.push_str(&format!("# HELP {metric}_packets_total Dropped attack packets per {label} since attach.\n"));
+    s.push_str(&format!("# TYPE {metric}_packets_total counter\n"));
+    for (ip, pkts, _) in &rows {
+        s.push_str(&format!(
+            "{metric}_packets_total{{iface=\"{iface}\",{label}=\"{}.{}.{}.{}\"}} {pkts}\n",
+            ip[0], ip[1], ip[2], ip[3]
+        ));
+    }
+    s.push_str(&format!("# HELP {metric}_bytes_total Dropped attack bytes per {label} since attach.\n"));
+    s.push_str(&format!("# TYPE {metric}_bytes_total counter\n"));
+    for (ip, _, bytes) in &rows {
+        s.push_str(&format!(
+            "{metric}_bytes_total{{iface=\"{iface}\",{label}=\"{}.{}.{}.{}\"}} {bytes}\n",
+            ip[0], ip[1], ip[2], ip[3]
+        ));
+    }
+    s
+}
+
+/// Victim (dst) and attacker (src) drop-accounting for an interface.
+fn render_victims(iface: &str, layout: &PinLayout) -> String {
+    let mut s = render_drop_ips(iface, layout, MAP_VICTIM_V4, "xs_target", "dst", "xs_target_hosts");
+    s.push_str(&render_drop_ips(iface, layout, MAP_ATTACKER_V4, "xs_attacker", "src", "xs_attacker_sources"));
+    s
 }
 
 // ---- Phase 6/9 live state for the dashboard (/api/state.json) ----

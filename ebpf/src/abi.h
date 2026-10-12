@@ -277,6 +277,17 @@ struct xs_sample {
 	__u32 _pad2;           /* pad to 64 bytes (one cache line) */
 };
 
+/*
+ * Per-destination victim accounting (value of xs_victim_v4). Credited only on
+ * an XDP_DROP verdict, so an un-attacked box never touches the map; the
+ * destination with the most dropped packets during an episode is the attack's
+ * victim, which the control plane exports as xs_target_packets_total{dst}.
+ */
+struct xs_victim {
+	__u64 packets;
+	__u64 bytes;
+};
+
 /* ---- Phase 2: per-source policies and allowlist ---- */
 
 /* Action a matching per-source policy applies. */
