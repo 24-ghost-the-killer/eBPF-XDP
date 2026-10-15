@@ -9,12 +9,24 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 const PROM = process.env.PROM_URL || 'http://localhost:9091'
+const STEP = 300 // coarse scan step; also the cache-key bucket size
+
+type Payload = { status: string; retentionDays: number; attacks: unknown[] }
+
+// Reconstructing 15 days of history runs hundreds of Prometheus queries (~5-7s).
+// The result only changes when a new 300s bucket starts, and the client re-polls
+// every 30s, so we cache it per bucket and serve the last-good result instantly
+// while refreshing in the background (stale-while-revalidate). Module state is
+// shared across requests in the same server process.
+let CACHE: { key: number; data: Payload; builtAt: number } | null = null
+let INFLIGHT: Promise<Payload> | null = null
+const FRESH_MS = 60_000 // after this age, refresh in the background on next hit
 
 async function instant(expr: string, time?: number) {
   const u = new URL(`${PROM}/api/v1/query`)
   u.searchParams.set('query', expr)
   if (time) u.searchParams.set('time', String(time))
-  const r = await fetch(u.toString(), { cache: 'no-store' })
+  const r = await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })
   const j = await r.json()
   if (j.status !== 'success') throw new Error(j.error || 'query failed')
   return j.data.result as { metric: Record<string, string>; value: [number, string] }[]
@@ -25,12 +37,47 @@ async function range(expr: string, start: number, end: number, step: number) {
   u.searchParams.set('start', String(start))
   u.searchParams.set('end', String(end))
   u.searchParams.set('step', String(step))
-  const r = await fetch(u.toString(), { cache: 'no-store' })
+  const r = await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })
   const j = await r.json()
   if (j.status !== 'success') throw new Error(j.error || 'range failed')
   return j.data.result as { metric: Record<string, string>; values: [number, string][] }[]
 }
 const num = (r: { value: [number, string] }[]) => (r[0] ? parseFloat(r[0].value[1]) : 0)
+
+// Per-key episode delta, correct whether or not the counter was reset. For each
+// key we have its value at the end of the attack, its value just before the
+// attack, and how many resets happened in the window:
+//   * absent-before  -> the series was born in-window: use the full end value
+//     (captures the first scrape's packets that increase() drops);
+//   * reset in-window -> the map was flushed / agent restarted: the end value is
+//     entirely this episode's (everything since the reset);
+//   * otherwise       -> a monotonic counter with prior history: subtract the
+//     pre-attack value to isolate this episode.
+// This keeps Σ(per-source) == Σ(per-victim) == episode drops in every case,
+// including back-to-back flushed test runs that reuse the same source IPs.
+type Vec = { metric: Record<string, string>; value: [number, string] }[]
+function toMap(v: Vec, key: string): Map<string, number> {
+  const m = new Map<string, number>()
+  for (const r of v) if (r.metric[key] !== undefined) m.set(r.metric[key], parseFloat(r.value[1]))
+  return m
+}
+function deltaByKey(end: Vec, start: Vec, resets: Vec, key: string): Map<string, number> {
+  const s = toMap(start, key)
+  const rs = toMap(resets, key)
+  const out = new Map<string, number>()
+  for (const r of end) {
+    const k = r.metric[key]
+    if (k === undefined) continue
+    const endV = parseFloat(r.value[1])
+    const startV = s.get(k)
+    let d: number
+    if (startV === undefined) d = endV // born in-window
+    else if ((rs.get(k) ?? 0) > 0) d = endV // counter reset in-window (flush/restart)
+    else d = endV - startV // monotonic: isolate this episode
+    if (d > 0) out.set(k, d)
+  }
+  return out
+}
 const vlanName = (ifc: string) => (ifc === 'vlan10' ? 'VLAN10 · wan' : ifc === 'vlan20' ? 'VLAN20 · lan' : ifc)
 
 // RFC1918 → lan, else wan (best-effort from the address alone).
@@ -54,14 +101,12 @@ const VECTORS: [string, string][] = [
   ['Malformed', 'xs_parse_outcome_packets_total{class="malformed"}'],
 ]
 
-export async function GET() {
-  try {
+async function build(): Promise<Payload> {
     type Ep = { start: number; end: number }
 
     // --- Pass 1 (coarse): find attack REGIONS over 15d. 300s step + max_over_time
     // keeps us under Prometheus's 11k-point limit and catches short spikes. This
     // only bounds *where* to look; it over-merges, which pass 2 fixes. ---
-    const STEP = 300
     const end = Math.floor(Date.now() / 1000 / STEP) * STEP // bucket-aligned = stable across refreshes
     const start = end - 15 * 86400
     const coarse = await range(`max_over_time((max(xs_detection_active))[${STEP}s:15s])`, start, end, STEP)
@@ -81,22 +126,28 @@ export async function GET() {
     // fell in adjacent 5-min buckets but are really two different attacks. ---
     const FINE = 30
     const GAP_SPLIT = 150 // >= 2.5 min of calm between detections = separate attack
-    const eps: Ep[] = []
-    for (const r of regions) {
-      const fine = await range('max(xs_detection_active)', r.start - STEP, r.end + STEP, FINE)
-      const fv = fine[0]?.values ?? []
-      let cur: Ep | null = null
-      for (const [t, v] of fv) {
-        if (parseFloat(v) > 0) {
-          const ts = +t
-          if (cur && ts - cur.end <= GAP_SPLIT) cur.end = ts
-          else {
-            cur = { start: ts, end: ts }
-            eps.push(cur)
+    // Scan every region in parallel (they're independent), then flatten in
+    // chronological order so the newest-first reverse below still holds.
+    const perRegion = await Promise.all(
+      regions.map(async (r) => {
+        const fine = await range('max(xs_detection_active)', r.start - STEP, r.end + STEP, FINE)
+        const fv = fine[0]?.values ?? []
+        const local: Ep[] = []
+        let cur: Ep | null = null
+        for (const [t, v] of fv) {
+          if (parseFloat(v) > 0) {
+            const ts = +t
+            if (cur && ts - cur.end <= GAP_SPLIT) cur.end = ts
+            else {
+              cur = { start: ts, end: ts }
+              local.push(cur)
+            }
           }
         }
-      }
-    }
+        return local
+      })
+    )
+    const eps: Ep[] = perRegion.flat()
     // newest first, cap to 50
     eps.reverse()
     const picked = eps.slice(0, 50)
@@ -109,12 +160,14 @@ export async function GET() {
         const PAD = 90
         const dur = ep.end - ep.start + 2 * PAD
         const at = ep.end + PAD
+        const atStart = ep.start - PAD // evaluation instant just before the attack
         const sub = `[${dur}s:30s]`
         const win = `[${dur}s]`
 
         const [
-          peakPps, peakBps, totPkts, totBytes, dropped, peakRisk, peakThreat, uniq, cls, atkPkts, atkBytes,
-          detIface, rxIface, vicP, vicB,
+          peakPps, peakBps, totPkts, totBytes, dropped, peakRisk, peakThreat, uniq, cls,
+          atkPEnd, atkPStart, atkBEnd, atkBStart, atkResets, durActive,
+          detIface, rxIface, vicPEnd, vicPStart, vicBEnd, vicBStart, vicResets,
           ...vecRes
         ] = await Promise.all([
           instant(`max_over_time((sum(rate(xs_rx_packets_total[30s])))${sub})`, at),
@@ -127,51 +180,74 @@ export async function GET() {
           // attacker sources = sources of DROPPED packets (tracked in XDP), not the talker tap.
           // uniqueSources = peak distinct sources in the attacker map (thousands = spoofed).
           instant(`max_over_time((max(xs_attacker_sources))${sub}) or vector(0)`, at),
-          instant(`topk(1, max_over_time((max by(class)(xs_ddos_class_probability{class!="benign"}))${sub}))`, at),
-          instant(`topk(15, sum by(src)(increase(xs_attacker_packets_total${win})))`, at),
-          instant(`topk(15, sum by(src)(increase(xs_attacker_bytes_total${win})))`, at),
+          // Attack type from the deterministic rule (xs_detection_info), NOT the
+          // CART classifier (xs_ddos_class_probability): the CART model is trained
+          // on synthetic data and mislabels real floods (e.g. a SYN flood as
+          // "connection_flood", an ACK/ICMP/UDP flood as "benign"), whereas the
+          // rule-based detection is what actually drives mitigation and is correct.
+          // count_over_time gives how many windows each type was active -> dominant.
+          instant(`sum by(type)(count_over_time(xs_detection_info${win}))`, at),
+          // Per-source attacker drops: the counter VALUE at the end of the attack
+          // minus its value just before (0 for a fresh/flushed source). increase()
+          // over the padded window is WRONG here -- it loses the first scrape's
+          // packets for every young series (one born inside the window, which every
+          // freshly-seen attacker IP is), so summed over hundreds of sources it fell
+          // ~30% short of the true drop total. end-minus-start captures the full
+          // delta and isolates this episode from any earlier accumulation.
+          instant(`sum by(src)(xs_attacker_packets_total)`, at),
+          instant(`sum by(src)(xs_attacker_packets_total)`, atStart),
+          instant(`sum by(src)(xs_attacker_bytes_total)`, at),
+          instant(`sum by(src)(xs_attacker_bytes_total)`, atStart),
+          instant(`sum by(src)(resets(xs_attacker_packets_total${win}))`, at),
+          // True attack length in seconds (count of 1s windows detection was active),
+          // used as the denominator for average rates. The episode's coarse 30s-step
+          // span over/under-estimates; this is accurate to the second.
+          instant(`sum_over_time((max(xs_detection_active) or vector(0))[${dur}s:1s])`, at),
           // target: which interface(s) were under attack + which absorbed the ingress
           instant(`max_over_time((xs_detection_active)${sub})`, at),
           instant(`sum by(iface)(increase(xs_rx_packets_total${win}))`, at),
-          // victim: exact destination IP(s) the dropped attack packets were aimed at
-          instant(`topk(5, sum by(dst)(increase(xs_target_packets_total${win})))`, at),
-          instant(`topk(5, sum by(dst)(increase(xs_target_bytes_total${win})))`, at),
+          // victim destinations: same accurate end-minus-start delta as attackers.
+          instant(`sum by(dst)(xs_target_packets_total)`, at),
+          instant(`sum by(dst)(xs_target_packets_total)`, atStart),
+          instant(`sum by(dst)(xs_target_bytes_total)`, at),
+          instant(`sum by(dst)(xs_target_bytes_total)`, atStart),
+          instant(`sum by(dst)(resets(xs_target_packets_total${win}))`, at),
           ...VECTORS.map(([, m]) => instant(`sum(increase(${m}${win}))`, at)),
         ])
 
-        // victim destination hosts (exact IPs the flood was aimed at)
-        const vicBytesByDst = new Map<string, number>()
-        for (const s of vicB) vicBytesByDst.set(s.metric.dst, parseFloat(s.value[1]))
-        const victims = vicP
-          .map((s) => ({
-            ip: s.metric.dst,
-            packets: Math.round(parseFloat(s.value[1])),
-            bytes: Math.round(vicBytesByDst.get(s.metric.dst) ?? 0),
-          }))
+        // True attack duration in seconds (count of active 1s windows), the
+        // denominator for all average rates, with a sane fallback.
+        const durSec = Math.max(1, Math.round(num(durActive)) || ep.end - ep.start + FINE)
+
+        // victim destination hosts (exact IPs the flood was aimed at), top 5
+        const vicPkt = deltaByKey(vicPEnd, vicPStart, vicResets, 'dst')
+        const vicByte = deltaByKey(vicBEnd, vicBStart, vicResets, 'dst')
+        const victims = [...vicPkt.entries()]
+          .map(([ip, packets]) => ({ ip, packets: Math.round(packets), bytes: Math.round(vicByte.get(ip) ?? 0) }))
           .filter((v) => v.packets > 0)
           .sort((a, b) => b.packets - a.packets)
+          .slice(0, 5)
 
         // vectors above 5% of the strongest signal
         const vecVals = vecRes.map((r, k) => ({ name: VECTORS[k][0], v: num(r) }))
         const vmax = Math.max(1, ...vecVals.map((x) => x.v))
         const vectors = vecVals.filter((x) => x.v > vmax * 0.05 && x.v > 100).sort((a, b) => b.v - a.v).map((x) => x.name)
 
-        // attacker sources: IPs whose packets XDP dropped during the episode
-        // (tracked inside the dataplane), merged bytes + packets by src.
-        const atkBytesBySrc = new Map<string, number>()
-        for (const s of atkBytes) atkBytesBySrc.set(s.metric.src, parseFloat(s.value[1]))
-        const attackers = atkPkts
-          .map((s) => {
-            const ip = s.metric.src
-            const pkts = parseFloat(s.value[1])
-            const bytes = atkBytesBySrc.get(ip) ?? 0
+        // attacker sources: per-source dropped packets/bytes (accurate end-start
+        // delta), averaged over the true attack duration. Summed over all sources
+        // these now equal the episode's total drops.
+        const atkPkt = deltaByKey(atkPEnd, atkPStart, atkResets, 'src')
+        const atkByte = deltaByKey(atkBEnd, atkBStart, atkResets, 'src')
+        const attackers = [...atkPkt.entries()]
+          .map(([ip, pkts]) => {
+            const bytes = atkByte.get(ip) ?? 0
             return {
               ip,
               scope: scopeOf(ip),
               bytes,
               packets: Math.round(pkts),
-              pps: Math.round(pkts / dur),
-              bps: (bytes * 8) / dur,
+              pps: Math.round(pkts / durSec),
+              bps: (bytes * 8) / durSec,
             }
           })
           .filter((a) => a.packets > 0)
@@ -193,7 +269,17 @@ export async function GET() {
             }
           : null
 
-        const classRow = cls[0]
+        // Dominant accurate attack type over the episode, with how much of the
+        // detected time it was the active type as a confidence.
+        const detCounts = cls
+          .map((s) => ({ type: s.metric.type, n: parseFloat(s.value[1]) }))
+          .filter((x) => x.type && x.n > 0)
+          .sort((a, b) => b.n - a.n)
+        const detTotal = detCounts.reduce((a, b) => a + b.n, 0)
+        const classifier = detCounts[0]
+          ? { label: detCounts[0].type, conf: detTotal > 0 ? detCounts[0].n / detTotal : 1 }
+          : null
+
         const dropPkts = num(dropped)
         const totP = num(totPkts)
 
@@ -201,7 +287,7 @@ export async function GET() {
           id: i + 1,
           start: ep.start * 1000,
           end: ep.end * 1000,
-          durationSec: ep.end - ep.start + FINE,
+          durationSec: durSec,
           peakPps: num(peakPps),
           peakBps: num(peakBps),
           totalPackets: Math.round(totP),
@@ -210,7 +296,7 @@ export async function GET() {
           dropShare: totP > 0 ? Math.min(1, dropPkts / totP) : 0,
           peakRiskLevel: Math.round(num(peakRisk)),
           peakThreatState: Math.round(num(peakThreat)),
-          classifier: classRow ? { label: classRow.metric.class, conf: parseFloat(classRow.value[1]) } : null,
+          classifier,
           vectors,
           uniqueSources: Math.round(num(uniq)),
           attackers,
@@ -220,7 +306,38 @@ export async function GET() {
       })
     )
 
-    return NextResponse.json({ status: 'success', retentionDays: 15, attacks })
+    return { status: 'success', retentionDays: 15, attacks }
+}
+
+// Build once per bucket, deduped across concurrent callers.
+function rebuild(key: number): Promise<Payload> {
+  if (!INFLIGHT) {
+    INFLIGHT = build()
+      .then((data) => {
+        CACHE = { key, data, builtAt: Date.now() }
+        return data
+      })
+      .finally(() => {
+        INFLIGHT = null
+      })
+  }
+  return INFLIGHT
+}
+
+export async function GET() {
+  const key = Math.floor(Date.now() / 1000 / STEP) * STEP
+  try {
+    // Warm cache: serve it instantly. If it's for an old bucket or getting old,
+    // kick off a background refresh so the NEXT poll gets fresh data — the user
+    // never waits on the 5-7s reconstruction.
+    if (CACHE) {
+      const stale = CACHE.key !== key || Date.now() - CACHE.builtAt > FRESH_MS
+      if (stale) void rebuild(key).catch(() => {})
+      return NextResponse.json(CACHE.data)
+    }
+    // Cold start (no cache yet): build synchronously this once.
+    const data = await rebuild(key)
+    return NextResponse.json(data)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     return NextResponse.json({ status: 'error', error: msg }, { status: 502 })

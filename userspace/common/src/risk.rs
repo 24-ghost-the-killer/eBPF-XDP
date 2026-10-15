@@ -242,10 +242,19 @@ impl RiskEngine {
             } else if self.escalations_this_window >= self.cfg.escalation_budget {
                 reason = format!("{reason}; escalation deferred: budget exhausted");
             } else {
-                st.level = Level::from_usize(st.level as usize + 1);
+                // Jump straight to the risk's target rung instead of climbing one
+                // rung per escalation. Climbing one-at-a-time meant a clear flood
+                // (which maps directly to the top of the ladder) took ~5 escalations
+                // to reach level 5 where DROP_UDP_STRICT and the hard aggregate cap
+                // arm -- ~10s, and at multi-Mpps that let ~100M packets through
+                // before mitigation was fully effective. Hysteresis (escalate_windows)
+                // still gates WHEN we move and the budget/breaker/allowlist guard
+                // rails are unchanged; this only changes HOW FAR per move. target is
+                // always > st.level here, and the max() keeps it a strict climb.
+                st.level = target.max(Level::from_usize(st.level as usize + 1));
                 st.above = 0;
                 self.escalations_this_window += 1;
-                reason = format!("{reason}; escalated");
+                reason = format!("{reason}; escalated to {}", st.level.as_str());
             }
         }
 
@@ -297,6 +306,26 @@ mod tests {
             level = e.decide("1.2.3.4", &ev, false, w).level;
         }
         assert_eq!(level, Level::TemporaryBlock, "reached {level:?}");
+    }
+
+    #[test]
+    fn clear_flood_jumps_to_top_rung_fast() {
+        // A clear, sustained flood maps to the top of the ladder and must reach
+        // it within ~escalate_windows, not after climbing every rung (which used
+        // to take ~5x longer and leaked packets before DROP_UDP_STRICT armed).
+        let mut cfg = Config::default();
+        cfg.escalate_windows = 2;
+        let mut e = RiskEngine::new(cfg);
+        let ev = attack_ev();
+        let mut reached_at = None;
+        for w in 0..6u64 {
+            e.begin_window(1);
+            if e.decide("svc", &ev, false, w).level == Level::TemporaryBlock {
+                reached_at = Some(w);
+                break;
+            }
+        }
+        assert!(matches!(reached_at, Some(w) if w <= 2), "reached top at window {reached_at:?}");
     }
 
     #[test]

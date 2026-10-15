@@ -69,9 +69,17 @@ export default function Attacks() {
 
   useEffect(() => {
     let alive = true
+    let busy = false
     const load = async () => {
+      // /api/attacks reconstructs 15 days of history (many Prometheus queries)
+      // and can be slow under attack — guard against overlap and abort if it
+      // stalls, so this poll never piles up and freezes the Attacks tab.
+      if (busy) return
+      busy = true
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 25000)
       try {
-        const r = await fetch('/api/attacks', { cache: 'no-store' })
+        const r = await fetch('/api/attacks', { cache: 'no-store', signal: ctrl.signal })
         const j = await r.json()
         if (!alive) return
         if (j.status !== 'success') throw new Error(j.error || 'failed')
@@ -80,6 +88,8 @@ export default function Attacks() {
       } catch (e) {
         if (alive) setErr(e instanceof Error ? e.message : String(e))
       } finally {
+        clearTimeout(timer)
+        busy = false
         if (alive) setLoading(false)
       }
     }
@@ -92,7 +102,9 @@ export default function Attacks() {
   }, [])
 
   if (loading) return <div className="panel p-6 text-center text-sm text-zinc-500">Reconstructing attack history from 15 days of telemetry…</div>
-  if (err) return <div className="panel p-6 text-sm text-amber-300">Couldn&apos;t load attack history: {err}</div>
+  // Only blank the tab on error if we have nothing to show; otherwise keep the
+  // last-good history visible (a refresh can transiently fail under load).
+  if (err && !data) return <div className="panel p-6 text-sm text-amber-300">Couldn&apos;t load attack history: {err}</div>
   if (!data || data.length === 0)
     return (
       <SpotlightCard className="p-8 text-center">
@@ -170,7 +182,7 @@ export default function Attacks() {
                 <div className="mt-3 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-7">
                   <Stat label="peak risk level" value={`${a.peakRiskLevel} / 5`} tone={crit ? 'text-rose-300' : 'text-amber-300'} />
                   <Stat label="threat state" value={['normal', 'suspect', 'under attack'][a.peakThreatState] ?? String(a.peakThreatState)} tone="text-rose-300" />
-                  <Stat label="classifier" value={a.classifier ? `${a.classifier.label} ${(a.classifier.conf * 100).toFixed(0)}%` : 'n/a'} tone="text-fuchsia-300" />
+                  <Stat label="attack type" value={a.classifier ? `${a.classifier.label} ${(a.classifier.conf * 100).toFixed(0)}%` : 'n/a'} tone="text-fuchsia-300" />
                   <Stat label="unique sources" value={String(a.uniqueSources)} />
                   <div className="col-span-2 lg:col-span-3">
                     <div className="text-[9.5px] uppercase tracking-[0.12em] text-zinc-600">vectors</div>
@@ -239,30 +251,40 @@ export default function Attacks() {
                       </div>
                     )
                   ) : (
-                    <table className="w-full text-[11px] font-mono">
-                      <thead>
-                        <tr className="text-[10px] uppercase text-zinc-600">
-                          <th className="pb-1 text-left font-normal">source ip</th>
-                          <th className="pb-1 text-left font-normal">scope</th>
-                          <th className="pb-1 text-right font-normal">sent</th>
-                          <th className="pb-1 text-right font-normal">packets</th>
-                          <th className="pb-1 text-right font-normal">avg pps</th>
-                          <th className="pb-1 text-right font-normal">avg bps</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {a.attackers.map((at) => (
-                          <tr key={at.ip} className="border-t border-white/[0.05]">
-                            <td className="py-[3px] text-zinc-200">{at.ip}</td>
-                            <td className={at.scope === 'lan' ? 'text-emerald-500' : 'text-sky-500'}>{at.scope}</td>
-                            <td className="text-right tabular-nums text-zinc-300">{bytes(at.bytes)}</td>
-                            <td className="text-right tabular-nums text-zinc-300">{Math.round(at.packets).toLocaleString('en-US')}</td>
-                            <td className="text-right tabular-nums text-rose-300">{pps(at.pps)}</td>
-                            <td className="text-right tabular-nums text-orange-300">{bps(at.bps)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                    <>
+                      {a.attackers.length > 15 && (
+                        <div className="mb-1 text-[10px] text-zinc-500">
+                          {a.attackers.length.toLocaleString('en-US')} sources — scroll for all
+                        </div>
+                      )}
+                      {/* ~15 rows tall, then scroll. Sticky header stays put. */}
+                      <div className="max-h-[360px] overflow-y-auto rounded-md border border-white/[0.05] pr-1">
+                        <table className="w-full text-[11px] font-mono">
+                          <thead className="sticky top-0 z-10 bg-[#0b0b11]">
+                            <tr className="text-[10px] uppercase text-zinc-600">
+                              <th className="px-2 py-1 text-left font-normal">source ip</th>
+                              <th className="py-1 text-left font-normal">scope</th>
+                              <th className="py-1 text-right font-normal">sent</th>
+                              <th className="py-1 text-right font-normal">packets</th>
+                              <th className="py-1 text-right font-normal">avg pps</th>
+                              <th className="px-2 py-1 text-right font-normal">avg bps</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {a.attackers.map((at) => (
+                              <tr key={at.ip} className="border-t border-white/[0.05]">
+                                <td className="px-2 py-[3px] text-zinc-200">{at.ip}</td>
+                                <td className={at.scope === 'lan' ? 'text-emerald-500' : 'text-sky-500'}>{at.scope}</td>
+                                <td className="text-right tabular-nums text-zinc-300">{bytes(at.bytes)}</td>
+                                <td className="text-right tabular-nums text-zinc-300">{Math.round(at.packets).toLocaleString('en-US')}</td>
+                                <td className="text-right tabular-nums text-rose-300">{pps(at.pps)}</td>
+                                <td className="px-2 text-right tabular-nums text-orange-300">{bps(at.bps)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
                   )}
                 </div>
               </div>

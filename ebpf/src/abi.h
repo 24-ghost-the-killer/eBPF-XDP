@@ -179,13 +179,18 @@ enum xs_config_flags {
 	 * shadow (CONNTRACK alone) before enabling DROP_UNTRACKED. */
 	XS_CFG_CONNTRACK          = 1u << 16,
 	XS_CFG_DROP_UNTRACKED     = 1u << 17,
+	/* Drop any IPv6 packet carrying >=1 extension header. Extension headers are
+	 * rare in normal traffic but are abused for ext-header floods and parser
+	 * evasion, so the risk engine arms this only under an IPv6 ext-header flood
+	 * and lifts it when the flood ends. */
+	XS_CFG_DROP_IPV6_EXT      = 1u << 18,
 };
 #define XS_CFG_KNOWN_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
 			    XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
 			    XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT | \
 			    XS_CFG_SAMPLING | XS_CFG_HLL | XS_CFG_DPORT_HIST | XS_CFG_GLOBAL_RL | \
 			    XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT | \
-			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED)
+			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED | XS_CFG_DROP_IPV6_EXT)
 /* Flags an operator sets directly (sentinelctl config); CHECK_* are managed
  * automatically by the block/allow commands as the maps gain or lose entries. */
 #define XS_CFG_OPERATOR_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \

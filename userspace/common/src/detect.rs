@@ -25,6 +25,8 @@ use crate::features::index_of;
 pub enum AttackType {
     SynFlood,
     AckFlood,
+    RstFlood,
+    FinFlood,
     UdpFlood,
     UdpReflection,
     IcmpFlood,
@@ -32,6 +34,9 @@ pub enum AttackType {
     MalformedFlood,
     ConnectionFlood,
     DnsAmplification,
+    Ipv6Flood,
+    Icmpv6Flood,
+    Ipv6ExtFlood,
 }
 
 impl AttackType {
@@ -39,6 +44,8 @@ impl AttackType {
         match self {
             AttackType::SynFlood => "syn_flood",
             AttackType::AckFlood => "ack_flood",
+            AttackType::RstFlood => "rst_flood",
+            AttackType::FinFlood => "fin_flood",
             AttackType::UdpFlood => "udp_flood",
             AttackType::UdpReflection => "udp_reflection",
             AttackType::IcmpFlood => "icmp_flood",
@@ -46,8 +53,34 @@ impl AttackType {
             AttackType::MalformedFlood => "malformed_flood",
             AttackType::ConnectionFlood => "connection_flood",
             AttackType::DnsAmplification => "dns_amplification",
+            AttackType::Ipv6Flood => "ipv6_flood",
+            AttackType::Icmpv6Flood => "icmpv6_flood",
+            AttackType::Ipv6ExtFlood => "ipv6_ext_flood",
         }
     }
+}
+
+/// IPv6-specific classification from raw counts, kept OUT of the model feature
+/// vector (so it never changes the schema hash). Called alongside `classify`;
+/// when it fires it refines a generic result into the precise IPv6 attack type.
+/// Returns None for non-IPv6-dominant traffic so the normal path is used.
+pub fn classify_ipv6(wi: &crate::features::WindowInput) -> Option<AttackType> {
+    let pkts = wi.packets as f64;
+    if pkts < 1.0 || (wi.ipv6 as f64) < 0.5 * pkts {
+        return None; // not IPv6-dominant
+    }
+    // Extension-header flood: a large share of IPv6 packets carry ext headers
+    // (rare in normal traffic). Most specific, so checked first.
+    if (wi.ipv6_ext as f64) > 0.4 * (wi.ipv6 as f64) {
+        return Some(AttackType::Ipv6ExtFlood);
+    }
+    // ICMPv6 flood: ICMPv6 dominates (it is also counted in `icmp`, so without
+    // this it would mislabel as a generic icmp_flood).
+    if (wi.icmpv6 as f64) > 0.6 * pkts {
+        return Some(AttackType::Icmpv6Flood);
+    }
+    // Generic IPv6 volumetric flood (not TCP/UDP/ICMP-shaped enough to name).
+    Some(AttackType::Ipv6Flood)
 }
 
 /// A window's detection result.
@@ -172,6 +205,9 @@ pub fn classify(vec: &[f64]) -> Option<AttackType> {
     let dport_entropy = f("dport_entropy");
     let flows_per_src = f("flows_per_src");
     let ack_rate = f("tcp_ack_rate");
+    let rst_rate = f("tcp_rst_rate");
+    let fin_rate = f("tcp_fin_rate");
+    let bad_flags_rate = f("tcp_bad_flags_rate");
 
     // Order matters: most specific first.
     if malformed.is_finite() && malformed > 1000.0 {
@@ -202,14 +238,29 @@ pub fn classify(vec: &[f64]) -> Option<AttackType> {
         if flows_per_src.is_finite() && flows_per_src > 50.0 && syn_share > 0.3 {
             return Some(AttackType::ConnectionFlood);
         }
-        // TCP-dominant flood with few SYNs = an ACK/RST/untracked-TCP flood
-        // (the `ack_rate` ratio is unreliable because the limiter may be
-        // dropping before the flags are classified, so key on the SYN share).
+        // TCP-dominant flood with few SYNs = a non-handshake flag flood. Pick the
+        // dominant flag class by its per-second rate (generalized TCP flag engine,
+        // rather than a hard-coded rule per combination). A flood of impossible
+        // flag combinations (NULL/XMAS/SYN+FIN/...) shows up as tcp_bad_flags and
+        // is treated as malformed. RST- and FIN-dominant floods are named
+        // explicitly; anything else non-SYN falls back to the ACK/untracked case.
+        // All three are mitigated the same safe way (conntrack drop_untracked +
+        // rate limit), so misattribution between them never breaks real TCP.
         if syn_share < 0.2 {
-            return Some(AttackType::AckFlood);
+            let rates = [
+                (AttackType::AckFlood, ack_rate),
+                (AttackType::RstFlood, rst_rate),
+                (AttackType::FinFlood, fin_rate),
+                (AttackType::MalformedFlood, bad_flags_rate),
+            ];
+            let dominant = rates
+                .iter()
+                .filter(|(_, r)| r.is_finite() && *r > 0.0)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            return Some(dominant.map(|(t, _)| *t).unwrap_or(AttackType::AckFlood));
         }
     }
-    let _ = (ack_rate, pps);
+    let _ = pps;
     None
 }
 
@@ -369,11 +420,58 @@ mod tests {
         }
     }
 
+    fn tcp_flag_flood(syn: u64, ack: u64, rst: u64, fin: u64, bad: u64) -> Vec<f64> {
+        let total = syn + ack + rst + fin + bad + 100;
+        features::compute(&WindowInput {
+            dt_s: 1.0,
+            packets: total,
+            bytes: total * 60,
+            tcp_syn: syn,
+            tcp_ack: ack,
+            tcp_rst: rst,
+            tcp_fin: fin,
+            tcp_bad_flags: bad,
+            tcp_total: total,
+            unique_src: 5000.0,
+            unique_flows: 50000.0,
+            sub_counts: [(total / 10).max(1); 10],
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn classify_signatures() {
         assert_eq!(classify(&syn_flood()), Some(AttackType::SynFlood));
         assert_eq!(classify(&udp_reflection()), Some(AttackType::UdpReflection));
         assert_eq!(classify(&benign(7)), None);
+    }
+
+    #[test]
+    fn ipv6_classifier() {
+        let base = |ipv6, icmpv6, ext| WindowInput {
+            dt_s: 1.0, packets: 100_000, bytes: 100_000 * 80,
+            ipv6, icmpv6, ipv6_ext: ext, sub_counts: [10_000; 10], ..Default::default()
+        };
+        // ICMPv6 flood: IPv6-dominant, ICMPv6 dominates.
+        assert_eq!(classify_ipv6(&base(99_000, 98_000, 0)), Some(AttackType::Icmpv6Flood));
+        // Extension-header flood: most IPv6 packets carry ext headers.
+        assert_eq!(classify_ipv6(&base(99_000, 0, 90_000)), Some(AttackType::Ipv6ExtFlood));
+        // Generic IPv6 volumetric.
+        assert_eq!(classify_ipv6(&base(99_000, 0, 0)), Some(AttackType::Ipv6Flood));
+        // Not IPv6-dominant -> None (normal path handles it).
+        assert_eq!(classify_ipv6(&base(1_000, 0, 0)), None);
+    }
+
+    #[test]
+    fn generalized_tcp_flag_engine() {
+        // Each non-SYN TCP flood is named by its dominant flag class.
+        assert_eq!(classify(&tcp_flag_flood(10, 190_000, 10, 10, 0)), Some(AttackType::AckFlood));
+        assert_eq!(classify(&tcp_flag_flood(10, 10, 190_000, 10, 0)), Some(AttackType::RstFlood));
+        assert_eq!(classify(&tcp_flag_flood(10, 10, 10, 190_000, 0)), Some(AttackType::FinFlood));
+        // A flood of impossible flag combos (NULL/XMAS/SYN+FIN) -> malformed.
+        assert_eq!(classify(&tcp_flag_flood(10, 10, 10, 10, 190_000)), Some(AttackType::MalformedFlood));
+        // A real SYN flood is still a SYN flood, not caught by the flag engine.
+        assert_eq!(classify(&syn_flood()), Some(AttackType::SynFlood));
     }
 
     #[test]

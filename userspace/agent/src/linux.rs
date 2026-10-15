@@ -264,7 +264,13 @@ fn all_metrics(cfg: &Config, analysis: &Mutex<Analysis>) -> String {
 /// maps only on a drop, so when nothing is being mitigated they're empty and
 /// no series is emitted (idle = silent). Cardinality is bounded to the top N.
 fn render_drop_ips(iface: &str, layout: &PinLayout, map_name: &str, metric: &str, label: &str, count_metric: &str) -> String {
-    const TOP_N: usize = 24;
+    // Export every source/dest the LRU map holds (its max_entries is the ceiling:
+    // 8192 for attackers, 4096 for victims), so the dashboard can list ALL
+    // attributable sources, not just the top few. For a distributed botnet this
+    // surfaces every member; for a fully source-spoofed flood the map churns many
+    // 1-packet sources (none dominant), which the UI already summarises instead of
+    // listing. `xs_<count_metric>` still reports the true distinct total.
+    const TOP_N: usize = 8192;
     let Ok(map) = MapHandle::from_pinned_path(layout.map(map_name)) else {
         return String::new();
     };
@@ -563,6 +569,9 @@ fn window_input(delta: &Snapshot, dt: f64, prev_pps: f64) -> WindowInput {
     let tcp = cv("l4_tcp");
     let udp = cv("l4_udp");
     let icmp = cv("l4_icmp") + cv("l4_icmpv6");
+    let icmpv6 = cv("l4_icmpv6");
+    let ipv6 = cv("l3_ipv6");
+    let ipv6_ext = cv("ipv6_ext");
     WindowInput {
         dt_s: dt,
         packets: cv("rx"),
@@ -579,6 +588,9 @@ fn window_input(delta: &Snapshot, dt: f64, prev_pps: f64) -> WindowInput {
         udp_bytes: delta.get(25).bytes,
         udp_len_mismatch: cv("anom_udp_len_mismatch"),
         icmp,
+        icmpv6,
+        ipv6,
+        ipv6_ext,
         frag: cv("frag_first") + cv("frag_later"),
         other_l4: cv("l4_other"),
         malformed: sum_prefix(delta, "parse_err_"),
@@ -804,13 +816,24 @@ impl Analyzer {
                     "udp_flood" | "udp_reflection" | "dns_amplification" => ConfigFlags::DROP_UDP.bits(),
                     "frag_flood" => ConfigFlags::DROP_FRAGMENTS.bits(),
                     "malformed_flood" => ConfigFlags::DROP_MALFORMED.bits(),
-                    "icmp_flood" => ConfigFlags::DROP_ICMP.bits(),
+                    // DROP_ICMP covers both ICMP and ICMPv6 in the datapath.
+                    "icmp_flood" | "icmpv6_flood" => ConfigFlags::DROP_ICMP.bits(),
+                    // New defense: drop IPv6 packets carrying extension headers.
+                    "ipv6_ext_flood" => ConfigFlags::DROP_IPV6_EXT.bits(),
+                    // Generic IPv6 volumetric flood: no safe per-vector drop, rely on
+                    // the per-source + aggregate rate limiters below.
+                    "ipv6_flood" => 0,
                     // ACK/RST floods: the correct, safe tool is conntrack's
                     // drop_untracked (drops ACKs with no established flow). It is
                     // NOT drop_ack, which would kill every live connection.
                     // Conntrack runs continuously, so real connections are
                     // already tracked; the allowlisted admin is exempt.
-                    "ack_flood" => ConfigFlags::DROP_UNTRACKED.bits(),
+                    // ACK/RST/FIN floods: non-handshake TCP with no established
+                    // flow. The safe tool is conntrack's drop_untracked (drops only
+                    // TCP that matches no tracked connection), NOT drop_syn/ack/fin
+                    // which would kill live sessions. Real connections are already
+                    // tracked; the allowlisted admin is exempt.
+                    "ack_flood" | "rst_flood" | "fin_flood" => ConfigFlags::DROP_UNTRACKED.bits(),
                     _ => ConfigFlags::DROP_BAD_TCP_FLAGS.bits(),
                 };
                 // Connection-tracking enforcement (opt-in via XS_CONNTRACK_ENFORCE
@@ -883,6 +906,18 @@ impl Analyzer {
         // the classifier only to name the type when the rules found none, and for
         // the ddos score.
         let mut dtype = det.suspected.map(|t| t.as_str().to_string()).unwrap_or_default();
+        // IPv6-specific refinement (raw-signal, outside the model vector): name an
+        // ICMPv6 / ext-header / generic-IPv6 flood that would otherwise read as a
+        // generic icmp_flood or go unnamed. Always override for the specific IPv6
+        // types; for generic ipv6_flood only when nothing better was found, so a
+        // real UDP/TCP-over-IPv6 flood keeps its (correct) udp/tcp class and its
+        // matching drop. Never changes the model schema.
+        if let Some(t) = xs_common::detect::classify_ipv6(&wi) {
+            let name = t.as_str();
+            if name == "icmpv6_flood" || name == "ipv6_ext_flood" || dtype.is_empty() || dtype == "icmp_flood" {
+                dtype = name.to_string();
+            }
+        }
         if let Some(clf) = &self.classifier {
             let probs = clf.predict_proba(&vec);
             for (c, p) in clf.classes().iter().zip(&probs) {

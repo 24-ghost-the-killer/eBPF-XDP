@@ -20,13 +20,14 @@ const FLAG_ORDER = [
 function Chip({ name, on }: { name: string; on: boolean }) {
   return (
     <span
-      className={`mono rounded px-1.5 py-0.5 text-[9.5px] tracking-tight transition-colors ${
+      className={`mono inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9.5px] tracking-tight transition-colors ${
         on
-          ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-inset ring-emerald-500/30'
-          : 'bg-white/[0.02] text-zinc-600 ring-1 ring-inset ring-white/[0.05]'
+          ? 'bg-emerald-500/20 font-semibold text-emerald-300 ring-1 ring-inset ring-emerald-500/40'
+          : 'bg-transparent text-zinc-600 opacity-45 ring-1 ring-inset ring-white/[0.04]'
       }`}
-      title={on ? `${name}: ARMED` : `${name}: off`}
+      title={on ? `${name}: ARMED` : `${name}: not armed`}
     >
+      {on && <span className="inline-block h-1 w-1 rounded-full bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.9)]" />}
       {name}
     </span>
   )
@@ -48,17 +49,29 @@ export default function Defenses({ d }: { d: DefenseData | null }) {
       <div className="space-y-3">
         {ifaces.map((ifc) => {
           const fl = d!.flags[ifc]
-          const armed = Object.values(fl).filter((v) => v > 0).length
           const ordered = FLAG_ORDER.filter((f) => f in fl).concat(Object.keys(fl).filter((f) => !FLAG_ORDER.includes(f)))
+          // Armed flags first (keeping human order within each group) so the
+          // active defenses are obvious at a glance and not lost among the ~14
+          // inactive ones.
+          const armedFlags = ordered.filter((f) => fl[f] > 0)
+          const offFlags = ordered.filter((f) => !(fl[f] > 0))
           return (
             <div key={ifc}>
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-[11px] font-medium text-zinc-300">{vlanName(ifc)}</span>
-                <span className="mono text-[10px] text-zinc-500">{armed}/{ordered.length} armed</span>
+                <span className="mono text-[10px]">
+                  <span className={armedFlags.length > 0 ? 'text-emerald-400' : 'text-zinc-500'}>{armedFlags.length}</span>
+                  <span className="text-zinc-600">/{ordered.length} armed</span>
+                </span>
               </div>
-              <div className="flex flex-wrap gap-1">
-                {ordered.map((f) => (
-                  <Chip key={f} name={f} on={fl[f] > 0} />
+              <div className="flex flex-wrap items-center gap-1">
+                {armedFlags.length === 0 && <span className="mono text-[9.5px] text-zinc-600">— baseline, none armed —</span>}
+                {armedFlags.map((f) => (
+                  <Chip key={f} name={f} on />
+                ))}
+                {armedFlags.length > 0 && offFlags.length > 0 && <span className="mx-0.5 h-3 w-px bg-white/10" />}
+                {offFlags.map((f) => (
+                  <Chip key={f} name={f} on={false} />
                 ))}
               </div>
             </div>

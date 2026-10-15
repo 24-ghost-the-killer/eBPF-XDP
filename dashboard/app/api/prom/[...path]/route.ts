@@ -17,7 +17,9 @@ export async function GET(
   const path = params.path.join('/')
   const url = `${PROM}/${path}${req.nextUrl.search}`
   try {
-    const r = await fetch(url, { cache: 'no-store' })
+    // Bound each proxied query so a slow/overloaded Prometheus can't pin a
+    // Next.js worker open and starve the rest of the dashboard under attack.
+    const r = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(12000) })
     const body = await r.text()
     return new NextResponse(body, {
       status: r.status,

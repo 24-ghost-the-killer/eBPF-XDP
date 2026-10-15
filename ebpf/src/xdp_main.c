@@ -56,6 +56,8 @@ static __always_inline int xs_validity_verdict(int rc, const struct xs_pkt *p, _
 		return XDP_DROP;
 	if (p->frag != XS_FRAG_NONE && (flags & XS_CFG_DROP_FRAGMENTS))
 		return XDP_DROP;
+	if (p->n_ext > 0 && (flags & XS_CFG_DROP_IPV6_EXT))
+		return XDP_DROP; /* IPv6 extension-header flood */
 	/*
 	 * Per-vector drops the risk engine turns on for the detected attack type.
 	 * DROP_UDP_STRICT closes the ephemeral-port / fragment / reflection gaps of

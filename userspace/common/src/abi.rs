@@ -211,12 +211,15 @@ impl ConfigFlags {
     /// (shadow); DROP_UNTRACKED also drops it.
     pub const CONNTRACK: ConfigFlags = ConfigFlags(1 << 16);
     pub const DROP_UNTRACKED: ConfigFlags = ConfigFlags(1 << 17);
-    pub const KNOWN: u32 = 0b11_1111_1111_1111_1111;
+    /// Drop IPv6 packets carrying extension headers (ext-header flood). Auto-armed
+    /// by the risk engine under an IPv6 ext-header flood, lifted when it ends.
+    pub const DROP_IPV6_EXT: ConfigFlags = ConfigFlags(1 << 18);
+    pub const KNOWN: u32 = 0b111_1111_1111_1111_1111;
     /// Bits an operator toggles directly (the rest are auto-managed).
     pub const OPERATOR: u32 = 0b1000_1111;
 
     /// Names in bit order, used for display and the CLI.
-    pub const NAMES: [(ConfigFlags, &'static str); 18] = [
+    pub const NAMES: [(ConfigFlags, &'static str); 19] = [
         (Self::DROP_MALFORMED, "drop_malformed"),
         (Self::DROP_BAD_TCP_FLAGS, "drop_bad_tcp_flags"),
         (Self::DROP_FRAGMENTS, "drop_fragments"),
@@ -235,6 +238,7 @@ impl ConfigFlags {
         (Self::DROP_UDP_STRICT, "drop_udp_strict"),
         (Self::CONNTRACK, "conntrack"),
         (Self::DROP_UNTRACKED, "drop_untracked"),
+        (Self::DROP_IPV6_EXT, "drop_ipv6_ext"),
     ];
 
     /// Validate bits coming from an operator or API before they reach the

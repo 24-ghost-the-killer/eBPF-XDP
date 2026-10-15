@@ -506,10 +506,19 @@ export default function Page() {
       </nav>
 
       <main className="flex-1 px-4 py-4 lg:px-6">
-        {status.error && (
+        {status.error && !s && (
           <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-300">
             Can&apos;t reach Prometheus ({status.error}). The dashboard proxies{' '}
             <code className="text-amber-200">/api/prom → localhost:9091</code> on the server.
+          </div>
+        )}
+        {status.error && s && (
+          // We still have last-good data, so keep rendering it and show only a
+          // subtle notice. This is what happens when the appliance is too busy
+          // (e.g. mid-attack) to answer a poll in time — values are stale, not gone.
+          <div className="mb-4 flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.06] px-3 py-1.5 text-xs text-amber-300/80">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+            Live data delayed — appliance busy ({status.error}). Showing last known values, retrying…
           </div>
         )}
         {body}

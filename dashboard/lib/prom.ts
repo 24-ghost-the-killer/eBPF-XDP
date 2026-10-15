@@ -13,12 +13,31 @@ export interface RangeResult {
 }
 export type Row = { t: number; [key: string]: number }
 
+// Every query is aborted after TIMEOUT_MS. Without this, when the appliance is
+// under heavy load and Prometheus/the proxy slow down, browser fetches hang
+// forever; the dashboard fires dozens of them per poll cycle, so they pile up
+// past the browser's ~6-connection-per-host cap and the whole UI freezes
+// mid-attack. Aborting frees the connection so the next poll can get through.
+const TIMEOUT_MS = 12000
+
 async function call(path: string) {
-  const r = await fetch(`${BASE}${path}`)
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  const j = await r.json()
-  if (j.status !== 'success') throw new Error(j.error || 'query failed')
-  return j.data
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS)
+  try {
+    const r = await fetch(`${BASE}${path}`, { signal: ctrl.signal, cache: 'no-store' })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const j = await r.json()
+    if (j.status !== 'success') throw new Error(j.error || 'query failed')
+    return j.data
+  } catch (e) {
+    // The browser aborts with the opaque "signal is aborted without reason";
+    // surface something the UI can show meaningfully (the appliance is just
+    // slow to answer, usually because it's busy under attack).
+    if (e instanceof DOMException && e.name === 'AbortError') throw new Error('query timed out (appliance busy)')
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export async function instant(expr: string): Promise<InstantResult[]> {

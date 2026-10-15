@@ -133,6 +133,12 @@ pub struct WindowInput {
     pub udp_bytes: u64,
     pub udp_len_mismatch: u64,
     pub icmp: u64,
+    /// IPv6-specific raw counts. NOT part of the model feature vector (SCHEMA) —
+    /// they feed the rule-based IPv6 classifier only, so adding them never changes
+    /// the schema hash and the trained models keep loading.
+    pub ipv6: u64,
+    pub icmpv6: u64,
+    pub ipv6_ext: u64,
     pub frag: u64,
     pub other_l4: u64,
     pub malformed: u64,
