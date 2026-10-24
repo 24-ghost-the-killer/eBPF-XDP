@@ -43,10 +43,12 @@ pub enum Mode {
 #[serde(deny_unknown_fields)]
 pub struct Interface {
     pub name: String,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only read by linux.rs
     #[serde(default)]
     pub mode: Mode,
     /// If true (default) the agent attaches the program (reusing pinned maps);
     /// if false it only reads metrics from whatever is already attached.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only read by linux.rs
     #[serde(default = "default_true")]
     pub attach: bool,
 }
@@ -63,6 +65,7 @@ pub struct Config {
     pub metrics_addr: SocketAddr,
     #[serde(default = "default_pin_root")]
     pub pin_root: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only read by linux.rs
     #[serde(default = "default_bpf_obj")]
     pub bpf_obj: PathBuf,
     /// Interfaces to manage. Renamed `interface` in TOML (`[[interface]]`).

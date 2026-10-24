@@ -1,0 +1,11 @@
+{
+  "_comment": "Dashboard users & groups. Install at a path writable by the dashboard user (set DASH_USERS_FILE to it), chmod 600. A group grants a set of pages; a user belongs to a group. Valid page ids: overview, explore, attacks, ai, protect, ip, query, users (users = the admin page). Do NOT hand-edit password fields — use the admin Users page or: node dashboard/scripts/dash-users.mjs add <user> <group>. Seed defaults + admin/admin with: dash-users.mjs init.",
+  "groups": [
+    { "name": "admins", "pages": ["overview", "explore", "attacks", "ai", "protect", "ip", "query", "users"] },
+    { "name": "operators", "pages": ["overview", "explore", "attacks", "ai", "ip", "query", "protect"] },
+    { "name": "viewers", "pages": ["overview", "explore", "attacks", "ai", "ip", "query"] }
+  ],
+  "users": [
+    { "username": "admin", "group": "admins", "password": "scrypt$16384$8$1$<saltHex>$<hashHex>" }
+  ]
+}

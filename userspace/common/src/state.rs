@@ -6,7 +6,7 @@
 //! `sentinel-agent` restores them on startup after (re)attaching.
 //!
 //! Only the operator-controlled parts are persisted. The auto-managed
-//! `CHECK_ALLOW` / `CHECK_POLICY` bits are cleared before saving, because
+//! `CHECK_ALLOW` / `CHECK_POLICY` / `SERVICE_ALLOW` bits are cleared before saving, because
 //! they are derived from the (ephemeral, TTL'd) policy maps and must start
 //! clear on a fresh boot. Blocks and allowlist entries are deliberately not
 //! persisted: they are dynamic and carry their own TTLs.
@@ -33,7 +33,9 @@ pub fn file(iface: &str) -> PathBuf {
 /// typically ignore the error so a read-only state dir never fails a command.
 pub fn save(iface: &str, cfg: &Config) -> io::Result<()> {
     let mut c = *cfg;
-    let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits();
+    let managed = ConfigFlags::CHECK_ALLOW.bits()
+        | ConfigFlags::CHECK_POLICY.bits()
+        | ConfigFlags::SERVICE_ALLOW.bits();
     c.flags = ConfigFlags::from_bits_retain(c.flags.bits() & !managed);
     std::fs::create_dir_all(dir())?;
     let path = file(iface);

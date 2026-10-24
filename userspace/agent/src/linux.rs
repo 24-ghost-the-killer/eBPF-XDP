@@ -27,7 +27,10 @@ use xs_common::features::{self, WindowInput};
 use xs_common::iforest::Forest;
 use xs_common::risk::{Evidence, RiskEngine};
 use xs_common::metrics::prometheus;
-use xs_common::pin::{PinLayout, MAP_ATTACKER_V4, MAP_CONFIG, MAP_STATS, MAP_VICTIM_V4, PROG_NAME};
+use xs_common::pin::{
+    PinLayout, MAP_ATTACKER_V4, MAP_CONFIG, MAP_PROTECTED_V4, MAP_SERVICE_V4, MAP_STATS,
+    MAP_VICTIM_V4, PROG_NAME,
+};
 use xs_common::{Config as DpConfig, ConfigFlags, Snapshot};
 
 use crate::config::{Config, Interface, Mode};
@@ -140,7 +143,8 @@ fn restore_config(layout: &PinLayout) -> Result<()> {
     let raw = map.lookup(&0u32.to_ne_bytes(), MapFlags::ANY)?.unwrap_or_default();
     let current = DpConfig::from_bytes(&raw).unwrap_or_default();
 
-    let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits();
+    let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
+            | ConfigFlags::SERVICE_ALLOW.bits();
     let flags = ConfigFlags::from_bits_retain(
         (saved.flags.bits() & !managed) | (current.flags.bits() & managed),
     );
@@ -229,7 +233,7 @@ fn iface_metrics(iface: &str, layout: &PinLayout) -> Result<String> {
     Ok(prometheus(iface, &snap, mode, &flag_pairs))
 }
 
-fn all_metrics(cfg: &Config, analysis: &Mutex<Analysis>) -> String {
+fn all_metrics(cfg: &Config, analyses: &[(String, Arc<Mutex<Analysis>>)]) -> String {
     let mut body = String::from(
         "# HELP xs_agent_up 1 while the agent process is running.\n# TYPE xs_agent_up gauge\nxs_agent_up 1\n",
     );
@@ -251,9 +255,14 @@ fn all_metrics(cfg: &Config, analysis: &Mutex<Analysis>) -> String {
             )),
         }
     }
-    // Phase 6-13 analysis gauges (detector, models, risk).
-    if let Ok(a) = analysis.lock() {
-        body.push_str(&render_analysis(&a));
+    // Phase 6-13 analysis gauges (detector, models, risk) — one block per
+    // interface, so each monitored interface reports its own threat/risk/class.
+    for (_name, slot) in analyses {
+        if let Ok(a) = slot.lock() {
+            if a.valid {
+                body.push_str(&render_analysis(&a));
+            }
+        }
     }
     body
 }
@@ -378,6 +387,63 @@ fn cval(snap: &Snapshot, name: &str) -> u64 {
         .find(|d| d.name == name)
         .map(|d| snap.get(d.slot).packets)
         .unwrap_or(0)
+}
+
+/// Build the `/api/services.json` body: the service allowlist (default-deny)
+/// state per managed interface -- which destinations are protected and which
+/// `{proto, port}` services are permitted on each. Read-only; the dashboard's
+/// Protection page renders it. Reads the pinned maps the agent already owns.
+fn api_services_json(cfg: &Config) -> String {
+    use std::collections::BTreeMap;
+
+    let proto_name = |p: u8| -> &'static str {
+        match p {
+            6 => "tcp",
+            17 => "udp",
+            1 => "icmp",
+            _ => "other",
+        }
+    };
+
+    let mut ifaces = Vec::new();
+    for iface in &cfg.interfaces {
+        let name = iface.name.clone();
+        let Ok(layout) = PinLayout::new(&cfg.pin_root, &name) else { continue };
+
+        // Group service entries by destination IP.
+        let mut by_ip: BTreeMap<[u8; 4], Vec<(u8, u16)>> = BTreeMap::new();
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_SERVICE_V4)) {
+            for key in m.keys() {
+                if key.len() == 8 {
+                    let ip = [key[0], key[1], key[2], key[3]];
+                    let port = u16::from_be_bytes([key[4], key[5]]);
+                    by_ip.entry(ip).or_default().push((key[6], port));
+                }
+            }
+        }
+
+        let mut protected = Vec::new();
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_PROTECTED_V4)) {
+            for key in m.keys() {
+                if key.len() == 4 {
+                    let ip = [key[0], key[1], key[2], key[3]];
+                    let mut svcs = by_ip.get(&ip).cloned().unwrap_or_default();
+                    svcs.sort_unstable();
+                    let services: Vec<_> = svcs
+                        .iter()
+                        .map(|(p, port)| serde_json::json!({"proto": proto_name(*p), "port": port}))
+                        .collect();
+                    protected.push(serde_json::json!({
+                        "ip": std::net::Ipv4Addr::from(ip).to_string(),
+                        "services": services,
+                    }));
+                }
+            }
+        }
+        protected.sort_by(|a, b| a["ip"].as_str().cmp(&b["ip"].as_str()));
+        ifaces.push(serde_json::json!({"iface": name, "protected": protected}));
+    }
+    serde_json::json!({"interfaces": ifaces}).to_string()
 }
 
 /// Build the `/api/state.json` body: real rate deltas plus a live Phase 9
@@ -591,6 +657,7 @@ fn window_input(delta: &Snapshot, dt: f64, prev_pps: f64) -> WindowInput {
         icmpv6,
         ipv6,
         ipv6_ext,
+        ct_untracked: cv("ct_untracked"),
         frag: cv("frag_first") + cv("frag_later"),
         other_l4: cv("l4_other"),
         malformed: sum_prefix(delta, "parse_err_"),
@@ -770,7 +837,8 @@ impl Analyzer {
             // forever. The saved state only reflects operator actions, so it is
             // clean. Preserve the live CHECK_* bits (allowlist/policy presence).
             let saved = xs_common::state::load(layout.iface()).unwrap_or(cur);
-            let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits();
+            let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
+            | ConfigFlags::SERVICE_ALLOW.bits();
             let mut b = saved;
             b.flags = ConfigFlags::from_bits_retain(
                 (saved.flags.bits() & !managed) | (cur.flags.bits() & managed),
@@ -787,6 +855,19 @@ impl Analyzer {
             _ => 0,
         };
         let mut want = base;
+        // Always track the LIVE allowlist/policy-presence bits, never the ones
+        // frozen into the baseline at first capture. The baseline is captured
+        // once; if `xs-baseline` arms CHECK_ALLOW *after* the agent started
+        // (the boot-order race -- the agent attaches before xs-baseline loads
+        // the LAN exemption), the frozen baseline has CHECK_ALLOW off, and every
+        // config write here would clobber it back off, silently killing the
+        // management-plane exemption. Re-applying the current bits each window
+        // makes the exemption durable regardless of start order.
+        let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
+            | ConfigFlags::SERVICE_ALLOW.bits();
+        want.flags = ConfigFlags::from_bits_retain(
+            (want.flags.bits() & !managed) | (cur.flags.bits() & managed),
+        );
         // Connection tracking runs continuously (steady state) so legitimate
         // flows are already known before a flood hits -- it is harmless in
         // shadow (counts untracked TCP; only drops when DROP_UNTRACKED is set).
@@ -815,6 +896,9 @@ impl Analyzer {
                 let mut extra = match dtype {
                     "udp_flood" | "udp_reflection" | "dns_amplification" => ConfigFlags::DROP_UDP.bits(),
                     "frag_flood" => ConfigFlags::DROP_FRAGMENTS.bits(),
+                    // IPv6 fragment flood: dropping fragments is the safe, direct
+                    // mitigation (atomic-fragment passthrough is handled upstream).
+                    "ipv6_frag_flood" => ConfigFlags::DROP_FRAGMENTS.bits(),
                     "malformed_flood" => ConfigFlags::DROP_MALFORMED.bits(),
                     // DROP_ICMP covers both ICMP and ICMPv6 in the datapath.
                     "icmp_flood" | "icmpv6_flood" => ConfigFlags::DROP_ICMP.bits(),
@@ -914,7 +998,7 @@ impl Analyzer {
         // matching drop. Never changes the model schema.
         if let Some(t) = xs_common::detect::classify_ipv6(&wi) {
             let name = t.as_str();
-            if name == "icmpv6_flood" || name == "ipv6_ext_flood" || dtype.is_empty() || dtype == "icmp_flood" {
+            if name == "icmpv6_flood" || name == "ipv6_ext_flood" || name == "ipv6_frag_flood" || dtype.is_empty() || dtype == "icmp_flood" || dtype == "frag_flood" {
                 dtype = name.to_string();
             }
         }
@@ -941,8 +1025,13 @@ impl Analyzer {
         // z-score at low packet counts is suppressed. This is the guard that
         // stops "UNDER ATTACK at 29 pps, 0 drops".
         let plausible = drop_ratio > 0.05 || pps > 500.0;
-        let anomalous = det.anomalous && plausible;
-        if !plausible {
+        // A legitimate bulk transfer (download/backup/replication) spikes pps/bps
+        // like a flood but is TCP-dominant, conntrack-tracked, large-packet, and
+        // not dropping -- no flood looks like that. Suppress the attack state for
+        // it so curl/wget downloads are not mistaken for an attack and throttled.
+        let benign_bulk = xs_common::detect::is_benign_bulk_transfer(&wi);
+        let anomalous = det.anomalous && plausible && !benign_bulk;
+        if !plausible || benign_bulk {
             ddos = 0.0;
             anomaly01 = 0.0;
             iforest = f64::NAN; // not meaningful without a real attack; hide it
@@ -966,7 +1055,7 @@ impl Analyzer {
         let decision = self.risk.decide(&format!("service:{iface}"), &ev, false, now_s);
         let state = if anomalous {
             2
-        } else if plausible && (drop_ratio > 0.12 || det.score > 4.0) {
+        } else if plausible && !benign_bulk && (drop_ratio > 0.12 || det.score > 4.0) {
             1
         } else {
             0
@@ -1127,19 +1216,23 @@ fn serve(cfg: &Config) -> Result<()> {
     eprintln!("serving dashboard state on http://{}/api/state.json", cfg.metrics_addr);
     let api = Mutex::new(ApiState::new());
 
-    // Phase 6-13 analysis loop: every second, read the counters for the first
-    // interface, compute features, run the detector + models + risk engine, and
-    // publish the scores for /metrics to render.
-    let analysis = Arc::new(Mutex::new(Analysis::default()));
-    if let Some(iface) = cfg.interfaces.first().map(|i| i.name.clone()) {
+    // Phase 6-13 analysis loop, PER INTERFACE: one analyzer thread per configured
+    // interface, each with its own baseline and risk engine, so EVERY monitored
+    // interface (not just the first) gets real-time detection + auto-mitigation.
+    // Previously only interfaces.first() was analyzed, so an attack on any other
+    // attached interface was counted by the dataplane but never auto-blocked.
+    let mut analyses: Vec<(String, Arc<Mutex<Analysis>>)> = Vec::new();
+    for iface in &cfg.interfaces {
+        let name = iface.name.clone();
+        let slot = Arc::new(Mutex::new(Analysis::default()));
+        analyses.push((name.clone(), slot.clone()));
         let pin_root = cfg.pin_root.clone();
-        let shared = analysis.clone();
         thread::spawn(move || {
             let mut az = Analyzer::new();
             while !STOP.load(Ordering::SeqCst) {
-                let result = az.step(&iface, &pin_root);
-                if let Ok(mut slot) = shared.lock() {
-                    *slot = result;
+                let result = az.step(&name, &pin_root);
+                if let Ok(mut g) = slot.lock() {
+                    *g = result;
                 }
                 thread::sleep(Duration::from_secs(1));
             }
@@ -1149,7 +1242,7 @@ fn serve(cfg: &Config) -> Result<()> {
     while !STOP.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
-                if let Err(e) = handle(stream, cfg, &api, &analysis) {
+                if let Err(e) = handle(stream, cfg, &api, &analyses) {
                     eprintln!("metrics request: {e:#}");
                 }
             }
@@ -1167,7 +1260,7 @@ fn handle(
     mut stream: TcpStream,
     cfg: &Config,
     api: &Mutex<ApiState>,
-    analysis: &Mutex<Analysis>,
+    analyses: &[(String, Arc<Mutex<Analysis>>)],
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -1186,7 +1279,7 @@ fn handle(
         ("405 Method Not Allowed", "text/plain", "method not allowed\n".into())
     } else {
         match path {
-            "/metrics" => ("200 OK", "text/plain; version=0.0.4", all_metrics(cfg, analysis)),
+            "/metrics" => ("200 OK", "text/plain; version=0.0.4", all_metrics(cfg, analyses)),
             "/api/state.json" => {
                 let json = match api.lock() {
                     Ok(mut g) => api_state_json(cfg, &mut g),
@@ -1194,6 +1287,7 @@ fn handle(
                 };
                 ("200 OK", "application/json", json)
             }
+            "/api/services.json" => ("200 OK", "application/json", api_services_json(cfg)),
             "/healthz" => ("200 OK", "text/plain", "ok\n".into()),
             "/readyz" => {
                 if ready(cfg) {

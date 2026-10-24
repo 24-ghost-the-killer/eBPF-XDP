@@ -48,6 +48,7 @@ enum xs_counter_id {
 	XS_CNT_SAMPLED                = 12, /* headers copied to the xs_samples ring buffer */
 	XS_CNT_SAMPLE_DROP            = 13, /* ring-buffer reserve failed (collector behind) */
 	XS_CNT_CT_UNTRACKED           = 14, /* TCP packets matching no tracked flow (ACK/RST flood) */
+	XS_CNT_SERVICE_DENY           = 15, /* dropped by the service allowlist (default-deny on a protected dst) */
 
 	/* L2 */
 	XS_CNT_L2_VLAN1               = 8,  /* exactly one 802.1Q/802.1ad tag */
@@ -184,13 +185,25 @@ enum xs_config_flags {
 	 * evasion, so the risk engine arms this only under an IPv6 ext-header flood
 	 * and lifts it when the flood ends. */
 	XS_CFG_DROP_IPV6_EXT      = 1u << 18,
+	/* Positive security model (default-deny per destination). On a destination
+	 * listed in xs_protected_v4, drop every packet whose {proto,dport} is not in
+	 * xs_service_v4. Set by userspace while those maps are non-empty (managed
+	 * like CHECK_ALLOW), so a packet pays the lookup only when there is a policy. */
+	XS_CFG_SERVICE_ALLOW      = 1u << 19,
+	/* Lockdown kill-switch (operator-set, per interface). When set, every IPv4
+	 * packet whose destination is NOT in xs_protected_v4 is dropped. Protected
+	 * hosts still follow their service allowlist. ARP and IPv6 are untouched so
+	 * the bridge keeps forwarding and never isolates itself. Meant to be armed
+	 * only on the ingress interface and lifted by an auto-revert timer. */
+	XS_CFG_LOCKDOWN           = 1u << 20,
 };
 #define XS_CFG_KNOWN_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
 			    XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
 			    XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT | \
 			    XS_CFG_SAMPLING | XS_CFG_HLL | XS_CFG_DPORT_HIST | XS_CFG_GLOBAL_RL | \
 			    XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT | \
-			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED | XS_CFG_DROP_IPV6_EXT)
+			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED | XS_CFG_DROP_IPV6_EXT | \
+			    XS_CFG_SERVICE_ALLOW | XS_CFG_LOCKDOWN)
 /* Flags an operator sets directly (sentinelctl config); CHECK_* are managed
  * automatically by the block/allow commands as the maps gain or lose entries. */
 #define XS_CFG_OPERATOR_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
@@ -291,6 +304,20 @@ struct xs_sample {
 struct xs_victim {
 	__u64 packets;
 	__u64 bytes;
+};
+
+/*
+ * Key of xs_service_v4 (service allowlist / positive security model). A packet
+ * to a destination present in xs_protected_v4 is dropped unless {proto,dport}
+ * is present here. dport is 0 for protocols without ports (e.g. ICMP) and for
+ * non-first fragments (no L4 header). Fixed 8-byte layout, no implicit padding,
+ * so the Rust control plane and the dataplane agree byte-for-byte.
+ */
+struct xs_service_key {
+	__be32 daddr;  /* destination IPv4, network order */
+	__be16 dport;  /* destination port, network order (0 = none) */
+	__u8   proto;  /* IP protocol (6 TCP, 17 UDP, 1 ICMP, ...) */
+	__u8   _pad;   /* must be zero */
 };
 
 /* ---- Phase 2: per-source policies and allowlist ---- */

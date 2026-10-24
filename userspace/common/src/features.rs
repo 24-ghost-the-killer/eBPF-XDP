@@ -139,6 +139,9 @@ pub struct WindowInput {
     pub ipv6: u64,
     pub icmpv6: u64,
     pub ipv6_ext: u64,
+    /// TCP packets matching no tracked conntrack flow (ACK/RST-flood signal).
+    /// Raw — not a model feature, so it doesn't change the schema hash.
+    pub ct_untracked: u64,
     pub frag: u64,
     pub other_l4: u64,
     pub malformed: u64,

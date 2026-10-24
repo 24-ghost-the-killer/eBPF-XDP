@@ -85,6 +85,7 @@ pub const COUNTERS: &[CounterDef] = &[
     c!(12, "sampled", "headers copied to the sample ring buffer"),
     c!(13, "sample_drop", "sample ring-buffer reserve failures (collector behind)"),
     c!(14, "ct_untracked", "TCP packets matching no tracked flow (ACK/RST flood)"),
+    c!(15, "service_deny", "dropped by the service allowlist (default-deny on a protected dst)"),
     c!(16, "l3_ipv4", "frames with a valid IPv4 header"),
     c!(17, "l3_ipv6", "frames with a valid IPv6 header"),
     c!(18, "l3_arp", "ARP frames"),
@@ -214,12 +215,18 @@ impl ConfigFlags {
     /// Drop IPv6 packets carrying extension headers (ext-header flood). Auto-armed
     /// by the risk engine under an IPv6 ext-header flood, lifted when it ends.
     pub const DROP_IPV6_EXT: ConfigFlags = ConfigFlags(1 << 18);
-    pub const KNOWN: u32 = 0b111_1111_1111_1111_1111;
+    /// Service allowlist / positive security model (default-deny per protected
+    /// destination). Managed by `sentinelctl protect`/`service`, like CHECK_ALLOW.
+    pub const SERVICE_ALLOW: ConfigFlags = ConfigFlags(1 << 19);
+    /// Lockdown kill-switch: drop every IPv4 packet whose destination is not a
+    /// protected host. Operator-set via `sentinelctl config --lockdown`.
+    pub const LOCKDOWN: ConfigFlags = ConfigFlags(1 << 20);
+    pub const KNOWN: u32 = 0b1_1111_1111_1111_1111_1111;
     /// Bits an operator toggles directly (the rest are auto-managed).
-    pub const OPERATOR: u32 = 0b1000_1111;
+    pub const OPERATOR: u32 = 0b1_0000_0000_0000_1000_1111;
 
     /// Names in bit order, used for display and the CLI.
-    pub const NAMES: [(ConfigFlags, &'static str); 19] = [
+    pub const NAMES: [(ConfigFlags, &'static str); 21] = [
         (Self::DROP_MALFORMED, "drop_malformed"),
         (Self::DROP_BAD_TCP_FLAGS, "drop_bad_tcp_flags"),
         (Self::DROP_FRAGMENTS, "drop_fragments"),
@@ -239,6 +246,8 @@ impl ConfigFlags {
         (Self::CONNTRACK, "conntrack"),
         (Self::DROP_UNTRACKED, "drop_untracked"),
         (Self::DROP_IPV6_EXT, "drop_ipv6_ext"),
+        (Self::SERVICE_ALLOW, "service_allow"),
+        (Self::LOCKDOWN, "lockdown"),
     ];
 
     /// Validate bits coming from an operator or API before they reach the
@@ -413,7 +422,7 @@ mod tests {
         let cfg = Config { abi_version: ABI_VERSION, flags, ..Default::default() };
         assert_eq!(Config::from_bytes(&cfg.to_bytes()).unwrap(), cfg);
         assert_eq!(flags.bits(), 0b101);
-        assert_eq!(ConfigFlags::from_bits(1 << 20), Err(AbiError::UnknownFlags(1 << 20)));
+        assert_eq!(ConfigFlags::from_bits(1 << 21), Err(AbiError::UnknownFlags(1 << 21)));
         assert!(Config::from_bytes(&[0u8; 8]).is_err());
         assert_eq!(format!("{:?}", flags), "drop_malformed|drop_fragments");
     }

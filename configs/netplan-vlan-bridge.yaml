@@ -23,6 +23,30 @@ network:
     br0:
       interfaces: [vlan10, vlan20]
       addresses: [192.168.1.193/24]
-      routes: [{to: default, via: 192.168.1.1}]
+      routes: [{to: default, via: 192.168.1.1, metric: 700}]   # backup to wlo1's internet
       nameservers: {addresses: [192.168.1.1]}
       parameters: { stp: false, forward-delay: 0 }
+  # Optional uplink to the school WiFi "vbff" (WPA2/WPA3-Personal, one shared
+  # password) on the box's wireless card, with a static IP. Stays on networkd,
+  # which drives the card through wpa_supplicant (`apt install wpasupplicant`).
+  #
+  # Network values read from a laptop on vbff (22 Oct 2026): 10.55.12.0/22,
+  # gateway 10.55.12.1, DNS 185.232.148.2 / 185.232.149.2. .193 was unused
+  # then, but it sits inside the school's DHCP pool, so ask IT to reserve it
+  # (they may want wlo1's MAC from `ip link show wlo1`) or it can clash.
+  #
+  # Its default route (metric 100) beats br0's (700), so whenever vbff is
+  # connected the box reaches the internet over WiFi; without WiFi (e.g. at
+  # home) br0's route via 192.168.1.1 takes over. Traffic over
+  # wlo1 does not pass through XDP (only vlan10/vlan20 are protected). The
+  # file holds the WiFi password, so keep it mode 0600 (scripts/xs-cutover
+  # installs it that way) and don't commit the real password.
+  wifis:
+    wlo1:
+      dhcp4: false
+      addresses: [10.55.12.193/22]                  # 255.255.252.0 = 10.55.12.0-10.55.15.255
+      routes: [{to: default, via: 10.55.12.1, metric: 100}]
+      nameservers: {addresses: [185.232.148.2, 185.232.149.2]}
+      access-points:
+        "VBFF":                                      # SSID is case-sensitive: the school broadcasts "VBFF"
+          password: "aske1212"                    # the vbff WiFi password

@@ -117,6 +117,37 @@ static __always_inline int xs_global_rl_drop(const struct xs_rl_params *grl, __u
 	return !xs_gcra(gtat, grl->interval_ns, grl->tolerance_ns, now);
 }
 
+/*
+ * Service allowlist (positive security model). On a destination listed in
+ * xs_protected_v4, only the {proto,dport} services present in xs_service_v4 are
+ * permitted; anything else returns 1 (deny). A destination that is NOT protected
+ * returns 0 (default allow), so the stage is transparent for unprotected hosts.
+ * IPv4 only; dport is 0 for portless protocols and non-first fragments.
+ */
+static __always_inline int xs_service_denied(const struct xs_pkt *p)
+{
+	__be32 d = p->daddr.v4;
+
+	if (!bpf_map_lookup_elem(&xs_protected_v4, &d))
+		return 0; /* destination not protected -> default allow */
+
+	struct xs_service_key k = {
+		.daddr = d,
+		.dport = p->l4_parsed ? p->dport : 0,
+		.proto = p->l4_proto,
+		._pad  = 0,
+	};
+	return bpf_map_lookup_elem(&xs_service_v4, &k) ? 0 : 1;
+}
+
+/* True when the destination is under default-deny (listed in xs_protected_v4). */
+static __always_inline int xs_is_protected(const struct xs_pkt *p)
+{
+	__be32 d = p->daddr.v4;
+
+	return bpf_map_lookup_elem(&xs_protected_v4, &d) ? 1 : 0;
+}
+
 SEC("xdp")
 int xs_xdp_main(struct xdp_md *ctx)
 {
@@ -176,13 +207,36 @@ int xs_xdp_main(struct xdp_md *ctx)
 		verdict = XDP_PASS;
 	else if (decision == XS_POL_DROP)
 		verdict = XDP_DROP;
-	else if (!exempt && (flags & XS_CFG_GLOBAL_RL) && grl.interval_ns && rc == XS_PARSE_OK &&
-		 xs_global_rl_drop(&grl, bpf_ktime_get_ns())) {
-		/* aggregate cap hit: drops spoofed-source floods per-source can't.
-		 * Counted as a rate-limiter drop. */
-		xs_count(st, XS_CNT_RATE_LIMITED, len);
+	else if (!exempt && (flags & XS_CFG_SERVICE_ALLOW) && rc == XS_PARSE_OK &&
+		 pkt.l3 == XS_L3_IPV4 && xs_service_denied(&pkt)) {
+		/*
+		 * Positive security model: on a protected destination only the
+		 * explicitly allowed {proto,dport} services pass; everything else is
+		 * dropped and attributed as service_deny. Checked ahead of the
+		 * per-vector drops so off-service floods are cut at the door.
+		 */
+		xs_count(st, XS_CNT_SERVICE_DENY, len);
+		verdict = XDP_DROP;
+	} else if (!exempt && (flags & XS_CFG_LOCKDOWN) && rc == XS_PARSE_OK &&
+		   pkt.l3 == XS_L3_IPV4 && !xs_is_protected(&pkt)) {
+		/*
+		 * Lockdown kill-switch: only protected destinations are reachable;
+		 * every other IPv4 packet is dropped (attributed as service_deny).
+		 * Protected hosts still obey their service allowlist (handled just
+		 * above). ARP / IPv6 are untouched so the bridge never isolates itself.
+		 */
+		xs_count(st, XS_CNT_SERVICE_DENY, len);
 		verdict = XDP_DROP;
 	} else {
+		/*
+		 * Precise, per-vector validity drops run FIRST, ahead of the aggregate
+		 * rate limiter. A malformed / UDP / ICMP / fragment / bad-flags /
+		 * IPv6-ext flood is then dropped and attributed as exactly that vector
+		 * instead of being masked as a generic "rate_limited" drop (the limiter
+		 * used to run first and swallow ~96% of drops). It also stops clearly-bad
+		 * traffic from consuming the limiter's GCRA budget, so the aggregate cap
+		 * is spent only on the ambiguous volumetric remainder.
+		 */
 		verdict = xs_validity_verdict(rc, &pkt, flags);
 		/*
 		 * Connection tracking: for TCP that validity passed, count packets
@@ -196,6 +250,18 @@ int xs_xdp_main(struct xdp_md *ctx)
 			xs_count(st, XS_CNT_CT_UNTRACKED, len);
 			if (flags & XS_CFG_DROP_UNTRACKED)
 				verdict = XDP_DROP;
+		}
+		/*
+		 * Aggregate (interface-wide) rate limiter LAST: only packets that
+		 * survived the precise drops above are metered, so it caps whatever
+		 * volumetric remainder the per-vector rules cannot name -- notably a
+		 * spoofed-source TCP/SYN flood, which per-source limiting can't catch.
+		 * Still counted as a rate-limiter drop.
+		 */
+		if (verdict != XDP_DROP && !exempt && (flags & XS_CFG_GLOBAL_RL) && grl.interval_ns &&
+		    rc == XS_PARSE_OK && xs_global_rl_drop(&grl, bpf_ktime_get_ns())) {
+			xs_count(st, XS_CNT_RATE_LIMITED, len);
+			verdict = XDP_DROP;
 		}
 	}
 

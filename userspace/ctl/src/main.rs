@@ -111,6 +111,11 @@ pub enum Cmd {
         /// this cannot sever the box's own connectivity or remote management.
         #[arg(long, value_enum)]
         drop_udp: Option<Toggle>,
+        /// Lockdown: drop every IPv4 packet whose destination is not a protected
+        /// host (protected hosts still follow their allowlist). Only the ingress
+        /// interface should be armed; pair with an auto-revert timer.
+        #[arg(long, value_enum)]
+        lockdown: Option<Toggle>,
     },
 
     /// Block a source address (drop all its packets) until the TTL expires.
@@ -173,6 +178,78 @@ pub enum Cmd {
         #[arg(long, default_value_t = 0)]
         burst: u32,
     },
+
+    /// Mark a destination as PROTECTED (positive security / default-deny): only
+    /// the services added with `service` reach it; all other traffic to it is
+    /// dropped. IPv4 only. Add your services BEFORE protecting to avoid an outage.
+    Protect {
+        #[arg(short, long)]
+        iface: String,
+        /// Destination IP to protect (IPv4).
+        ip: IpAddr,
+    },
+    /// Remove a destination from default-deny (its service entries are kept).
+    Unprotect {
+        #[arg(short, long)]
+        iface: String,
+        ip: IpAddr,
+    },
+    /// Allow one service `{proto port}` on a protected destination. Use port 0
+    /// for portless protocols (e.g. icmp). Remove it again with `--remove`.
+    Service {
+        #[arg(short, long)]
+        iface: String,
+        /// Protected destination IP (IPv4).
+        ip: IpAddr,
+        /// Transport protocol.
+        #[arg(value_enum)]
+        proto: ProtoArg,
+        /// Destination port (0 for portless protocols such as ICMP).
+        #[arg(default_value_t = 0)]
+        port: u16,
+        /// Remove this service instead of adding it.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Mirror the box's own `ufw` ALLOW rules into the service-allowlist for a
+    /// destination (IPv4), so you manage open ports in ufw and the dataplane
+    /// follows. Adds ports now open in ufw and removes allowlist entries no
+    /// longer open there. Inbound ALLOW/LIMIT rules are mirrored by their port;
+    /// a source- or interface-restricted rule is mirrored by port only (the
+    /// allowlist has no source dimension, so it opens the port for all sources
+    /// -- ufw itself still enforces the restriction behind the allowlist).
+    /// App-profile, "Anywhere" and IPv6 rules have no numeric IPv4 port and are
+    /// reported and skipped. Needs root (reads ufw).
+    ServiceSync {
+        #[arg(short, long)]
+        iface: String,
+        /// Destination IP the mirrored services apply to (IPv4).
+        ip: IpAddr,
+        /// Also mark the destination PROTECTED (default-deny) after syncing.
+        #[arg(long)]
+        protect: bool,
+        /// Show what would change without touching the allowlist.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProtoArg {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl ProtoArg {
+    /// IANA IP protocol number used as the service key's `proto` field.
+    pub fn number(self) -> u8 {
+        match self {
+            ProtoArg::Tcp => 6,
+            ProtoArg::Udp => 17,
+            ProtoArg::Icmp => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

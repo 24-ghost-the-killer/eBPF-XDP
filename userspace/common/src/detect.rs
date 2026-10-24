@@ -37,6 +37,7 @@ pub enum AttackType {
     Ipv6Flood,
     Icmpv6Flood,
     Ipv6ExtFlood,
+    Ipv6FragFlood,
 }
 
 impl AttackType {
@@ -56,8 +57,31 @@ impl AttackType {
             AttackType::Ipv6Flood => "ipv6_flood",
             AttackType::Icmpv6Flood => "icmpv6_flood",
             AttackType::Ipv6ExtFlood => "ipv6_ext_flood",
+            AttackType::Ipv6FragFlood => "ipv6_frag_flood",
         }
     }
+}
+
+/// A legitimate high-throughput transfer (curl/wget download, backup, DB
+/// replication) is a sudden pps/bps spike that trips the anomaly detector, but
+/// it is unmistakably NOT a flood: it is TCP-dominant, rides ESTABLISHED
+/// conntrack-tracked connections, carries large near-MTU data packets, and is
+/// not being dropped. No SYN/ACK/RST/NULL/FIN flood can look like this — those
+/// are tiny (~40–64 B) and untracked. When this holds we suppress the attack
+/// state so a download is never mistaken for an attack. A spoofed or volumetric
+/// flood is untracked, tiny-packet, or dropping, so it is never exempted here.
+pub fn is_benign_bulk_transfer(wi: &crate::features::WindowInput) -> bool {
+    if wi.packets == 0 || wi.tcp_total == 0 {
+        return false;
+    }
+    let share_tcp = wi.tcp_total as f64 / wi.packets as f64;
+    let mean_size = wi.bytes as f64 / wi.packets as f64;
+    let untracked = wi.ct_untracked as f64 / wi.tcp_total as f64;
+    let drop_ratio = wi.dropped as f64 / wi.packets as f64;
+    share_tcp > 0.8      // TCP-dominant
+        && mean_size > 700.0 // large data packets (flag floods are ~40–64 B)
+        && untracked < 0.3   // established / tracked (floods are untracked)
+        && drop_ratio < 0.02 // nothing being dropped
 }
 
 /// IPv6-specific classification from raw counts, kept OUT of the model feature
@@ -68,6 +92,14 @@ pub fn classify_ipv6(wi: &crate::features::WindowInput) -> Option<AttackType> {
     let pkts = wi.packets as f64;
     if pkts < 1.0 || (wi.ipv6 as f64) < 0.5 * pkts {
         return None; // not IPv6-dominant
+    }
+    // Fragment flood: a large share of IPv6 packets are fragments. A fragment
+    // header is itself an extension header (so it also trips the ipv6_ext rule
+    // below); checking frag first keeps the more specific label. `wi.frag`
+    // counts IPv4+IPv6 fragments, but we are already in the IPv6-dominant branch,
+    // so it is effectively the IPv6 fragment share here.
+    if (wi.frag as f64) > 0.4 * (wi.ipv6 as f64) {
+        return Some(AttackType::Ipv6FragFlood);
     }
     // Extension-header flood: a large share of IPv6 packets carry ext headers
     // (rare in normal traffic). Most specific, so checked first.
@@ -99,6 +131,15 @@ pub struct Detection {
 pub struct RobustBaseline {
     windows: Vec<VecDeque<f64>>,
     cap: usize,
+    /// Per-feature absolute floor on the z-score scale (= 1.4826 * MAD). A floor
+    /// of 0 means "no floor" (the historical behaviour). A positive floor caps
+    /// the sensitivity when the recent baseline is quiet or constant: on an idle
+    /// link the MAD collapses to ~0, so without a floor ANY change produced an
+    /// infinite z-score and a single small, harmless blip read as a maximal
+    /// anomaly (the "risk 5 with no attack" false alarm). The floor turns that
+    /// into a finite, proportionate score so a burst must be large in ABSOLUTE
+    /// terms -- not merely larger than a near-zero baseline -- to alarm.
+    scale_floor: Vec<f64>,
 }
 
 impl RobustBaseline {
@@ -106,6 +147,14 @@ impl RobustBaseline {
         RobustBaseline {
             windows: (0..n_features).map(|_| VecDeque::with_capacity(cap)).collect(),
             cap: cap.max(8),
+            scale_floor: vec![0.0; n_features],
+        }
+    }
+
+    /// Set the absolute z-score-scale floor for feature `i` (see `scale_floor`).
+    pub fn set_floor(&mut self, i: usize, floor: f64) {
+        if i < self.scale_floor.len() && floor.is_finite() && floor >= 0.0 {
+            self.scale_floor[i] = floor;
         }
     }
 
@@ -126,11 +175,19 @@ impl RobustBaseline {
         if !x.is_finite() || i >= self.windows.len() {
             return f64::NAN;
         }
+        let floor = self.scale_floor.get(i).copied().unwrap_or(0.0);
         match Self::median_mad(&self.windows[i]) {
-            Some((med, mad)) if mad > 1e-9 => (x - med) / (1.4826 * mad),
-            // MAD == 0 (a constant feature): any change is a strong signal.
-            Some((med, _)) => {
-                if (x - med).abs() > 1e-9 {
+            Some((med, mad)) => {
+                // Effective scale never drops below the configured floor, so a
+                // quiet/constant baseline (MAD ~= 0) yields a finite, bounded
+                // z-score proportional to the ABSOLUTE departure instead of
+                // exploding to infinity on the first small change.
+                let scale = (1.4826 * mad).max(floor);
+                if scale > 1e-9 {
+                    (x - med) / scale
+                } else if (x - med).abs() > 1e-9 {
+                    // No floor configured and a constant feature changed: keep
+                    // the historical "any change is a strong signal" behaviour.
                     f64::INFINITY
                 } else {
                     0.0
@@ -275,7 +332,28 @@ pub struct Detector {
     /// Windows to keep baseline learning frozen after any elevation, so a slow
     /// ramp ("boiling frog") cannot be absorbed into the baseline as normal.
     learn_freeze: u32,
+    /// Absolute traffic floor: a window below BOTH `floor_pps` and `floor_bps`
+    /// carries too little volume to be a flood this dataplane cares about, so it
+    /// can never be marked anomalous no matter how large its z-score. This is
+    /// the backstop against a quiet baseline turning a trickle into "an attack".
+    floor_pps: f64,
+    floor_bps: f64,
 }
+
+/// Per-feature absolute floors on the z-score scale (packets/s, bits/s, or
+/// events/s to match each feature's unit). Chosen so that against a near-idle
+/// baseline a burst must be large in absolute terms -- not merely larger than
+/// ~0 -- before it contributes a high z-score. Tuned well under real attack
+/// magnitudes (floods are 10^4-10^6 pps) but above incidental idle jitter.
+const FEATURE_FLOORS: &[(&str, f64)] = &[
+    ("pps", 100.0),
+    ("bps", 1_000_000.0),
+    ("tcp_syn_rate", 200.0),
+    ("udp_pps", 200.0),
+    ("icmp_pps", 100.0),
+    ("frag_rate", 100.0),
+    ("malformed_rate", 100.0),
+];
 
 impl Detector {
     pub fn new(n_features: usize) -> Self {
@@ -294,13 +372,24 @@ impl Detector {
         .iter()
         .filter_map(|n| index_of(n))
         .collect();
+        let mut baseline = RobustBaseline::new(n_features, 256);
+        for (name, floor) in FEATURE_FLOORS {
+            if let Some(i) = index_of(name) {
+                baseline.set_floor(i, *floor);
+            }
+        }
         Detector {
-            baseline: RobustBaseline::new(n_features, 256),
+            baseline,
             // k=0.5 sigma slack, h=8 sigma cumulative: slow ramps, low FPR.
             cusum_pps: Cusum::new(0.5, 8.0),
             z_threshold: 8.0,
             monitored,
             learn_freeze: 0,
+            // A real volumetric event is >= a few thousand pps or several Mbit/s;
+            // below ~300 pps AND ~2 Mbit/s there is simply not enough traffic to
+            // constitute a flood, so never alarm there.
+            floor_pps: 300.0,
+            floor_bps: 2_000_000.0,
         }
     }
 
@@ -324,6 +413,18 @@ impl Detector {
         let cusum_alarm = self.cusum_pps.update(if pps_z.is_finite() { pps_z } else { 0.0 });
         let suspected = classify(vec);
 
+        // Absolute traffic floor: a window carrying less than floor_pps packets/s
+        // AND less than floor_bps bits/s is too small to be a flood. Below it,
+        // suppress every signal -- a near-idle baseline makes a tiny blip look
+        // infinitely anomalous, and that false "attack" is exactly what armed
+        // mitigation against harmless management traffic.
+        let cur_pps = index_of("pps").map(|i| vec[i]).unwrap_or(0.0);
+        let cur_bps = index_of("bps").map(|i| vec[i]).unwrap_or(0.0);
+        let below_floor = cur_pps.is_finite()
+            && cur_bps.is_finite()
+            && cur_pps < self.floor_pps
+            && cur_bps < self.floor_bps;
+
         let mut reasons = Vec::new();
         if score > self.z_threshold {
             reasons.push(format!("robust z-score {score:.1} > {:.0}", self.z_threshold));
@@ -338,17 +439,29 @@ impl Detector {
         // when the window is also statistically elevated -- otherwise a benign
         // UDP-heavy or SYN-heavy moment at idle would be flagged as an attack.
         let rule_confirmed = suspected.is_some() && (score > self.z_threshold / 2.0 || cusum_alarm);
-        let anomalous = score > self.z_threshold || cusum_alarm || rule_confirmed;
+        let anomalous = !below_floor && (score > self.z_threshold || cusum_alarm || rule_confirmed);
+        if below_floor {
+            reasons.push(format!(
+                "below absolute floor ({cur_pps:.0} pps < {:.0}, {:.2} Mbit/s < {:.0}): not an attack",
+                self.floor_pps,
+                cur_bps / 1e6,
+                self.floor_bps / 1e6
+            ));
+        }
 
         // Freeze baseline learning for a while after any elevation, so a slow
-        // upward ramp cannot be gradually learned as the new "normal".
-        if score > self.z_threshold / 2.0 || cusum_alarm {
+        // upward ramp cannot be gradually learned as the new "normal". A window
+        // below the absolute floor carries no real volume, so it never counts as
+        // an elevation and is always safe to learn from (this is how the baseline
+        // builds up on a quiet link in the first place).
+        if !below_floor && (score > self.z_threshold / 2.0 || cusum_alarm) {
             self.learn_freeze = 60;
         } else if self.learn_freeze > 0 {
             self.learn_freeze -= 1;
         }
-        // Learn only from clearly-normal windows, and only when not frozen.
-        if !anomalous && self.learn_freeze == 0 && score < self.z_threshold / 2.0 {
+        // Learn from clearly-normal windows when not frozen, and always from
+        // sub-floor windows (definitively benign).
+        if below_floor || (!anomalous && self.learn_freeze == 0 && score < self.z_threshold / 2.0) {
             self.baseline.learn(vec);
         }
         Detection { anomalous, score, cusum_alarm, suspected, reasons }
@@ -447,6 +560,30 @@ mod tests {
     }
 
     #[test]
+    fn benign_bulk_transfer_not_an_attack() {
+        // A fast download: TCP-dominant, ~1460 B packets, tracked, no drops.
+        let dl = WindowInput {
+            dt_s: 1.0, packets: 80_000, bytes: 80_000 * 1460,
+            tcp_total: 80_000, ct_untracked: 10, dropped: 0,
+            unique_src: 1.0, sub_counts: [8000; 10], ..Default::default()
+        };
+        assert!(is_benign_bulk_transfer(&dl), "a tracked large-packet download must not read as an attack");
+        // An ACK flood: tiny packets, untracked -> must NOT be exempted.
+        let ack = WindowInput {
+            dt_s: 1.0, packets: 200_000, bytes: 200_000 * 54,
+            tcp_total: 200_000, ct_untracked: 199_000, tcp_ack: 199_000,
+            sub_counts: [20000; 10], ..Default::default()
+        };
+        assert!(!is_benign_bulk_transfer(&ack), "an untracked tiny-packet flood must still be an attack");
+        // A SYN flood: tiny packets -> not exempted even if somehow tracked.
+        let syn = WindowInput {
+            dt_s: 1.0, packets: 200_000, bytes: 200_000 * 60,
+            tcp_total: 200_000, tcp_syn: 195_000, sub_counts: [20000; 10], ..Default::default()
+        };
+        assert!(!is_benign_bulk_transfer(&syn));
+    }
+
+    #[test]
     fn ipv6_classifier() {
         let base = |ipv6, icmpv6, ext| WindowInput {
             dt_s: 1.0, packets: 100_000, bytes: 100_000 * 80,
@@ -456,6 +593,13 @@ mod tests {
         assert_eq!(classify_ipv6(&base(99_000, 98_000, 0)), Some(AttackType::Icmpv6Flood));
         // Extension-header flood: most IPv6 packets carry ext headers.
         assert_eq!(classify_ipv6(&base(99_000, 0, 90_000)), Some(AttackType::Ipv6ExtFlood));
+        // Fragment flood: every fragment also carries an ext header (frag hdr),
+        // so frag and ipv6_ext are both high — the frag rule must win.
+        let frag = WindowInput {
+            dt_s: 1.0, packets: 100_000, bytes: 100_000 * 80,
+            ipv6: 99_000, frag: 99_000, ipv6_ext: 99_000, sub_counts: [10_000; 10], ..Default::default()
+        };
+        assert_eq!(classify_ipv6(&frag), Some(AttackType::Ipv6FragFlood));
         // Generic IPv6 volumetric.
         assert_eq!(classify_ipv6(&base(99_000, 0, 0)), Some(AttackType::Ipv6Flood));
         // Not IPv6-dominant -> None (normal path handles it).
@@ -484,6 +628,53 @@ mod tests {
         let refl = d.detect(&udp_reflection());
         assert!(refl.anomalous);
         assert_eq!(refl.suspected, Some(AttackType::UdpReflection));
+    }
+
+    // A near-idle window: a handful of packets per second (quiet appliance).
+    fn idle(seed: u64) -> Vec<f64> {
+        let r = ((seed.wrapping_mul(2654435761)) % 10) as f64; // 0..9
+        features::compute(&WindowInput {
+            dt_s: 1.0,
+            packets: (5.0 + r) as u64,
+            bytes: ((5.0 + r) * 300.0) as u64,
+            tcp_syn: 1,
+            tcp_ack: 4,
+            tcp_total: 5,
+            udp: 2,
+            unique_src: 3.0,
+            unique_flows: 5.0,
+            sub_counts: [1; 10],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn floor_suppresses_quiet_baseline_blip() {
+        // On an idle link the baseline MAD collapses to ~0. A small, harmless
+        // blip (a few hundred pps of management traffic) must NOT read as an
+        // attack -- this is the "risk 5 with no attack" regression.
+        let mut d = Detector::new(features::N);
+        for s in 0..300 {
+            d.observe_normal(&idle(s));
+        }
+        // ~250 pps / ~0.6 Mbit/s blip: below both absolute floors -> never anomalous.
+        let blip = features::compute(&WindowInput {
+            dt_s: 1.0,
+            packets: 250,
+            bytes: 250 * 300,
+            tcp_syn: 120,
+            tcp_ack: 20,
+            tcp_total: 200,
+            udp: 50,
+            unique_src: 8.0,
+            unique_flows: 40.0,
+            sub_counts: [25; 10],
+            ..Default::default()
+        });
+        let det = d.detect(&blip);
+        assert!(!det.anomalous, "a sub-floor blip must not be an attack: {:?}", det.reasons);
+        // A real flood against the SAME quiet baseline must still fire.
+        assert!(d.detect(&syn_flood()).anomalous, "a real flood must still be detected");
     }
 
     #[test]

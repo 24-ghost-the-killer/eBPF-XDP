@@ -62,6 +62,37 @@ static __always_inline __u64 xs_hash_flow(const struct xs_pkt *p)
 	return xs_mix64(a ^ (b * 0x9e3779b97f4a7c15ULL));
 }
 
+/*
+ * Direction-insensitive flow hash for CONNECTION TRACKING.
+ *
+ * The 5-tuple hash above is directional: a connection's two halves
+ * (client->server and server->client) have swapped src/dst and sport/dport, so
+ * they hash to different keys. On an inline bridge the forward SYN and the
+ * return data/ACK are literally reversed tuples, so the return half never
+ * matched the entry the SYN created and read as "untracked" -- i.e. a legit
+ * reply looked like an ACK/RST flood. This hashes the two endpoints
+ * (addr+port) with a COMMUTATIVE combine (a^b and a*b are both order-free), so
+ * both directions of the same connection map to one key. A SYN in either
+ * direction establishes it; any later packet of the flow -- forward or
+ * return -- is then found and counts as tracked.
+ */
+static __always_inline __u64 xs_hash_flow_ct(const struct xs_pkt *p)
+{
+	__u64 e1, e2;
+
+	if (p->l3 == XS_L3_IPV4) {
+		e1 = xs_mix64(((__u64)p->saddr.v4 << 16) | (__u64)p->sport);
+		e2 = xs_mix64(((__u64)p->daddr.v4 << 16) | (__u64)p->dport);
+	} else {
+		__u64 sa = xs_addr_hi(&p->saddr) ^ (xs_addr_lo(&p->saddr) * 0x9e3779b97f4a7c15ULL);
+		__u64 da = xs_addr_hi(&p->daddr) ^ (xs_addr_lo(&p->daddr) * 0x9e3779b97f4a7c15ULL);
+
+		e1 = xs_mix64(sa ^ ((__u64)p->sport << 48));
+		e2 = xs_mix64(da ^ ((__u64)p->dport << 48));
+	}
+	return xs_mix64((e1 ^ e2) + (e1 * e2) + ((__u64)p->l4_proto << 1));
+}
+
 /* One HLL observation: register = max(register, rank). */
 static __always_inline void xs_hll_add(struct xs_hll *h, __u32 epoch, __u32 sketch, __u64 hash)
 {
@@ -101,7 +132,10 @@ static __always_inline void xs_hll_update(const struct xs_pkt *p, __u32 epoch)
  */
 static __always_inline int xs_conntrack_untracked(const struct xs_pkt *p, __u64 now)
 {
-	__u64 key = xs_hash_flow(p);
+	/* Direction-insensitive key: the return half of a connection matches the
+	 * entry its SYN created, so legitimate replies are never misread as an
+	 * untracked ACK/RST flood. */
+	__u64 key = xs_hash_flow_ct(p);
 	__u64 *seen;
 
 	if (p->tcp_flags & XS_TCP_SYN) {

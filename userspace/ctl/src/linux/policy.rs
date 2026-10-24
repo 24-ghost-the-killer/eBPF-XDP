@@ -7,6 +7,7 @@
 //! `bpf_ktime_get_ns()` reads, so a TTL means the same thing on both sides
 //! and NTP steps cannot move it.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +15,7 @@ use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use xs_common::abi::ABI_VERSION;
 use xs_common::pin::{
     PinLayout, MAP_ALLOW_V4, MAP_ALLOW_V6, MAP_CONFIG, MAP_POLICY_V4, MAP_POLICY_V6,
+    MAP_PROTECTED_V4, MAP_SERVICE_V4,
 };
 use xs_common::policy::{
     self, Action, Allow, Policy, Reason, Trust, ALLOW_SIZE, LPM_V4_SIZE, LPM_V6_SIZE, POLICY_SIZE,
@@ -81,11 +83,16 @@ fn refresh_check_bits(layout: &PinLayout) -> Result<()> {
     let policy_ =
         is_nonempty(&open(layout, MAP_POLICY_V4)?) || is_nonempty(&open(layout, MAP_POLICY_V6)?);
 
+    // SERVICE_ALLOW follows the protected-destination map. Tolerant if the map
+    // is absent (a dataplane that predates the feature): treat as empty.
+    let service = open(layout, MAP_PROTECTED_V4).map(|m| is_nonempty(&m)).unwrap_or(false);
+
     let cfg_map = open(layout, MAP_CONFIG)?;
     let mut cfg = read_config(&cfg_map)?;
     let before = cfg.flags;
     cfg.flags.set(ConfigFlags::CHECK_ALLOW, allow);
     cfg.flags.set(ConfigFlags::CHECK_POLICY, policy_);
+    cfg.flags.set(ConfigFlags::SERVICE_ALLOW, service);
     if cfg.flags != before {
         cfg.abi_version = ABI_VERSION;
         write_config(&cfg_map, cfg)?;
@@ -204,6 +211,270 @@ pub fn unallow(layout: &PinLayout, cidr: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the 8-byte `struct xs_service_key`: daddr(be32) dport(be16) proto(u8) pad(u8).
+fn service_key(v4: std::net::Ipv4Addr, proto: u8, port: u16) -> [u8; 8] {
+    let mut k = [0u8; 8];
+    k[0..4].copy_from_slice(&v4.octets());
+    k[4..6].copy_from_slice(&port.to_be_bytes());
+    k[6] = proto;
+    k[7] = 0;
+    k
+}
+
+/// Mark a destination as protected: default-deny everything to it except the
+/// services added with `service`. IPv4 only (the maps are v4).
+pub fn protect(layout: &PinLayout, ip: IpAddr) -> Result<()> {
+    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only for now: {ip}") };
+    let key = v4.octets();
+    let map = open(layout, MAP_PROTECTED_V4)?;
+    map.update(&key, &[1u8], MapFlags::ANY).context("insert protected destination")?;
+    refresh_check_bits(layout)?;
+    println!(
+        "protecting {v4} (DEFAULT-DENY): only services added with `service` reach it; \
+         all other traffic to it is dropped. Add your services now, e.g. \
+         `sentinelctl service {v4} tcp 22`."
+    );
+    Ok(())
+}
+
+pub fn unprotect(layout: &PinLayout, ip: IpAddr) -> Result<()> {
+    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only: {ip}") };
+    let key = v4.octets();
+    let map = open(layout, MAP_PROTECTED_V4)?;
+    match map.delete(&key) {
+        Ok(()) => println!("unprotected {v4}: default-deny lifted (its service entries are kept)"),
+        Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => println!("{v4} was not protected"),
+        Err(e) => return Err(e).context("delete protected destination"),
+    }
+    refresh_check_bits(layout)?;
+    Ok(())
+}
+
+/// Add (or, with `remove`, delete) one permitted `{proto,dport}` service on a
+/// destination. Use port 0 for portless protocols such as ICMP.
+pub fn service(layout: &PinLayout, ip: IpAddr, proto: u8, port: u16, remove: bool) -> Result<()> {
+    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only: {ip}") };
+    let key = service_key(v4, proto, port);
+    let map = open(layout, MAP_SERVICE_V4)?;
+    if remove {
+        match map.delete(&key) {
+            Ok(()) => println!("removed service {v4} proto={proto} port={port}"),
+            Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => {
+                println!("{v4} proto={proto} port={port} was not a listed service")
+            }
+            Err(e) => return Err(e).context("delete service entry"),
+        }
+    } else {
+        map.update(&key, &[1u8], MapFlags::ANY).context("insert service entry")?;
+        let protected = open(layout, MAP_PROTECTED_V4).map(|m| is_nonempty(&m)).unwrap_or(false);
+        println!("allowed service {v4} proto={proto} port={port}");
+        if !protected {
+            println!("note: {v4} is not protected yet, so this has no effect until you run `sentinelctl protect {v4}`");
+        }
+    }
+    Ok(())
+}
+
+const PROTO_TCP: u8 = 6;
+const PROTO_UDP: u8 = 17;
+
+fn proto_name(p: u8) -> &'static str {
+    match p {
+        PROTO_TCP => "tcp",
+        PROTO_UDP => "udp",
+        1 => "icmp",
+        _ => "proto",
+    }
+}
+
+/// Services parsed from `ufw status`, plus the rules we could not map.
+struct UfwParse {
+    services: Vec<(u8, u16)>,
+    skipped: Vec<String>,
+}
+
+/// Turn one `ufw status` "To" port spec into `(proto, port)` pairs, or None if
+/// it has no numeric port we can mirror (app profiles, "Anywhere", odd protos).
+/// A bare port (no `/proto`) opens both TCP and UDP, matching ufw.
+fn parse_port_spec(spec: &str) -> Option<Vec<(u8, u16)>> {
+    if spec.is_empty() {
+        return None;
+    }
+    let (ports, protos): (&str, Vec<u8>) = match spec.split_once('/') {
+        Some((p, "tcp")) => (p, vec![PROTO_TCP]),
+        Some((p, "udp")) => (p, vec![PROTO_UDP]),
+        Some(_) => return None, // esp/ah/etc: no port concept in the allowlist
+        None => (spec, vec![PROTO_TCP, PROTO_UDP]),
+    };
+    let (lo, hi) = match ports.split_once(':') {
+        Some((a, b)) => (a.parse::<u16>().ok()?, b.parse::<u16>().ok()?),
+        None => {
+            let p = ports.parse::<u16>().ok()?;
+            (p, p)
+        }
+    };
+    if lo == 0 || hi < lo || (hi as u32 - lo as u32) > 1024 {
+        return None; // 0, inverted, or a range too large to expand into the map
+    }
+    let mut out = Vec::new();
+    for port in lo..=hi {
+        for &pr in &protos {
+            out.push((pr, port));
+        }
+    }
+    Some(out)
+}
+
+/// Find the ALLOW/LIMIT action column, returning the "To" text before it and
+/// the text after it (which begins with the direction, e.g. "" or "OUT").
+/// DENY/REJECT lines and headers return None and are ignored.
+fn find_action(line: &str) -> Option<(&str, &str)> {
+    for kw in ["ALLOW", "LIMIT"] {
+        if let Some(idx) = line.find(kw) {
+            let at_column = idx == 0 || line.as_bytes()[idx - 1].is_ascii_whitespace();
+            if at_column {
+                return Some((&line[..idx], line[idx + kw.len()..].trim_start()));
+            }
+        }
+    }
+    None
+}
+
+/// Parse `ufw status` text into the IPv4 inbound services it opens.
+fn parse_ufw_status(text: &str) -> UfwParse {
+    let mut services = Vec::new();
+    let mut skipped = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((to, rest)) = find_action(line) else { continue };
+        // Only inbound rules open a service; OUT/FWD do not.
+        if rest.starts_with("OUT") || rest.starts_with("FWD") {
+            continue;
+        }
+        let to = to.trim();
+        if to.contains("(v6)") {
+            continue; // the allowlist is IPv4-only
+        }
+        // The first whitespace token is the port spec; the rest ("on eth0",
+        // trailing comments) does not change which port is opened.
+        let spec = to.split_whitespace().next().unwrap_or("");
+        match parse_port_spec(spec) {
+            Some(list) => services.extend(list),
+            None => skipped.push(to.to_string()),
+        }
+    }
+    services.sort_unstable();
+    services.dedup();
+    UfwParse { services, skipped }
+}
+
+/// Run `ufw status` (needs root) and parse it. Refuses when ufw is inactive so
+/// a sync never silently empties the allowlist.
+fn ufw_services() -> Result<UfwParse> {
+    let out = std::process::Command::new("ufw")
+        .arg("status")
+        .output()
+        .context("run `ufw status` (is ufw installed, and are we root?)")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let msg = if stderr.trim().is_empty() { &stdout } else { &stderr };
+        bail!("`ufw status` failed: {}", msg.trim());
+    }
+    if stdout.contains("Status: inactive") {
+        bail!("ufw is inactive; refusing to sync (it would empty the allowlist). Enable ufw or add services manually.");
+    }
+    Ok(parse_ufw_status(&stdout))
+}
+
+/// Mirror the box's ufw ALLOW rules into the service-allowlist for `ip`: add
+/// ports ufw now opens, remove allowlist entries ufw no longer opens. With
+/// `do_protect`, enable default-deny afterwards. With `dry_run`, only report.
+pub fn service_sync(layout: &PinLayout, ip: IpAddr, do_protect: bool, dry_run: bool) -> Result<()> {
+    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only: {ip}") };
+    let parsed = ufw_services()?;
+    let desired: HashSet<(u8, u16)> = parsed.services.iter().copied().collect();
+
+    // The service map only exists once the new dataplane is loaded. A dry-run
+    // should still preview the ufw parse before that, so tolerate a missing map
+    // there (current set = empty); a real sync requires it.
+    let map = match open(layout, MAP_SERVICE_V4) {
+        Ok(m) => Some(m),
+        Err(_) if dry_run => {
+            println!("note: service map not present yet (new dataplane not loaded) -- previewing ufw parse only");
+            None
+        }
+        Err(e) => return Err(e).context("open service allowlist map (is the new dataplane loaded?)"),
+    };
+    let mut current: HashSet<(u8, u16)> = HashSet::new();
+    if let Some(ref m) = map {
+        for key in m.keys() {
+            if key.len() == 8 && key[..4] == v4.octets()[..] {
+                current.insert((key[6], u16::from_be_bytes([key[4], key[5]])));
+            }
+        }
+    }
+
+    let mut to_add: Vec<(u8, u16)> = desired.difference(&current).copied().collect();
+    let mut to_del: Vec<(u8, u16)> = current.difference(&desired).copied().collect();
+    to_add.sort_unstable();
+    to_del.sort_unstable();
+
+    if !parsed.skipped.is_empty() {
+        println!(
+            "skipped {} ufw rule(s) with no numeric IPv4 port (add these manually if needed): {}",
+            parsed.skipped.len(),
+            parsed.skipped.join(", ")
+        );
+    }
+
+    let tag = if dry_run { "(dry-run) " } else { "" };
+    if to_add.is_empty() && to_del.is_empty() {
+        println!("{v4}: allowlist already matches ufw ({} service(s))", desired.len());
+    } else {
+        for (p, port) in &to_add {
+            println!("{tag}+ allow  {v4} {} {port}", proto_name(*p));
+        }
+        for (p, port) in &to_del {
+            println!("{tag}- remove {v4} {} {port}", proto_name(*p));
+        }
+    }
+
+    if dry_run {
+        if do_protect {
+            println!("{tag}would protect {v4} (default-deny)");
+        }
+        return Ok(());
+    }
+
+    let map = map.expect("service map is opened (non-dry-run returns Err above if absent)");
+    for (p, port) in &to_add {
+        map.update(&service_key(v4, *p, *port), &[1u8], MapFlags::ANY)
+            .context("insert service entry")?;
+    }
+    for (p, port) in &to_del {
+        if let Err(e) = map.delete(&service_key(v4, *p, *port)) {
+            if e.kind() != libbpf_rs::ErrorKind::NotFound {
+                return Err(e).context("delete stale service entry");
+            }
+        }
+    }
+    println!(
+        "synced {v4} from ufw: {} service(s) allowed (+{} -{})",
+        desired.len(),
+        to_add.len(),
+        to_del.len()
+    );
+
+    if do_protect {
+        protect(layout, ip)?;
+    }
+    Ok(())
+}
+
 /// Remaining TTL as a human string, or "never"/"expired".
 fn ttl_str(expires_ns: u64, now: u64) -> String {
     if expires_ns == 0 {
@@ -315,4 +586,58 @@ fn print_json(iface: &str, blocks: &[(IpAddr, Policy)], allows: &[(IpAddr, u8, A
         })
         .collect();
     println!(r#"{{"iface":"{iface}","blocks":[{}],"allowlist":[{}]}}"#, b.join(","), a.join(","));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_spec_variants() {
+        assert_eq!(parse_port_spec("22/tcp"), Some(vec![(PROTO_TCP, 22)]));
+        assert_eq!(parse_port_spec("53/udp"), Some(vec![(PROTO_UDP, 53)]));
+        // bare port = both transports
+        assert_eq!(parse_port_spec("80"), Some(vec![(PROTO_TCP, 80), (PROTO_UDP, 80)]));
+        // small range expands
+        assert_eq!(
+            parse_port_spec("6000:6001/tcp"),
+            Some(vec![(PROTO_TCP, 6000), (PROTO_TCP, 6001)])
+        );
+        // unmappable specs
+        assert_eq!(parse_port_spec("OpenSSH"), None);
+        assert_eq!(parse_port_spec("Anywhere"), None);
+        assert_eq!(parse_port_spec("500/esp"), None);
+        assert_eq!(parse_port_spec("0/tcp"), None);
+        // oversized range refused
+        assert_eq!(parse_port_spec("1:5000/tcp"), None);
+    }
+
+    #[test]
+    fn parses_ufw_status_table() {
+        let text = "\
+Status: active
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW       Anywhere
+3000                       ALLOW       Anywhere
+8006/tcp                   LIMIT       Anywhere
+8006/tcp on eth0           ALLOW       192.168.1.0/24
+25/tcp                     DENY        Anywhere
+1234/tcp                   ALLOW OUT   Anywhere
+OpenSSH                    ALLOW       Anywhere
+22/tcp (v6)                ALLOW       Anywhere (v6)
+";
+        let p = parse_ufw_status(text);
+        // DENY, OUT and v6 are excluded; LIMIT counts as allow; the
+        // interface-bound 8006 dedups with the LIMIT 8006.
+        assert!(p.services.contains(&(PROTO_TCP, 22)));
+        assert!(p.services.contains(&(PROTO_TCP, 3000)));
+        assert!(p.services.contains(&(PROTO_UDP, 3000)));
+        assert!(p.services.contains(&(PROTO_TCP, 8006)));
+        assert!(!p.services.contains(&(PROTO_TCP, 25))); // DENY
+        assert!(!p.services.contains(&(PROTO_TCP, 1234))); // OUT
+        // app profile reported as skipped
+        assert!(p.skipped.iter().any(|s| s == "OpenSSH"));
+    }
 }

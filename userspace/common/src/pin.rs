@@ -33,6 +33,10 @@ pub const MAP_RL_V6: &str = "xs_rl_v6";
 pub const MAP_VICTIM_V4: &str = "xs_victim_v4";
 /// Per-source attacker accounting (dropped attack packets by src IPv4).
 pub const MAP_ATTACKER_V4: &str = "xs_attacker_v4";
+/// Service allowlist: destinations under default-deny.
+pub const MAP_PROTECTED_V4: &str = "xs_protected_v4";
+/// Service allowlist: permitted {dst,proto,dport} services on protected dsts.
+pub const MAP_SERVICE_V4: &str = "xs_service_v4";
 
 /// Linux IFNAMSIZ including the terminating NUL.
 const IFNAMSIZ: usize = 16;

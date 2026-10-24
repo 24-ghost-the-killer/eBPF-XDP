@@ -94,6 +94,29 @@ struct {
 	__type(value, struct xs_allow);
 } xs_allow_v6 SEC(".maps");
 
+/* ---- Service allowlist (positive security model, default-deny per dst) ---- */
+/*
+ * xs_protected_v4 lists the destinations under default-deny; xs_service_v4 lists
+ * the {dst,proto,dport} services explicitly permitted on them. A packet to a
+ * protected destination that matches no service entry is dropped. Both are plain
+ * HASH (only the control plane writes, so an attacker cannot churn them) and are
+ * consulted only when XS_CFG_SERVICE_ALLOW is set. The appliance protects a
+ * handful of hosts with a handful of services, so these are sized small.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __be32);            /* protected destination IPv4, network order */
+	__type(value, __u8);            /* presence marker */
+} xs_protected_v4 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct xs_service_key);
+	__type(value, __u8);            /* presence marker */
+} xs_service_v4 SEC(".maps");
+
 /* ---- Phase 3: automatic per-source rate limiting ---- */
 
 /*

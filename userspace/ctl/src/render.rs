@@ -56,6 +56,7 @@ pub fn json(iface: &str, snap: &Snapshot, interval_s: Option<f64>, unix_ms: u128
 }
 
 /// Re-exported from the shared crate so `render::prometheus` keeps working.
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))] // only used by linux.rs
 pub use xs_common::metrics::prometheus;
 
 #[cfg(test)]

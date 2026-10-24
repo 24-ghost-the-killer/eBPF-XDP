@@ -53,6 +53,7 @@ pub fn run(cli: Cli) -> Result<()> {
             drop_fragments,
             drop_udp_dns,
             drop_udp,
+            lockdown,
         } => config(
             &layout(&cli, iface)?,
             [
@@ -61,6 +62,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 (ConfigFlags::DROP_FRAGMENTS, drop_fragments),
                 (ConfigFlags::DROP_UDP_DNS, drop_udp_dns),
                 (ConfigFlags::DROP_UDP, drop_udp),
+                (ConfigFlags::LOCKDOWN, lockdown),
             ],
         ),
         Cmd::Block { ref iface, ip, ttl } => policy::block(&layout(&cli, iface)?, ip, ttl),
@@ -72,6 +74,14 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::List { ref iface, json } => policy::list(&layout(&cli, iface)?, json),
         Cmd::Ratelimit { ref iface, pps, burst } => {
             policy::ratelimit(&layout(&cli, iface)?, pps, burst)
+        }
+        Cmd::Protect { ref iface, ip } => policy::protect(&layout(&cli, iface)?, ip),
+        Cmd::Unprotect { ref iface, ip } => policy::unprotect(&layout(&cli, iface)?, ip),
+        Cmd::Service { ref iface, ip, proto, port, remove } => {
+            policy::service(&layout(&cli, iface)?, ip, proto.number(), port, remove)
+        }
+        Cmd::ServiceSync { ref iface, ip, protect, dry_run } => {
+            policy::service_sync(&layout(&cli, iface)?, ip, protect, dry_run)
         }
     }
 }
@@ -416,7 +426,7 @@ fn write_config(map: &MapHandle, cfg: Config) -> Result<()> {
     Ok(())
 }
 
-fn config(layout: &PinLayout, changes: [(ConfigFlags, Option<Toggle>); 5]) -> Result<()> {
+fn config(layout: &PinLayout, changes: [(ConfigFlags, Option<Toggle>); 6]) -> Result<()> {
     let path = layout.map(MAP_CONFIG);
     let map = MapHandle::from_pinned_path(&path)
         .with_context(|| format!("open {path:?} (is the program attached?)"))?;

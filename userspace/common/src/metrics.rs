@@ -41,6 +41,8 @@ pub fn prom_family(name: &str) -> (&'static str, Option<(&'static str, &str)>) {
         "sample_drop" => ("sample", Some(("event", "dropped"))),
         // Connection tracking: untracked TCP (ACK/RST flood).
         "ct_untracked" => ("conntrack", Some(("event", "untracked"))),
+        // Service allowlist: dropped as off-service on a protected destination.
+        "service_deny" => ("service", Some(("event", "deny"))),
         // Every counter has a family (enforced by a test); keep a sane
         // fallback rather than panicking in an exporter.
         _ => ("other", Some(("counter", name))),
@@ -65,6 +67,7 @@ const PROM_HELP: &[(&str, &str)] = &[
     ("rate_tracked", "IP packets evaluated by the per-source rate limiter"),
     ("sample", "Phase 5 header sampling (event: taken = to ring buffer, dropped = reserve failed)"),
     ("conntrack", "Connection tracking: TCP packets with no matching flow (ACK/RST flood)"),
+    ("service", "Service allowlist denials (default-deny on a protected destination)"),
     ("other", "Unmapped counters"),
 ];
 
