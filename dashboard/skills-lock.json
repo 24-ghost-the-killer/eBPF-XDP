@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "ebpf-attacks": {
+      "source": "CyberStrikeus/CyberStrike",
+      "sourceType": "github",
+      "skillPath": ".cyberstrike/skill/ebpf-attacks/SKILL.md",
+      "computedHash": "d82646890eac6e14613ff09e94ed2d3682d309b074d9b61d08859815fdb4c680"
+    }
+  }
+}

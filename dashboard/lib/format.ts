@@ -18,6 +18,7 @@ export const bytes = (n: number | null | undefined) => si(n, 'B')
 
 export function duration(sec: number | null | undefined): string {
   if (sec == null || Number.isNaN(sec)) return '—'
+  if (sec < 60) return `${Math.max(0, Math.round(sec))}s`
   const d = Math.floor(sec / 86400)
   const h = Math.floor((sec % 86400) / 3600)
   const m = Math.floor((sec % 3600) / 60)
@@ -25,3 +26,8 @@ export function duration(sec: number | null | undefined): string {
   if (h) return `${h}h ${m}m`
   return `${m}m`
 }
+
+// "syn_flood" → "SYN flood": metric label values as readable text.
+const TOKENS = new Set(['syn', 'ack', 'rst', 'fin', 'udp', 'icmp', 'icmpv6', 'ipv4', 'ipv6', 'tcp', 'ext', 'ip', 'land'])
+export const pretty = (s: string) =>
+  s.split('_').map((w) => (TOKENS.has(w) ? w.toUpperCase() : w)).join(' ').replace(/^./, (c) => c.toUpperCase())

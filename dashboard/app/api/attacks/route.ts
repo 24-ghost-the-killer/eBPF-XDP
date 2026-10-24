@@ -1,4 +1,7 @@
 import { NextResponse } from 'next/server'
+import { readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 // Reconstructs a DDoS attack history from Prometheus (15d retention). An attack
 // is a contiguous period where the risk engine had detection_active > 0. For
@@ -11,7 +14,7 @@ export const maxDuration = 60
 const PROM = process.env.PROM_URL || 'http://localhost:9091'
 const STEP = 300 // coarse scan step; also the cache-key bucket size
 
-type Payload = { status: string; retentionDays: number; attacks: unknown[] }
+type Payload = { status: string; retentionDays: number; attacks: unknown[]; incomplete?: number }
 
 // Reconstructing 15 days of history runs hundreds of Prometheus queries (~5-7s).
 // The result only changes when a new 300s bucket starts, and the client re-polls
@@ -22,12 +25,65 @@ let CACHE: { key: number; data: Payload; builtAt: number } | null = null
 let INFLIGHT: Promise<Payload> | null = null
 const FRESH_MS = 60_000 // after this age, refresh in the background on next hit
 
+// Prometheus evaluates ~20 queries at a time. Firing every episode's ~30
+// queries at once (60 regions ≈ 1,500 requests) left most of them queued past
+// their timeout, and one timeout failed the whole history. Cap what we keep in
+// flight so each query is answered promptly.
+const MAX_INFLIGHT = 8
+let inflight = 0
+const waiters: (() => void)[] = []
+async function limited<T>(fn: () => Promise<T>): Promise<T> {
+  if (inflight >= MAX_INFLIGHT) await new Promise<void>((r) => waiters.push(r))
+  inflight++
+  try {
+    return await fn()
+  } finally {
+    inflight--
+    waiters.shift()?.()
+  }
+}
+
+// A finished episode never changes, so its (expensive) breakdown is computed
+// once and reused; only new or still-running episodes are queried again. The
+// cache is mirrored to disk so a dashboard restart doesn't start cold.
+type Ep = { start: number; end: number }
+type Built = Record<string, unknown> & { start: number; end: number }
+const SETTLED_S = 600 // an episode that ended this long ago is final
+// Bump whenever the per-episode breakdown logic changes, so a cache written by
+// an older build is discarded instead of served with stale/wrong numbers.
+// v2: per-source/victim counts read as peak-over-window (flush-safe) not instant.
+const CACHE_SCHEMA = 2
+const EPISODES = new Map<string, Built>()
+const epKey = (ep: Ep) => `${ep.start}-${ep.end}`
+const DISK = join(tmpdir(), 'xs-attacks-cache.json')
+let loaded = false
+async function loadDisk() {
+  if (loaded) return
+  loaded = true
+  try {
+    const j = JSON.parse(await readFile(DISK, 'utf8')) as { schema?: number; cache: typeof CACHE; episodes: [string, Built][] }
+    // A cache from an older breakdown-logic version is discarded, not trusted.
+    if (j.schema === CACHE_SCHEMA) {
+      if (j.cache) CACHE = j.cache
+      for (const [k, v] of j.episodes ?? []) EPISODES.set(k, v)
+    }
+  } catch {
+    // no cache yet, or unreadable: rebuild from Prometheus
+  }
+}
+async function saveDisk() {
+  try {
+    await writeFile(DISK, JSON.stringify({ schema: CACHE_SCHEMA, cache: CACHE, episodes: [...EPISODES.entries()] }))
+  } catch {
+    // best effort: the in-memory cache still works
+  }
+}
+
 async function instant(expr: string, time?: number) {
   const u = new URL(`${PROM}/api/v1/query`)
   u.searchParams.set('query', expr)
   if (time) u.searchParams.set('time', String(time))
-  const r = await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })
-  const j = await r.json()
+  const j = await limited(async () => (await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })).json())
   if (j.status !== 'success') throw new Error(j.error || 'query failed')
   return j.data.result as { metric: Record<string, string>; value: [number, string] }[]
 }
@@ -37,8 +93,7 @@ async function range(expr: string, start: number, end: number, step: number) {
   u.searchParams.set('start', String(start))
   u.searchParams.set('end', String(end))
   u.searchParams.set('step', String(step))
-  const r = await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })
-  const j = await r.json()
+  const j = await limited(async () => (await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })).json())
   if (j.status !== 'success') throw new Error(j.error || 'range failed')
   return j.data.result as { metric: Record<string, string>; values: [number, string][] }[]
 }
@@ -102,7 +157,6 @@ const VECTORS: [string, string][] = [
 ]
 
 async function build(): Promise<Payload> {
-    type Ep = { start: number; end: number }
 
     // --- Pass 1 (coarse): find attack REGIONS over 15d. 300s step + max_over_time
     // keeps us under Prometheus's 11k-point limit and catches short spikes. This
@@ -152,8 +206,11 @@ async function build(): Promise<Payload> {
     eps.reverse()
     const picked = eps.slice(0, 50)
 
-    const attacks = await Promise.all(
-      picked.map(async (ep, i) => {
+    const now = Math.floor(Date.now() / 1000)
+    const settled = await Promise.allSettled(
+      picked.map(async (ep): Promise<Built> => {
+        const cached = EPISODES.get(epKey(ep))
+        if (cached) return cached
         // pad the window by one step on each side so the counters fully cover the spike
         // stats window: the detection span padded ±PAD so increase()/max_over_time
         // capture the flood's counter rise without pulling in a neighbouring attack.
@@ -187,16 +244,20 @@ async function build(): Promise<Payload> {
           // rule-based detection is what actually drives mitigation and is correct.
           // count_over_time gives how many windows each type was active -> dominant.
           instant(`sum by(type)(count_over_time(xs_detection_info${win}))`, at),
-          // Per-source attacker drops: the counter VALUE at the end of the attack
-          // minus its value just before (0 for a fresh/flushed source). increase()
-          // over the padded window is WRONG here -- it loses the first scrape's
-          // packets for every young series (one born inside the window, which every
-          // freshly-seen attacker IP is), so summed over hundreds of sources it fell
-          // ~30% short of the true drop total. end-minus-start captures the full
-          // delta and isolates this episode from any earlier accumulation.
-          instant(`sum by(src)(xs_attacker_packets_total)`, at),
+          // Per-source attacker drops. The "end" value is the per-source counter's
+          // PEAK over the episode window (max_over_time), NOT its value at `at`:
+          // the attacker map is flushed to 0 within ~seconds of the attack ending,
+          // and `at` = ep.end + PAD lands AFTER that flush, so an instant read there
+          // returns 0 for every flood source and the whole attack vanishes from the
+          // breakdown (only leftover local traffic survives). The peak is the value
+          // the counter reached just before the flush = this source's episode total.
+          // deltaByKey then isolates the episode: subtract the pre-attack value for a
+          // monotonic series, or take the full peak for one born in-window / reset.
+          // (increase() is still WRONG here -- it drops the first scrape's packets for
+          // every young series, which every freshly-seen attacker IP is.)
+          instant(`sum by(src)(max_over_time(xs_attacker_packets_total${win}))`, at),
           instant(`sum by(src)(xs_attacker_packets_total)`, atStart),
-          instant(`sum by(src)(xs_attacker_bytes_total)`, at),
+          instant(`sum by(src)(max_over_time(xs_attacker_bytes_total${win}))`, at),
           instant(`sum by(src)(xs_attacker_bytes_total)`, atStart),
           instant(`sum by(src)(resets(xs_attacker_packets_total${win}))`, at),
           // True attack length in seconds (count of 1s windows detection was active),
@@ -206,10 +267,10 @@ async function build(): Promise<Payload> {
           // target: which interface(s) were under attack + which absorbed the ingress
           instant(`max_over_time((xs_detection_active)${sub})`, at),
           instant(`sum by(iface)(increase(xs_rx_packets_total${win}))`, at),
-          // victim destinations: same accurate end-minus-start delta as attackers.
-          instant(`sum by(dst)(xs_target_packets_total)`, at),
+          // victim destinations: same flush-safe peak-over-window as attackers.
+          instant(`sum by(dst)(max_over_time(xs_target_packets_total${win}))`, at),
           instant(`sum by(dst)(xs_target_packets_total)`, atStart),
-          instant(`sum by(dst)(xs_target_bytes_total)`, at),
+          instant(`sum by(dst)(max_over_time(xs_target_bytes_total${win}))`, at),
           instant(`sum by(dst)(xs_target_bytes_total)`, atStart),
           instant(`sum by(dst)(resets(xs_target_packets_total${win}))`, at),
           ...VECTORS.map(([, m]) => instant(`sum(increase(${m}${win}))`, at)),
@@ -252,6 +313,9 @@ async function build(): Promise<Payload> {
           })
           .filter((a) => a.packets > 0)
           .sort((a, b) => b.packets - a.packets)
+          // keep the payload small: a spoofed flood has thousands of sources, the
+          // UI shows the top few, and uniqueSources still carries the full count
+          .slice(0, 25)
 
         // ---- target: where the attack was aimed ----
         const rxByIface = new Map<string, number>()
@@ -283,8 +347,7 @@ async function build(): Promise<Payload> {
         const dropPkts = num(dropped)
         const totP = num(totPkts)
 
-        return {
-          id: i + 1,
+        const built: Built = {
           start: ep.start * 1000,
           end: ep.end * 1000,
           durationSec: durSec,
@@ -303,10 +366,26 @@ async function build(): Promise<Payload> {
           target,
           victims,
         }
+        if (now - ep.end >= SETTLED_S) EPISODES.set(epKey(ep), built)
+        return built
       })
     )
 
-    return { status: 'success', retentionDays: 15, attacks }
+    // An episode whose queries failed is left out this round (and retried on
+    // the next refresh) instead of failing the whole history.
+    const attacks = settled
+      .map((r) => (r.status === 'fulfilled' ? r.value : null))
+      .filter((a): a is Built => a !== null)
+      .map((a, i) => ({ ...a, id: i + 1 }))
+    const incomplete = settled.length - attacks.length
+    if (incomplete === settled.length && settled.length > 0) {
+      throw (settled[0] as PromiseRejectedResult).reason
+    }
+    // forget episodes that have aged out of the retention window
+    const live = new Set(picked.map(epKey))
+    for (const k of EPISODES.keys()) if (!live.has(k)) EPISODES.delete(k)
+
+    return { status: 'success', retentionDays: 15, attacks, ...(incomplete ? { incomplete } : {}) }
 }
 
 // Build once per bucket, deduped across concurrent callers.
@@ -315,6 +394,7 @@ function rebuild(key: number): Promise<Payload> {
     INFLIGHT = build()
       .then((data) => {
         CACHE = { key, data, builtAt: Date.now() }
+        void saveDisk()
         return data
       })
       .finally(() => {
@@ -327,6 +407,7 @@ function rebuild(key: number): Promise<Payload> {
 export async function GET() {
   const key = Math.floor(Date.now() / 1000 / STEP) * STEP
   try {
+    await loadDisk()
     // Warm cache: serve it instantly. If it's for an old bucket or getting old,
     // kick off a background refresh so the NEXT poll gets fresh data — the user
     // never waits on the 5-7s reconstruction.

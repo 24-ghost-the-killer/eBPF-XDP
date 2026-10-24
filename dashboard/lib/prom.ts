@@ -58,6 +58,21 @@ export async function range(
   return d.result
 }
 
+// Range query over an absolute window (unix seconds), for custom ranges and
+// drill-downs into past episodes.
+export async function rangeAbs(expr: string, start: number, end: number, step: number): Promise<RangeResult[]> {
+  const d = await call(
+    `/query_range?query=${encodeURIComponent(expr)}&start=${Math.floor(start)}&end=${Math.floor(end)}&step=${Math.max(1, Math.round(step))}`
+  )
+  return d.result
+}
+
+// Instant query evaluated at a given time (unix seconds).
+export async function instantAt(expr: string, time: number): Promise<InstantResult[]> {
+  const d = await call(`/query?query=${encodeURIComponent(expr)}&time=${Math.floor(time)}`)
+  return d.result
+}
+
 // First value of an instant result, or the default.
 export function scalar(result: InstantResult[], dflt: number | null = null): number | null {
   if (!result || result.length === 0) return dflt
