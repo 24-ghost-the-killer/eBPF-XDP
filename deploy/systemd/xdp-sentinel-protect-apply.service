@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply the dashboard protection plan to the XDP service-allowlist
+After=sentinel-agent.service
+Wants=sentinel-agent.service
+
+[Service]
+Type=oneshot
+# Creates /var/lib/xdp-sentinel for the applied-state snapshot.
+StateDirectory=xdp-sentinel
+ExecStart=/usr/local/bin/xs-protect-apply

@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply the dashboard lockdown desired-state to the XDP dataplane
+After=sentinel-agent.service
+Wants=sentinel-agent.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/xdp-sentinel/lockdown.env
+ExecStart=/usr/local/bin/xs-lockdown-apply

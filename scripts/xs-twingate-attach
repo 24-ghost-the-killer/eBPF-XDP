@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Route Twingate-originated traffic through the existing XDP dataplane.
+
+The Twingate connector, run as a container, has its own network namespace and a
+host-side veth. Its connections to internal resources (e.g. Proxmox) *ingress*
+that veth on the host, so the existing xdp-sentinel program can inspect them
+there exactly as it does on vlan10/vlan20 -- no new program, same per-interface
+service-allowlist maps. This script:
+
+  1. resolves the connector container's current host-side veth (the name is
+     regenerated on every container restart),
+  2. attaches the existing dataplane object to that veth (generic/SKB mode, which
+     is what a veth needs; --replace so it is idempotent), and
+  3. syncs the protection plan's hosts+services into that interface's
+     allowlist, so Twingate obeys the same default-deny as the bridge.
+
+Run once (a single reconcile pass) or with --watch (initial pass, then re-run on
+every container start via `docker events`). A systemd .path unit also triggers a
+one-shot pass when the plan file changes.
+
+Must run as root (docker + nsenter + sentinelctl). Idempotent.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONTAINER = os.environ.get("XS_TWINGATE_CONTAINER", "twingate-connector")
+CONTAINER_IFACE = os.environ.get("XS_TWINGATE_CONTAINER_IFACE", "eth0")
+PLAN = os.environ.get("XS_PROTECT_PLAN", "/home/test_server/xdp-sentinel-data/protect-plan.json")
+APPLIED = os.environ.get("XS_TWINGATE_APPLIED", "/var/lib/xdp-sentinel/twingate.applied.json")
+SENTINELCTL = os.environ.get("SENTINELCTL", "/usr/local/bin/sentinelctl")
+OBJ = os.environ.get("XS_BPF_OBJ", "/usr/lib/xdp-sentinel/xdp_main.bpf.o")
+DOCKER = os.environ.get("DOCKER", "docker")
+MODE = os.environ.get("XS_TWINGATE_MODE", "generic")
+MGMT = set(x.strip() for x in os.environ.get("XS_PROTECT_MANAGEMENT", "192.168.1.193,10.55.12.193").split(",") if x.strip())
+LIFELINE_SPEC = os.environ.get("XS_PROTECT_LIFELINE", "tcp/22,tcp/3000")
+
+PROTO = {"tcp": "tcp", "6": "tcp", "udp": "udp", "17": "udp", "icmp": "icmp", "1": "icmp"}
+
+
+def log(m):
+    print(f"[xs-twingate-attach] {m}", flush=True)
+
+
+def norm_proto(p):
+    return PROTO.get(str(p).lower())
+
+
+def svc_key(proto, port):
+    proto = norm_proto(proto)
+    if proto is None:
+        return None
+    return f"{proto}/{0 if proto == 'icmp' else int(port)}"
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def ctl(*args):
+    try:
+        res = run([SENTINELCTL, *args], timeout=30)
+    except FileNotFoundError:
+        log(f"ERROR: {SENTINELCTL} not found")
+        return False
+    except Exception as e:
+        log(f"ERROR running sentinelctl {' '.join(args)}: {e}")
+        return False
+    if res.returncode != 0:
+        log(f"sentinelctl {' '.join(args)} failed: {res.stderr.strip() or res.stdout.strip()}")
+        return False
+    return True
+
+
+def attach_veth(veth):
+    """Attach the dataplane to the veth. Each container restart gives a fresh
+    veth with nothing attached, so a plain attach (no --replace) is correct;
+    --replace is for upgrading vlan10/vlan20 in place and does not carry the
+    generic/SKB mode flag. If our program is already on this veth, reuse it."""
+    res = run([SENTINELCTL, "attach", "-i", veth, "--mode", MODE, "--obj", OBJ], timeout=30)
+    if res.returncode == 0:
+        log(f"attached dataplane to {veth} (mode={MODE})")
+        return True
+    err = (res.stderr + res.stdout).strip()
+    if "already has XDP program" in err:
+        log(f"{veth} already has the dataplane attached; reusing")
+        return True
+    log(f"attach to {veth} failed: {err}")
+    return False
+
+
+def sshd_ports():
+    ports = set()
+    try:
+        out = run(["ss", "-Hltnp"], timeout=5).stdout
+        for line in out.splitlines():
+            if "sshd" not in line:
+                continue
+            cols = line.split()
+            if len(cols) >= 4:
+                p = cols[3].rsplit(":", 1)[-1]
+                if p.isdigit():
+                    ports.add(int(p))
+    except Exception:
+        pass
+    if not ports:
+        ports.add(22)
+    return ports
+
+
+def lifeline_keys():
+    keys = set()
+    for tok in LIFELINE_SPEC.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        proto, _, port = tok.partition("/")
+        k = svc_key(proto, port or 0)
+        if k:
+            keys.add(k)
+    for p in sshd_ports():
+        keys.add(f"tcp/{p}")
+    return keys
+
+
+def container_pid():
+    """PID of the running connector container, or None."""
+    res = run([DOCKER, "inspect", "-f", "{{.State.Running}} {{.State.Pid}}", CONTAINER], timeout=15)
+    if res.returncode != 0:
+        return None
+    parts = res.stdout.split()
+    if len(parts) != 2 or parts[0] != "true":
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def host_veth(pid):
+    """Host-side veth name for the container's primary interface."""
+    res = run(["nsenter", "-t", str(pid), "-n", "ip", "-o", "link", "show", CONTAINER_IFACE], timeout=10)
+    if res.returncode != 0:
+        log(f"cannot read {CONTAINER_IFACE} in container netns: {res.stderr.strip()}")
+        return None
+    m = re.search(rf"{re.escape(CONTAINER_IFACE)}@if(\d+):", res.stdout)
+    if not m:
+        log(f"could not parse peer ifindex from: {res.stdout.strip()}")
+        return None
+    peer = m.group(1)
+    for d in os.listdir("/sys/class/net"):
+        try:
+            with open(f"/sys/class/net/{d}/ifindex") as f:
+                if f.read().strip() == peer:
+                    return d
+        except Exception:
+            continue
+    log(f"no host interface with ifindex {peer}")
+    return None
+
+
+def desired_from_plan():
+    """{ip: set('proto/port')} aggregated across the plan, lifeline forced on mgmt IPs."""
+    plan = load_json(PLAN, {"hosts": []})
+    lifeline = lifeline_keys()
+    out = {}
+    for h in plan.get("hosts", []):
+        ip = str(h.get("ip", ""))
+        if not ip:
+            continue
+        svcs = out.setdefault(ip, set())
+        for s in h.get("services", []):
+            k = svc_key(s.get("proto"), s.get("port", 0))
+            if k:
+                svcs.add(k)
+    for ip in list(out):
+        if ip in MGMT:
+            out[ip] |= lifeline
+    return out, lifeline
+
+
+def reconcile():
+    pid = container_pid()
+    if pid is None:
+        log(f"container '{CONTAINER}' not running; nothing to attach")
+        return
+    veth = host_veth(pid)
+    if veth is None:
+        log("could not resolve host veth; skipping")
+        return
+
+    if not attach_veth(veth):
+        return
+
+    desired, lifeline = desired_from_plan()
+    snap = load_json(APPLIED, {})
+    fresh = snap.get("veth") != veth
+    applied = {} if fresh else {ip: set(v) for ip, v in snap.get("hosts", {}).items()}
+    if fresh and snap.get("veth"):
+        log(f"veth changed {snap.get('veth')} -> {veth}; maps are fresh")
+
+    for ip, svcs in desired.items():
+        cur = applied.get(ip, set())
+        # add services BEFORE protecting, so a protected host is never momentarily blackholed
+        for k in svcs - cur:
+            proto, port = k.split("/")
+            ctl("service", "-i", veth, ip, proto, port)
+        ctl("protect", "-i", veth, ip)
+        for k in cur - svcs:
+            if ip in MGMT and k in lifeline:
+                continue
+            proto, port = k.split("/")
+            ctl("service", "-i", veth, ip, proto, port, "--remove")
+
+    for ip, cur in applied.items():
+        if ip not in desired:
+            log(f"unprotecting {ip} on {veth} (removed from plan)")
+            ctl("unprotect", "-i", veth, ip)
+
+    try:
+        os.makedirs(os.path.dirname(APPLIED), exist_ok=True)
+        with open(APPLIED, "w") as f:
+            json.dump({"veth": veth, "hosts": {ip: sorted(v) for ip, v in desired.items()}}, f)
+    except Exception as e:
+        log(f"WARNING: could not write {APPLIED}: {e}")
+    log(f"synced {len(desired)} host(s) onto {veth}: {sorted(desired)}")
+
+
+def watch():
+    reconcile()
+    log(f"watching docker events for '{CONTAINER}' start...")
+    p = subprocess.Popen(
+        [DOCKER, "events", "--filter", "type=container", "--filter", f"container={CONTAINER}",
+         "--filter", "event=start", "--format", "{{.Action}} {{.Actor.Attributes.name}}"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        for line in p.stdout:
+            log(f"container start event: {line.strip()}")
+            time.sleep(2)  # let the veth settle
+            reconcile()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        p.terminate()
+
+
+def main():
+    if "--watch" in sys.argv[1:]:
+        watch()
+    else:
+        reconcile()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+# xdp-sentinel protected destinations (default-deny; services mirrored from ufw)
+#
+# Format:  <ipv4> [iface]
+#   <ipv4>  destination to put in default-deny. Only the ports ufw has open
+#           (ALLOW/LIMIT, inbound, IPv4) reach it; everything else is dropped
+#           before the rate limiter.
+#   [iface] interface to apply it on. Omit to apply to every interface the
+#           agent manages. For a host reached from the WAN side, name the WAN
+#           ingress (e.g. vlan10) so LAN-side traffic is unaffected.
+#
+# Install as /etc/xdp-sentinel/protect.conf, then enable:
+#   systemctl enable --now xdp-sentinel-ufw-sync.path xdp-sentinel-ufw-sync.service
+#
+# WARNING: default-deny is stateless/direction-agnostic. Protecting the box's
+# own IP can drop replies to the box's own OUTBOUND connections (DNS, updates)
+# that arrive on ephemeral ports. Safe for serve-only backends; for the box
+# itself, validate first (see docs) or wait for the stateful management-plane
+# exemption.
+
+# Protect the box's management IP on the WAN ingress only:
+# 192.168.1.193 vlan10
+
+# Protect a serve-only backend on every managed interface:
+# 192.168.1.173

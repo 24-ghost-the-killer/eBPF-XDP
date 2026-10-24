@@ -1,0 +1,11 @@
+# One-shot reconcile of the Twingate veth's service-allowlist from the plan.
+# Triggered by xdp-sentinel-twingate-attach.path when the plan file changes.
+[Unit]
+Description=Re-sync the Twingate veth allowlist from the protection plan
+After=xdp-sentinel-twingate-attach.service
+
+[Service]
+Type=oneshot
+StateDirectory=xdp-sentinel
+EnvironmentFile=-/etc/xdp-sentinel/twingate.env
+ExecStart=/usr/local/bin/xs-twingate-attach

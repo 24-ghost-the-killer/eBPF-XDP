@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the dashboard protection plan and reconcile on change
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/protect-plan.json
+Unit=xdp-sentinel-protect-apply.service
+
+[Install]
+WantedBy=multi-user.target

@@ -5,3 +5,6 @@ out
 .DS_Store
 *.tsbuildinfo
 next-env.d.ts
+
+# local secrets (e.g. REACTBITS_LICENSE_KEY)
+.env*.local

@@ -1,0 +1,11 @@
+# Auto-revert: restore the native Twingate connector if the containerized one
+# is down/unhealthy for several checks, so a remote-only box can't get stranded.
+[Unit]
+Description=Twingate connector auto-revert watchdog
+After=docker.service
+
+[Service]
+Type=oneshot
+StateDirectory=xdp-sentinel
+EnvironmentFile=-/etc/xdp-sentinel/twingate.env
+ExecStart=/usr/local/bin/xs-twingate-watchdog

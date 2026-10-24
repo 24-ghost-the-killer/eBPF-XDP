@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Apply the dashboard's lockdown desired-state to the dataplane and enforce the
+auto-revert timer.
+
+Lockdown drops every IPv4 packet on an interface whose destination is not a
+protected host (protected hosts keep their service allowlist). The dashboard
+writes a control file; a systemd .path applies changes immediately, and a .timer
+re-runs this every ~30s so the mode reverts itself the moment its timer expires
+-- a dead-man's switch so an operator can never arm an indefinite lockout. Root.
+
+Scope: the inline-bridge XDP dataplane (vlan10 + vlan20) AND the Twingate
+connector's host-side veth, resolved dynamically here (the veth name is
+regenerated on every container restart). Locking the veth drops the connector's
+own traffic to Twingate's relays, so arming lockdown severs the tunnel and the
+remote operator's access until the timer expires -- the operator chose this
+"everything through XDP" behaviour knowingly, and the LOCAL auto-revert timer
+below is what brings the tunnel back without any remote action.
+"""
+import json
+import os
+import re
+import subprocess
+import time
+
+FILE = os.environ.get("XS_LOCKDOWN_FILE", "/home/test_server/xdp-sentinel-data/lockdown.json")
+SENTINELCTL = os.environ.get("SENTINELCTL", "/usr/local/bin/sentinelctl")
+DOCKER = os.environ.get("DOCKER", "docker")
+# The static inline-bridge interfaces. Override with XS_LOCKDOWN_IFACES="vlan10 vlan20".
+DEFAULT_IFACES = [i for i in os.environ.get("XS_LOCKDOWN_IFACES", "vlan10 vlan20").replace(",", " ").split() if i]
+# Twingate connector container whose host veth is also locked down. Shared with
+# xs-twingate-attach via the same env var. Set XS_LOCKDOWN_TWINGATE=0 to exclude.
+CONTAINER = os.environ.get("XS_TWINGATE_CONTAINER", "twingate-connector")
+CONTAINER_IFACE = os.environ.get("XS_TWINGATE_CONTAINER_IFACE", "eth0")
+INCLUDE_TWINGATE = os.environ.get("XS_LOCKDOWN_TWINGATE", "1") not in ("0", "false", "no", "")
+
+
+def log(m):
+    print(f"[xs-lockdown-apply] {m}", flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def load():
+    try:
+        with open(FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def ctl(iface, on):
+    r = run([SENTINELCTL, "config", "-i", iface, "--lockdown", "on" if on else "off"], timeout=30)
+    if r.returncode != 0:
+        log(f"sentinelctl config --lockdown {'on' if on else 'off'} on {iface} failed: {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    return True
+
+
+def container_pid():
+    """PID of the running connector container, or None."""
+    r = run([DOCKER, "inspect", "-f", "{{.State.Running}} {{.State.Pid}}", CONTAINER], timeout=15)
+    if r.returncode != 0:
+        return None
+    parts = r.stdout.split()
+    if len(parts) != 2 or parts[0] != "true":
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def host_veth():
+    """Current host-side veth of the Twingate connector, or None if not running.
+    Mirrors xs-twingate-attach so both jobs target the same interface."""
+    if not INCLUDE_TWINGATE:
+        return None
+    pid = container_pid()
+    if pid is None:
+        return None
+    r = run(["nsenter", "-t", str(pid), "-n", "ip", "-o", "link", "show", CONTAINER_IFACE], timeout=10)
+    if r.returncode != 0:
+        return None
+    m = re.search(rf"{re.escape(CONTAINER_IFACE)}@if(\d+):", r.stdout)
+    if not m:
+        return None
+    peer = m.group(1)
+    try:
+        for d in os.listdir("/sys/class/net"):
+            try:
+                with open(f"/sys/class/net/{d}/ifindex") as f:
+                    if f.read().strip() == peer:
+                        return d
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def target_ifaces(desired_ifaces):
+    """Static ifaces from the control file (or defaults) + the live Twingate veth."""
+    ifaces = [str(i) for i in (desired_ifaces or DEFAULT_IFACES) if i] or list(DEFAULT_IFACES)
+    veth = host_veth()
+    if veth and veth not in ifaces:
+        ifaces.append(veth)
+    elif INCLUDE_TWINGATE and veth is None:
+        log(f"Twingate container '{CONTAINER}' veth not resolved; locking bridge only this pass")
+    return ifaces
+
+
+def main():
+    d = load()
+    enabled = bool(d.get("enabled"))
+    expires = int(d.get("expires_at") or 0)
+    now = int(time.time())
+    expired = enabled and expires and now >= expires
+    effective = enabled and not expired
+
+    ifaces = target_ifaces(d.get("ifaces"))
+    # Evaluate every interface (do NOT short-circuit on the first failure, or a
+    # failure on vlan10 would skip vlan20 and the veth).
+    results = [ctl(iface, effective) for iface in ifaces]
+    if all(results):
+        tail = f"; auto-reverts in {expires - now}s" if effective and expires else ""
+        log(f"lockdown {'ON' if effective else 'off'} on {', '.join(ifaces)}{tail}")
+    else:
+        done = [i for i, ok in zip(ifaces, results) if ok]
+        log(f"lockdown {'ON' if effective else 'off'} partially applied; ok on {', '.join(done) or '(none)'}")
+
+    # Once the timer has lapsed, clear the desired state so the dashboard and the
+    # dataplane agree that lockdown is off.
+    if expired:
+        d["enabled"] = False
+        d["expires_at"] = 0
+        try:
+            with open(FILE, "w") as f:
+                json.dump(d, f)
+            log("auto-revert: timer expired, lockdown cleared")
+        except Exception as e:
+            log(f"WARNING: could not clear {FILE}: {e}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+# Twingate connector, containerized so its traffic to internal resources
+# ingresses a dedicated veth that the existing xdp-sentinel program attaches to
+# (scripts/xs-twingate-attach). Same connector, same tokens -- just in its own
+# network namespace so the dataplane can inspect it. Tokens are read from
+# /etc/twingate/connector.conf via env_file; this file never holds secrets.
+#
+# Pin `image` to match the connector version you were running if you want an
+# exact match; `:1` tracks the current major and is Twingate's recommended tag.
+#
+# Cut over from the native service (interrupts Twingate briefly):
+#   sudo systemctl disable --now twingate-connector.service
+#   sudo docker compose -f /opt/xdp-sentinel/twingate/docker-compose.yml up -d
+services:
+  twingate-connector:
+    image: twingate/connector:1
+    container_name: twingate-connector
+    restart: unless-stopped
+    env_file:
+      - /etc/twingate/connector.conf
+    environment:
+      TWINGATE_LABEL_DEPLOYED_BY: xdp-sentinel-docker
+    networks:
+      - twingate
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  twingate:
+    name: twingate
+    driver: bridge

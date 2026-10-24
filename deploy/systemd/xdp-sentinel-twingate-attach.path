@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile the Twingate veth allowlist when the protection plan changes
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/protect-plan.json
+Unit=xdp-sentinel-twingate-sync.service
+
+[Install]
+WantedBy=multi-user.target

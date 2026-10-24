@@ -1,0 +1,18 @@
+# Mirrors the box's ufw ALLOW rules into the service-allowlist and asserts
+# default-deny for the hosts listed in /etc/xdp-sentinel/protect.conf.
+#
+# Runs once at boot after the agent has re-attached (pinned service maps do not
+# survive a reboot), and is re-triggered on every ufw change by the companion
+# xdp-sentinel-ufw-sync.path unit. No RemainAfterExit: the .path unit can only
+# re-run a oneshot that has already exited.
+[Unit]
+Description=xdp-sentinel ufw-driven service allowlist
+After=sentinel-agent.service
+Wants=sentinel-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xs-ufw-sync
+
+[Install]
+WantedBy=multi-user.target

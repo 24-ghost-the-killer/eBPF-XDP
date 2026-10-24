@@ -1,0 +1,15 @@
+# Watches the ufw rules file and re-runs xdp-sentinel-ufw-sync.service on every
+# change, so the service-allowlist follows `ufw allow/deny` with no manual
+# command. ufw rewrites user.rules on each change (and on `ufw reload`).
+#
+# Enable with:  systemctl enable --now xdp-sentinel-ufw-sync.path
+# (also enable xdp-sentinel-ufw-sync.service so it runs at boot).
+[Unit]
+Description=watch ufw rules and resync the xdp-sentinel service allowlist
+
+[Path]
+PathChanged=/etc/ufw/user.rules
+Unit=xdp-sentinel-ufw-sync.service
+
+[Install]
+WantedBy=multi-user.target

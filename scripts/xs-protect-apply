@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Reconcile the eBPF service-allowlist (default-deny) to the dashboard's
+protection plan. Runs as root from a systemd path-unit whenever the plan file
+changes. Reads the desired plan, compares to the live maps (via the agent's
+/api/services.json), and converges with `sentinelctl`.
+
+Authoritative only for hosts it manages: it records what it applied and
+unprotects a host only when that host was previously applied by this job and is
+now gone from the plan — so hosts managed by ufw-sync or the CLI are untouched.
+
+Management IPs MAY be protected, but a lifeline (SSH + dashboard) is always
+forced open and never removed, so default-deny can never blackhole the
+appliance's own SSH / the dashboard. The live sshd port is detected as a backstop
+on top of XS_PROTECT_LIFELINE.
+"""
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+PLAN = os.environ.get("XS_PROTECT_PLAN", "/home/test_server/xdp-sentinel-data/protect-plan.json")
+APPLIED = os.environ.get("XS_PROTECT_APPLIED", "/var/lib/xdp-sentinel/protect-plan.applied.json")
+AGENT = os.environ.get("XS_AGENT_URL", "http://127.0.0.1:9464")
+SENTINELCTL = os.environ.get("SENTINELCTL", "/usr/local/bin/sentinelctl")
+MGMT = set(x.strip() for x in os.environ.get("XS_PROTECT_MANAGEMENT", "192.168.1.193,10.55.12.193").split(",") if x.strip())
+LIFELINE_SPEC = os.environ.get("XS_PROTECT_LIFELINE", "tcp/22,tcp/3000")
+
+PROTO = {"tcp": "tcp", "6": "tcp", "udp": "udp", "17": "udp", "icmp": "icmp", "1": "icmp"}
+
+
+def log(msg):
+    print(f"[xs-protect-apply] {msg}", flush=True)
+
+
+def norm_proto(p):
+    return PROTO.get(str(p).lower())
+
+
+def svc_key(proto, port):
+    proto = norm_proto(proto)
+    if proto is None:
+        return None
+    return f"{proto}/{0 if proto == 'icmp' else int(port)}"
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def sshd_ports():
+    """TCP ports sshd is listening on (so protecting a management IP never cuts
+    SSH, even on a non-standard port). Falls back to 22."""
+    ports = set()
+    try:
+        out = subprocess.run(["ss", "-Hltnp"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "sshd" not in line:
+                continue
+            cols = line.split()
+            if len(cols) >= 4:
+                p = cols[3].rsplit(":", 1)[-1]
+                if p.isdigit():
+                    ports.add(int(p))
+    except Exception:
+        pass
+    if not ports:
+        ports.add(22)
+    return ports
+
+
+def lifeline_keys():
+    keys = set()
+    for tok in LIFELINE_SPEC.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        proto, _, port = tok.partition("/")
+        k = svc_key(proto, port or 0)
+        if k:
+            keys.add(k)
+    for p in sshd_ports():
+        keys.add(f"tcp/{p}")
+    return keys
+
+
+def live_state():
+    """{(iface, ip): set('proto/port')} from the agent, or None if unreachable."""
+    try:
+        with urllib.request.urlopen(f"{AGENT}/api/services.json", timeout=5) as r:
+            data = json.load(r)
+    except Exception as e:
+        log(f"WARNING: cannot read agent services ({e}); will add desired services but not prune")
+        return None
+    out = {}
+    for iface in data.get("interfaces", []):
+        name = iface.get("iface")
+        for p in iface.get("protected", []):
+            svcs = set()
+            for s in p.get("services", []):
+                k = svc_key(s.get("proto"), s.get("port", 0))
+                if k:
+                    svcs.add(k)
+            out[(name, p.get("ip"))] = svcs
+    return out
+
+
+def ctl(*args):
+    try:
+        res = subprocess.run([SENTINELCTL, *args], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        log(f"ERROR: {SENTINELCTL} not found — deploy the updated sentinelctl first")
+        sys.exit(2)
+    except Exception as e:
+        log(f"ERROR running sentinelctl {' '.join(args)}: {e}")
+        return False
+    if res.returncode != 0:
+        log(f"sentinelctl {' '.join(args)} failed: {res.stderr.strip() or res.stdout.strip()}")
+        return False
+    return True
+
+
+def main():
+    plan = load_json(PLAN, {"hosts": []})
+    lifeline = lifeline_keys()
+    desired = {}  # (iface, ip) -> set('proto/port')
+    for h in plan.get("hosts", []):
+        iface, ip = str(h.get("iface", "")), str(h.get("ip", ""))
+        if not iface or not ip:
+            continue
+        svcs = set()
+        for s in h.get("services", []):
+            k = svc_key(s.get("proto"), s.get("port", 0))
+            if k:
+                svcs.add(k)
+        if ip in MGMT:
+            # force the lifeline open on a management IP, always
+            svcs |= lifeline
+        desired[(iface, ip)] = svcs
+
+    live = live_state()
+    applied_prev = set(tuple(x) for x in load_json(APPLIED, {"hosts": []}).get("hosts", []))
+
+    for (iface, ip), svcs in desired.items():
+        is_mgmt = ip in MGMT
+        ctl("protect", "-i", iface, ip)
+        cur = live.get((iface, ip), set()) if live is not None else set()
+        for k in svcs - cur:
+            proto, port = k.split("/")
+            ctl("service", "-i", iface, ip, proto, port)
+        if live is not None:
+            for k in cur - svcs:
+                if is_mgmt and k in lifeline:
+                    continue  # never strip a management IP's lifeline
+                proto, port = k.split("/")
+                ctl("service", "-i", iface, ip, proto, port, "--remove")
+
+    # unprotect hosts this job applied before but are no longer desired (opening
+    # a host fully is safe; it just leaves default-deny)
+    for (iface, ip) in applied_prev - set(desired):
+        log(f"unprotecting {ip} on {iface} (removed from plan)")
+        ctl("unprotect", "-i", iface, ip)
+
+    try:
+        os.makedirs(os.path.dirname(APPLIED), exist_ok=True)
+        with open(APPLIED, "w") as f:
+            json.dump({"hosts": [list(k) for k in desired]}, f)
+    except Exception as e:
+        log(f"WARNING: could not write {APPLIED}: {e}")
+
+    log(f"reconciled {len(desired)} host(s); lifeline={sorted(lifeline)}")
+
+
+if __name__ == "__main__":
+    main()

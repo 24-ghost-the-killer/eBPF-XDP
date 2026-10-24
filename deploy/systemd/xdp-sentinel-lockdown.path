@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply lockdown when its control file changes
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/lockdown.json
+Unit=xdp-sentinel-lockdown.service
+
+[Install]
+WantedBy=multi-user.target

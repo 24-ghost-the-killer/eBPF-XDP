@@ -1,0 +1,19 @@
+# Keeps the xdp-sentinel dataplane attached to the Twingate connector's veth and
+# re-attaches on every container (re)start (the veth name changes each time).
+# The initial pass runs on start; `--watch` then follows `docker events`.
+[Unit]
+Description=Attach xdp-sentinel to the Twingate connector veth (watch container)
+After=docker.service sentinel-agent.service
+Wants=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+StateDirectory=xdp-sentinel
+EnvironmentFile=-/etc/xdp-sentinel/twingate.env
+ExecStart=/usr/local/bin/xs-twingate-attach --watch
+
+[Install]
+WantedBy=multi-user.target

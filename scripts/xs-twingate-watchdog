@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Auto-revert safety net for the containerized Twingate connector.
+
+The box is remote-only via Twingate. If the container connector is down or
+unhealthy for N consecutive checks, re-enable the native twingate-connector
+service so remote access is restored. Restoring it brings redundancy back (both
+connectors up) — re-retire the native one once the container is healthy again.
+
+Run every minute by xdp-sentinel-twingate-watchdog.timer. Root (docker + systemctl).
+"""
+import json
+import os
+import subprocess
+
+CONTAINER = os.environ.get("XS_TWINGATE_CONTAINER", "twingate-connector")
+NATIVE = os.environ.get("XS_TWINGATE_NATIVE_UNIT", "twingate-connector.service")
+DOCKER = os.environ.get("DOCKER", "docker")
+STATE = os.environ.get("XS_TWINGATE_WATCHDOG_STATE", "/var/lib/xdp-sentinel/twingate-watchdog.json")
+THRESHOLD = int(os.environ.get("XS_TWINGATE_WATCHDOG_THRESHOLD", "3"))
+
+
+def log(m):
+    print(f"[xs-twingate-watchdog] {m}", flush=True)
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+
+
+def container_healthy():
+    """True if the connector container is running (and, if it has a healthcheck,
+    reporting healthy)."""
+    try:
+        res = run([DOCKER, "inspect", "-f",
+                   "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}", CONTAINER])
+    except Exception as e:
+        log(f"docker inspect error: {e}")
+        return False
+    if res.returncode != 0:
+        log(f"container '{CONTAINER}' not found")
+        return False
+    running, _, health = res.stdout.strip().partition("|")
+    if running != "true":
+        log(f"container '{CONTAINER}' not running")
+        return False
+    if health and health != "healthy":
+        log(f"container '{CONTAINER}' health={health}")
+        return False
+    return True
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {"fails": 0}
+
+
+def save_state(s):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, "w") as f:
+            json.dump(s, f)
+    except Exception as e:
+        log(f"WARNING: cannot write {STATE}: {e}")
+
+
+def native_active():
+    return run(["systemctl", "is-active", NATIVE]).stdout.strip() == "active"
+
+
+def main():
+    st = load_state()
+    if container_healthy():
+        if st.get("fails", 0):
+            log("container healthy again; resetting failure count")
+        save_state({"fails": 0})
+        return
+    st["fails"] = st.get("fails", 0) + 1
+    log(f"connector unhealthy ({st['fails']}/{THRESHOLD})")
+    if st["fails"] >= THRESHOLD and not native_active():
+        log("THRESHOLD reached -> restoring native twingate-connector.service for remote access")
+        r = run(["systemctl", "enable", "--now", NATIVE])
+        if r.returncode == 0:
+            log("native connector restored (redundancy back; re-retire once the container is healthy)")
+        else:
+            log(f"FAILED to restore native connector: {r.stderr.strip()}")
+    save_state(st)
+
+
+if __name__ == "__main__":
+    main()
