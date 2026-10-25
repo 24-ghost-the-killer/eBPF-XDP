@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/inline-vlan-deployment.md) -->
+
 # Inline VLAN-bridge deployment (one-NIC hairpin)
 
 How the xdp-sentinel appliance was placed **in the path** of a network using a
@@ -120,7 +122,7 @@ done
 
 ### 3.2 Network: the VLAN bridge (netplan)
 Installed as `/etc/netplan/01-xdp-vlan-bridge.yaml` (template in
-[../configs/netplan-vlan-bridge.yaml](../configs/netplan-vlan-bridge.yaml)):
+[../configs/netplan-vlan-bridge.yaml](../../configs/netplan-vlan-bridge.yaml)):
 
 ```yaml
 network:
@@ -145,7 +147,7 @@ address. STP off + zero forward-delay = the bridge forwards immediately.
 
 ### 3.3 Agent: attach XDP to both VLANs
 `/etc/xdp-sentinel/config.toml` (template in
-[../configs/agent-vlan.toml](../configs/agent-vlan.toml)):
+[../configs/agent-vlan.toml](../../configs/agent-vlan.toml)):
 
 ```toml
 metrics_addr = "127.0.0.1:9464"
@@ -169,9 +171,9 @@ native XDP. That is fine behind a home/SOHO router, which is the bottleneck.
 Enable the agent: `sudo systemctl enable --now sentinel-agent`.
 
 ### 3.4 Operator allowlist (never lock yourself out)
-`/etc/xdp-sentinel/allowlist.conf` ([../configs/allowlist.conf](../configs/allowlist.conf)),
+`/etc/xdp-sentinel/allowlist.conf` ([../configs/allowlist.conf](../../configs/allowlist.conf)),
 re-applied on every boot by `xs-baseline.service` (script
-[../scripts/xs-baseline](../scripts/xs-baseline)). It marks the LAN prefixes
+[../scripts/xs-baseline](../../scripts/xs-baseline)). It marks the LAN prefixes
 `dynamic-exempt`, so auto-mitigation can never rate-limit or block the admin
 network.
 

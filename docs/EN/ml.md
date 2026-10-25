@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/ml.md) -->
+
 # J. Machine-learning architecture
 
 ML is a **control-plane advisor**. It consumes aggregated feature windows,

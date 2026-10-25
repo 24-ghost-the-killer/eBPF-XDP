@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/security-audit.md) -->
+
 # Security audit & production-hardening
 
 Audit of the xdp-sentinel dataplane, control plane, ML pipeline and the live

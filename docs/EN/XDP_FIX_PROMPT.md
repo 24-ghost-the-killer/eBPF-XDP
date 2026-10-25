@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/XDP_FIX_PROMPT.md) -->
+
 # XDP Firewall IPv6 Fragmentation Classification Fix Prompt
 
 ## Problem Statement

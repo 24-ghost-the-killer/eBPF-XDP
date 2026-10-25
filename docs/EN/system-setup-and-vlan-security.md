@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/system-setup-and-vlan-security.md) -->
+
 # xdp-sentinel — whole-system setup & VLAN interception analysis
 
 This document does three things:
@@ -173,7 +175,7 @@ bypasses the appliance entirely (see §3.8).
 ### 2.5 Appliance network — the VLAN bridge (netplan)
 
 Stage, don't apply live yet. Template:
-[../configs/netplan-vlan-bridge.yaml](../configs/netplan-vlan-bridge.yaml) →
+[../configs/netplan-vlan-bridge.yaml](../../configs/netplan-vlan-bridge.yaml) →
 `/etc/netplan/01-xdp-vlan-bridge.yaml`:
 
 ```yaml
@@ -198,7 +200,7 @@ Validate before anything goes live: `sudo netplan generate --root-dir <tmp>`.
 
 ### 2.6 Agent — attach XDP to both VLANs
 
-Template [../configs/agent-vlan.toml](../configs/agent-vlan.toml) →
+Template [../configs/agent-vlan.toml](../../configs/agent-vlan.toml) →
 `/etc/xdp-sentinel/config.toml`:
 
 ```toml
@@ -223,7 +225,7 @@ line-rate 10G claim.
 
 ### 2.7 Operator allowlist (never lock yourself out)
 
-Template [../configs/allowlist.conf](../configs/allowlist.conf) →
+Template [../configs/allowlist.conf](../../configs/allowlist.conf) →
 `/etc/xdp-sentinel/allowlist.conf`, re-applied every boot by
 `xs-baseline.service`. The LAN prefix is `dynamic-exempt` so auto-mitigation
 can never rate-limit or block the admin network:

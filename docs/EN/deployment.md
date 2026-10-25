@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/deployment.md) -->
+
 # Deployment
 
 The appliance runs on a plain Linux server under systemd. No container
@@ -126,7 +128,7 @@ The interface and attach mode must match the server (`native` is the default;
 use `generic` where driver-mode XDP is unavailable). The script preserves
 `/etc/xdp-sentinel/config.toml`, restarts `sentinel-agent` only if it is
 already active, and prints the resulting interface status. The server needs
-the Linux build dependencies listed at the top of the [Makefile](../Makefile),
+the Linux build dependencies listed at the top of the [Makefile](../../Makefile),
 `rsync`, SSH access, and sudo permission. The selected interface must already
 have this project's XDP program attached; initial installation is not an
 `--replace` operation. Run the documented staging tests before production

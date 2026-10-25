@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/development.md) -->
+
 # Q. Development: roadmap, build, test
 
 ## Roadmap

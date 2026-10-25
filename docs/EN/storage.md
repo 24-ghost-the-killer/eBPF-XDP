@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/storage.md) -->
+
 # L. ClickHouse schema
 
 ClickHouse stores **aggregates and decisions, never raw packets**. Volume at

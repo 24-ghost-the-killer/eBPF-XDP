@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/hardware-tuning.md) -->
+
 # C. Hardware for 10 Gbps and D. CPU / NUMA / RSS strategy
 
 Figures marked *estimate* are planning numbers from published XDP results

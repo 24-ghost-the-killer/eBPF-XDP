@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/performance.md) -->
+
 # P. Performance and benchmark methodology
 
 No throughput claim is made anywhere in this project without a benchmark

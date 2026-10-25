@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/XDP_RESILIENCE_ASSESSMENT_SUMMARY.md) -->
+
 # XDP Firewall Resilience Assessment — Executive Summary
 
 **Date:** October 23, 2026  

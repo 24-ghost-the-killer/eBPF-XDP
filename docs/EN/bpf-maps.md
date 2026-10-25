@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/bpf-maps.md) -->
+
 # G. BPF map design
 
 All maps are defined in `ebpf/src/maps.h` (added phase by phase), pinned per

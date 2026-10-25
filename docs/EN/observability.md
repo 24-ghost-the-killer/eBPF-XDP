@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/observability.md) -->
+
 # M. Metrics and alerting, N. Dashboard
 
 ## M. Prometheus metrics

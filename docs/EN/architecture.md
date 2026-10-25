@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/architecture.md) -->
+
 # xdp-sentinel architecture
 
 This document is the reference design. Sections map to the requested

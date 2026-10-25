@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/feature-schema.md) -->
+
 # I. Feature schema
 
 This document is the normative definition of every feature the control

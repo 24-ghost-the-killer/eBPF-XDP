@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/XDP_RESILIENCE_TEST_PLAN.md) -->
+
 # XDP Firewall Resilience Testing — Comprehensive Penetration Plan
 
 **Target:** 192.168.1.193  

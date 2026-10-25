@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/threat-model.md) -->
+
 # O. Threat model of the appliance itself
 
 The appliance sits in the path of hostile traffic and holds the power to

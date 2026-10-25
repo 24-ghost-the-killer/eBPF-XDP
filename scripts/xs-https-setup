@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# =============================================================================
+# xs-https-setup — put the dashboard behind TLS (nginx reverse proxy)
+# =============================================================================
+# Terminates HTTPS on :443 (override with --port) and proxies to the dashboard
+# on 127.0.0.1:<upstream>. Generates a self-signed cert (SAN = the box's IPs +
+# hostname) if none is supplied. Idempotent, additive: the plain dashboard port
+# keeps working, so running this never cuts your current access.
+#
+# Run as root on the appliance:
+#   sudo scripts/xs-https-setup                       # :443 -> 127.0.0.1:3000
+#   sudo scripts/xs-https-setup --port 8443 --upstream 127.0.0.1:3000
+#   sudo scripts/xs-https-setup --cert /path/fullchain.pem --key /path/key.pem
+#
+# IMPORTANT (XDP lockout safety): if the box's own IP is under default-deny,
+# the TLS port must be in the service allowlist/lifeline or XDP will drop it.
+# This script prints the exact reminder; the installer wires it automatically.
+# -----------------------------------------------------------------------------
+set -euo pipefail
+
+PORT=443
+UPSTREAM=127.0.0.1:3000
+TLS_DIR=/etc/xdp-sentinel/tls
+CERT=""; KEY=""
+SAN=""                      # comma list of IP:/DNS: entries; auto-detected if empty
+SERVER_NAME="_"
+
+c(){ printf '\033[%sm' "$1"; }
+info(){ printf '   %s\n' "$*"; }
+ok(){ printf '   %s✓%s %s\n' "$(c '1;32')" "$(c 0)" "$*"; }
+warn(){ printf '%s!! %s%s\n' "$(c '1;33')" "$*" "$(c 0)" >&2; }
+die(){ printf '%sxx %s%s\n' "$(c '1;31')" "$*" "$(c 0)" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2;;
+    --upstream) UPSTREAM="$2"; shift 2;;
+    --cert) CERT="$2"; shift 2;;
+    --key) KEY="$2"; shift 2;;
+    --san) SAN="$2"; shift 2;;
+    --server-name) SERVER_NAME="$2"; shift 2;;
+    --tls-dir) TLS_DIR="$2"; shift 2;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "run as root (sudo)."
+command -v apt-get >/dev/null || die "needs apt-get (Debian/Ubuntu)."
+
+# ---- nginx ------------------------------------------------------------------
+if ! command -v nginx >/dev/null; then
+  info "installing nginx…"; apt-get update -qq && apt-get install -y -qq nginx >/dev/null || die "could not install nginx."
+fi
+command -v openssl >/dev/null || { apt-get install -y -qq openssl >/dev/null || die "need openssl."; }
+
+# ---- certificate ------------------------------------------------------------
+install -d -m0750 "$TLS_DIR"
+if [ -n "$CERT" ] || [ -n "$KEY" ]; then
+  [ -n "$CERT" ] && [ -n "$KEY" ] || die "--cert and --key must be given together."
+  [ -r "$CERT" ] && [ -r "$KEY" ] || die "cannot read the given cert/key."
+  ok "using supplied certificate"
+else
+  CERT="$TLS_DIR/dashboard.crt"; KEY="$TLS_DIR/dashboard.key"
+  if [ -s "$CERT" ] && [ -s "$KEY" ]; then
+    ok "reusing existing self-signed cert in $TLS_DIR"
+  else
+    # SAN = all global IPv4 on the box + hostname, unless overridden.
+    if [ -z "$SAN" ]; then
+      local_ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+      for ipaddr in $local_ips; do SAN="${SAN:+$SAN,}IP:$ipaddr"; done
+      hn=$(hostname 2>/dev/null || echo localhost)
+      SAN="${SAN:+$SAN,}DNS:$hn,DNS:localhost,IP:127.0.0.1"
+    fi
+    info "generating self-signed cert (SAN: $SAN)"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -days 825 -nodes -keyout "$KEY" -out "$CERT" \
+      -subj "/CN=xdp-sentinel-dashboard" -addext "subjectAltName=$SAN" >/dev/null 2>&1 \
+      || die "openssl cert generation failed."
+    chmod 0640 "$KEY"; chmod 0644 "$CERT"
+    ok "self-signed cert written to $CERT (825-day)"
+  fi
+fi
+
+# ---- nginx site -------------------------------------------------------------
+SITE=/etc/nginx/sites-available/xdp-sentinel
+cat > "$SITE" <<EOF
+# Managed by xs-https-setup — TLS reverse proxy for the xdp-sentinel dashboard.
+server {
+    listen $PORT ssl;
+    listen [::]:$PORT ssl;
+    http2 on;
+    server_name $SERVER_NAME;
+
+    ssl_certificate     $CERT;
+    ssl_certificate_key $KEY;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:xssl:5m;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # Large upstream timeouts off; keep the dashboard responsive under attack.
+    proxy_read_timeout 75s;
+    client_max_body_size 4m;
+
+    location / {
+        proxy_pass http://$UPSTREAM;
+        proxy_http_version 1.1;
+        proxy_set_header Host               \$host;
+        proxy_set_header X-Real-IP          \$remote_addr;
+        proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto  https;
+        # WebSocket / HMR upgrade
+        proxy_set_header Upgrade            \$http_upgrade;
+        proxy_set_header Connection         \$connection_upgrade;
+    }
+}
+EOF
+
+# map for Connection upgrade header (idempotent include)
+MAPCONF=/etc/nginx/conf.d/xs-upgrade.conf
+cat > "$MAPCONF" <<'EOF'
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+EOF
+
+ln -sf "$SITE" /etc/nginx/sites-enabled/xdp-sentinel
+[ -e /etc/nginx/sites-enabled/default ] && rm -f /etc/nginx/sites-enabled/default
+
+if nginx -t >/dev/null 2>&1; then
+  systemctl enable nginx >/dev/null 2>&1 || true
+  systemctl reload nginx 2>/dev/null || systemctl restart nginx
+  ok "nginx serving HTTPS on :$PORT -> http://$UPSTREAM"
+else
+  nginx -t || true
+  die "nginx config test failed (see above); nothing reloaded."
+fi
+
+echo
+warn "XDP lockout check: if the box's IP is protected (default-deny), open the TLS port:"
+echo "   add 'tcp/$PORT' to DASH_PROTECT_LIFELINE (dashboard.env) and XS_PROTECT_LIFELINE (paths.env),"
+echo "   or run:  sudo sentinelctl service -i <iface> <box-ip> tcp $PORT   on each protected interface."
+echo
+info "self-signed cert will warn in the browser (expected on a LAN IP). To trust it,"
+info "import $CERT into your trust store, or use mkcert for a locally-trusted cert."

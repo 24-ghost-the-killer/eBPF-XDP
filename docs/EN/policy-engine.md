@@ -1,3 +1,5 @@
+<!-- Language: **English** · [Dansk](../DK/policy-engine.md) -->
+
 # K. Risk / policy engine
 
 Covers requirement sections 7 (rate limiting), 8 (fast mitigation),
