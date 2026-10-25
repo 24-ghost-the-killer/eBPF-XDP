@@ -211,16 +211,21 @@ else
   if ! command -v git >/dev/null; then
     info "installing git…"; apt-get update -qq && apt-get install -y -qq git >/dev/null || die "could not install git (needed to fetch the repo)."
   fi
+  # Private repo: pass a token via GITHUB_TOKEN/GH_TOKEN. Sent as an auth header
+  # (not embedded in the URL or saved to .git/config), so it isn't left on disk.
+  XS_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  GIT_AUTH=()
+  [ -n "$XS_TOKEN" ] && GIT_AUTH=(-c "http.extraHeader=Authorization: Bearer $XS_TOKEN") && info "using GITHUB_TOKEN for private-repo access"
   if [ -d "$XS_SRC_DIR/.git" ]; then
     info "updating existing clone at $XS_SRC_DIR"
-    git -C "$XS_SRC_DIR" fetch --depth 1 origin "$XS_BRANCH" >/dev/null 2>&1 \
-      && git -C "$XS_SRC_DIR" checkout -q FETCH_HEAD || die "git fetch failed (check --repo/--branch and network)."
+    git "${GIT_AUTH[@]}" -C "$XS_SRC_DIR" fetch --depth 1 origin "$XS_BRANCH" >/dev/null 2>&1 \
+      && git -C "$XS_SRC_DIR" checkout -q FETCH_HEAD || die "git fetch failed (check --repo/--branch, token and network)."
   else
     install -d -m0755 "$(dirname "$XS_SRC_DIR")"
     rm -rf "$XS_SRC_DIR"
-    git clone --depth 1 --branch "$XS_BRANCH" "$XS_REPO" "$XS_SRC_DIR" >/dev/null 2>&1 \
-      || git clone --depth 1 "$XS_REPO" "$XS_SRC_DIR" >/dev/null 2>&1 \
-      || die "git clone failed (check --repo/--branch and network)."
+    git "${GIT_AUTH[@]}" clone --depth 1 --branch "$XS_BRANCH" "$XS_REPO" "$XS_SRC_DIR" >/dev/null 2>&1 \
+      || git "${GIT_AUTH[@]}" clone --depth 1 "$XS_REPO" "$XS_SRC_DIR" >/dev/null 2>&1 \
+      || die "git clone failed — private repo? set GITHUB_TOKEN. (also check --repo/--branch, network)."
   fi
   REPO_ROOT="$XS_SRC_DIR"
   [ -f "$REPO_ROOT/Makefile" ] && [ -d "$REPO_ROOT/ebpf/src" ] || die "clone did not contain the expected repo layout."
