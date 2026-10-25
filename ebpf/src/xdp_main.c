@@ -148,6 +148,29 @@ static __always_inline int xs_is_protected(const struct xs_pkt *p)
 	return bpf_map_lookup_elem(&xs_protected_v4, &d) ? 1 : 0;
 }
 
+/*
+ * True when an IPv4 destination is a private/internal address (RFC1918).
+ * Lockdown uses this so it only ever drops traffic bound for the internal
+ * network and NEVER a packet to a public destination. That is what keeps the
+ * Twingate connector's link to its public relays (and any other egress to the
+ * internet) alive while lockdown is armed, so the remote operator can never
+ * lose their tunnel by turning lockdown on.
+ */
+static __always_inline int xs_dst_is_internal(const struct xs_pkt *p)
+{
+	__u32 d = bpf_ntohl(p->daddr.v4);
+	__u8 a = (__u8)(d >> 24);
+	__u8 b = (__u8)(d >> 16);
+
+	if (a == 10)
+		return 1;                        /* 10.0.0.0/8     */
+	if (a == 172 && (b & 0xf0) == 16)
+		return 1;                        /* 172.16.0.0/12  */
+	if (a == 192 && b == 168)
+		return 1;                        /* 192.168.0.0/16 */
+	return 0;
+}
+
 SEC("xdp")
 int xs_xdp_main(struct xdp_md *ctx)
 {
@@ -218,12 +241,16 @@ int xs_xdp_main(struct xdp_md *ctx)
 		xs_count(st, XS_CNT_SERVICE_DENY, len);
 		verdict = XDP_DROP;
 	} else if (!exempt && (flags & XS_CFG_LOCKDOWN) && rc == XS_PARSE_OK &&
-		   pkt.l3 == XS_L3_IPV4 && !xs_is_protected(&pkt)) {
+		   pkt.l3 == XS_L3_IPV4 && xs_dst_is_internal(&pkt) && !xs_is_protected(&pkt)) {
 		/*
-		 * Lockdown kill-switch: only protected destinations are reachable;
-		 * every other IPv4 packet is dropped (attributed as service_deny).
-		 * Protected hosts still obey their service allowlist (handled just
-		 * above). ARP / IPv6 are untouched so the bridge never isolates itself.
+		 * Lockdown kill-switch: inside the internal network only protected
+		 * destinations are reachable; every other IPv4 packet to an internal
+		 * (RFC1918) address is dropped (attributed as service_deny). Packets to
+		 * PUBLIC destinations always fall through, so the Twingate connector's
+		 * link to its relays survives and arming lockdown can never sever the
+		 * operator's own tunnel. Protected hosts still obey their service
+		 * allowlist (handled just above). ARP / IPv6 are untouched so the
+		 * bridge never isolates itself.
 		 */
 		xs_count(st, XS_CNT_SERVICE_DENY, len);
 		verdict = XDP_DROP;

@@ -496,7 +496,7 @@ function LockdownCard() {
             Lockdown
             {active && <span className="inline-flex items-center gap-1 rounded-full bg-st-crit/15 px-2 py-0.5 text-[11px] font-medium text-st-crit-fg">ACTIVE</span>}
           </div>
-          <p className="text-[12px] text-nd-dim">Block every connection across the XDP dataplane (<span className="font-mono">{ifaceList}</span>) <strong>and the Twingate tunnel</strong> except the protected hosts. {active ? `Auto-reverts in ${mmss(remaining)}.` : 'Severs remote (Twingate) access until the auto-revert timer expires — keep the timer short.'}</p>
+          <p className="text-[12px] text-nd-dim">Block every connection to your internal network — across the XDP dataplane (<span className="font-mono">{ifaceList}</span>) <strong>and over Twingate</strong> — except the protected hosts. {active ? `Auto-reverts in ${mmss(remaining)}.` : 'Your Twingate tunnel stays up, so you keep access and can lift it anytime. Arms with an auto-revert timer.'}</p>
         </div>
         <div className="ml-auto flex items-center gap-2">
           {active ? (
@@ -519,11 +519,11 @@ function LockdownCard() {
           <div className="space-y-3 px-5 py-4">
             <div className="flex items-start gap-2 rounded-xl border border-st-crit/30 bg-st-crit/[0.06] px-4 py-3 text-[13px] text-st-crit-fg">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>This drops <strong>every</strong> connection across the XDP dataplane (<span className="font-mono">{ifaceList}</span>) <strong>and the Twingate tunnel</strong> to any host that isn’t in the protection plan — WAN clients and LAN hosts alike, so non-protected LAN hosts lose internet. Management IPs keep their lifeline.</span>
+              <span>This drops <strong>every</strong> connection to your internal network — across the XDP dataplane (<span className="font-mono">{ifaceList}</span>) <strong>and over Twingate</strong> — to any host that isn’t in the protection plan. Non-protected LAN hosts lose access to other internal hosts. Management IPs keep their lifeline.</span>
             </div>
-            <div className="flex items-start gap-2 rounded-xl border border-st-crit/40 bg-st-crit/[0.1] px-4 py-3 text-[13px] text-st-crit-fg">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span><strong>You will lose your own remote access.</strong> The Twingate connector reaches its relays over the same path, so arming this cuts your tunnel — you will <strong>not</strong> be able to reach the dashboard or hit “Lift now”. Only the on-box timer below ends it, so set it short.</span>
+            <div className="flex items-start gap-2 rounded-xl border border-nd-line bg-nd-fill px-4 py-3 text-[13px] text-nd-dim">
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-nd-brand" />
+              <span>Your <strong>Twingate tunnel stays up.</strong> Lockdown only blocks traffic bound for the internal network, never the connector’s link to its relays — so you keep dashboard access and can hit “Lift now” anytime. The timer is a backstop.</span>
             </div>
             <label className="flex items-center gap-2 text-[13px] text-nd-dim">Auto-revert after
               <input autoFocus value={minutes} onChange={(e) => setMinutes(e.target.value.replace(/\D/g, ''))} className="w-20 rounded-lg border border-nd-line bg-nd-card px-2.5 py-1.5 text-center text-[13px] text-nd-fg outline-none focus:border-nd-brand" /> minutes

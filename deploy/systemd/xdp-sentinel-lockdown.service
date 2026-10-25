@@ -5,5 +5,9 @@ Wants=sentinel-agent.service
 
 [Service]
 Type=oneshot
+# twingate.env carries XS_TWINGATE_CONTAINER (the connector's container name), so
+# the lockdown job resolves the same veth as xs-twingate-attach and can lock it.
+# lockdown.env may override any of these. Both are optional (leading '-').
+EnvironmentFile=-/etc/xdp-sentinel/twingate.env
 EnvironmentFile=-/etc/xdp-sentinel/lockdown.env
 ExecStart=/usr/local/bin/xs-lockdown-apply

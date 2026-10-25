@@ -10,11 +10,11 @@ re-runs this every ~30s so the mode reverts itself the moment its timer expires
 
 Scope: the inline-bridge XDP dataplane (vlan10 + vlan20) AND the Twingate
 connector's host-side veth, resolved dynamically here (the veth name is
-regenerated on every container restart). Locking the veth drops the connector's
-own traffic to Twingate's relays, so arming lockdown severs the tunnel and the
-remote operator's access until the timer expires -- the operator chose this
-"everything through XDP" behaviour knowingly, and the LOCAL auto-revert timer
-below is what brings the tunnel back without any remote action.
+regenerated on every container restart). The dataplane only drops traffic bound
+for INTERNAL (RFC1918) destinations, so locking the veth enforces the protection
+plan on Twingate-originated traffic yet never drops the connector's own packets
+to its PUBLIC relays -- the operator's tunnel stays up and arming lockdown can
+never lock them out. The auto-revert timer below is a backstop.
 """
 import json
 import os

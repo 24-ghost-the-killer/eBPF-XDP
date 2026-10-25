@@ -60,10 +60,11 @@ function planPath(): string {
 // ---- Lockdown kill-switch ------------------------------------------------
 // A desired-state control file the dashboard writes; a root job on the box
 // applies it to the dataplane (sentinelctl config --lockdown) and enforces the
-// auto-revert timer. When on, every IPv4 packet on a locked interface whose
-// destination is not a protected host is dropped. Always carries an expiry: the
-// box-side timer runs locally, so even when lockdown severs the operator's own
-// Twingate tunnel (see below) the timer still lifts it and restores access.
+// auto-revert timer. When on, every IPv4 packet on a locked interface bound for
+// an INTERNAL (RFC1918) destination that is not a protected host is dropped;
+// traffic to public destinations always passes, so the Twingate connector's link
+// to its relays is never cut and arming can't strand the operator. Still always
+// carries an expiry as a backstop (the box-side timer runs locally).
 export interface Lockdown { enabled: boolean; ifaces: string[]; expires_at: number }
 const LOCKDOWN_DEFAULT_FILE = '/home/test_server/xdp-sentinel-data/lockdown.json'
 export const LOCKDOWN_MAX_MINUTES = 1440
@@ -75,8 +76,9 @@ function lockdownPath(): string {
 // Static interfaces lockdown applies to = the inline-bridge XDP dataplane. The
 // Twingate connector veth is ALSO locked ("everything through XDP"), but its name
 // is regenerated on every container restart, so the box job (xs-lockdown-apply)
-// resolves and appends it at apply time rather than it being listed here. Locking
-// the veth severs the tunnel while armed — intended; the on-box timer lifts it.
+// resolves and appends it at apply time rather than it being listed here. Lockdown
+// only drops internal-bound traffic, so locking the veth enforces the plan on
+// Twingate yet never cuts the connector's link to its public relays.
 export function lockdownIfaces(): string[] {
   const raw = (process.env.DASH_LOCKDOWN_IFACES || 'vlan10,vlan20').split(/[,\s]+/).map((s) => s.trim())
   const out = raw.filter((s) => IFACE_RE.test(s))
