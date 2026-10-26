@@ -85,6 +85,9 @@ enum xs_counter_id {
 	XS_CNT_ANOM_TCP_BAD_FLAGS     = 49,
 	XS_CNT_ANOM_UDP_LEN_MISMATCH  = 50,
 	XS_CNT_ANOM_LAND              = 51,
+	XS_CNT_ANOM_BOGON_SRC         = 52,
+	XS_CNT_ANOM_TTL_ZERO          = 53,
+	XS_CNT_ANOM_PORT_ZERO         = 54,
 
 	/* Parse outcome histogram: slot XS_CNT_PARSE_BASE + enum xs_parse_rc.
 	 * Exactly one outcome per frame, so the sum over these slots == RX. */
@@ -196,6 +199,16 @@ enum xs_config_flags {
 	 * the bridge keeps forwarding and never isolates itself. Meant to be armed
 	 * only on the ingress interface and lifted by an auto-revert timer. */
 	XS_CFG_LOCKDOWN           = 1u << 20,
+
+	/*
+	 * Drop "impossible" packets that no conforming stack emits: a source
+	 * address that can't exist on the wire (bogon/martian), TTL/hop-limit 0,
+	 * or a TCP/UDP port 0. Like DROP_MALFORMED this runs even for allowlist-
+	 * exempt sources, since spoofed floods routinely forge an exempt address.
+	 * Observe-only by default (the anomalies are always counted; dropping is
+	 * opt-in), so it never affects legitimate RFC1918 / link-local traffic.
+	 */
+	XS_CFG_DROP_SPOOFED       = 1u << 21,
 };
 #define XS_CFG_KNOWN_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
 			    XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
@@ -203,18 +216,20 @@ enum xs_config_flags {
 			    XS_CFG_SAMPLING | XS_CFG_HLL | XS_CFG_DPORT_HIST | XS_CFG_GLOBAL_RL | \
 			    XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT | \
 			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED | XS_CFG_DROP_IPV6_EXT | \
-			    XS_CFG_SERVICE_ALLOW | XS_CFG_LOCKDOWN)
+			    XS_CFG_SERVICE_ALLOW | XS_CFG_LOCKDOWN | XS_CFG_DROP_SPOOFED)
 /* Flags an operator sets directly (sentinelctl config); CHECK_* are managed
  * automatically by the block/allow commands as the maps gain or lose entries. */
 #define XS_CFG_OPERATOR_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
 			       XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
-			       XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT)
+			       XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT | \
+			       XS_CFG_DROP_SPOOFED)
 /* Base validity drops that act on malformed / specific packet shapes, used by
  * the deterministic corpus test. The per-vector drops (ICMP/SYN/ACK/UDP_STRICT)
  * drop *valid* packets of a type and are only enabled under attack, so they are
  * exercised separately, not in the always-valid corpus. */
 #define XS_CFG_VALIDITY_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
-			       XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP)
+			       XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
+			       XS_CFG_DROP_SPOOFED)
 
 /*
  * First port of the ephemeral range (IANA/Linux default 32768-60999). Inbound

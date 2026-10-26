@@ -33,6 +33,27 @@ static __always_inline int xs_validity_verdict(int rc, const struct xs_pkt *p, _
 		return (flags & XS_CFG_DROP_MALFORMED) ? XDP_DROP : XDP_PASS;
 	if (rc != XS_PARSE_OK)
 		return XDP_PASS; /* NOT_IP and UNSUP_* are never dropped here */
+	/*
+	 * LAND (source address == destination): never legitimate on a forwarding
+	 * path (RFC 1812 §5.3.7), so it is classed with malformed traffic. This
+	 * check runs even for allowlist-exempt sources, so a LAND flood that spoofs
+	 * an exempt address (e.g. the victim's own IP) is still dropped -- the
+	 * per-source and aggregate rate limiters cannot, because they skip exempt
+	 * sources. Gated on DROP_MALFORMED so the observe-only default is preserved.
+	 */
+	if ((p->anomalies & XS_ANOM_LAND) && (flags & XS_CFG_DROP_MALFORMED))
+		return XDP_DROP;
+	/*
+	 * Impossible packets: bogon/martian source, TTL/hop-limit 0, or port 0.
+	 * No conforming stack emits these, so they are never legitimate traffic --
+	 * they are either crafted or the product of a spoofed flood. Dropped only
+	 * when DROP_SPOOFED is set (observe-only default), and, like LAND, the
+	 * check runs even for allowlist-exempt sources so a flood that forges an
+	 * exempt address is still shed (the rate limiters skip exempt sources).
+	 */
+	if ((p->anomalies & (XS_ANOM_BOGON_SRC | XS_ANOM_TTL_ZERO | XS_ANOM_PORT_ZERO)) &&
+	    (flags & XS_CFG_DROP_SPOOFED))
+		return XDP_DROP;
 	if (p->l4_proto == 17 && (flags & XS_CFG_DROP_UDP)) {
 		/*
 		 * Drop UDP aimed at a service port, but never the host's own return

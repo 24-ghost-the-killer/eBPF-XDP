@@ -164,7 +164,36 @@ enum xs_anomaly {
 	XS_ANOM_TCP_BAD_FLAGS    = 1u << 1,
 	XS_ANOM_UDP_LEN_MISMATCH = 1u << 2, /* UDP length < IP payload length */
 	XS_ANOM_LAND             = 1u << 3, /* source address == destination address */
+	XS_ANOM_BOGON_SRC        = 1u << 4, /* source address can't exist on the wire */
+	XS_ANOM_TTL_ZERO         = 1u << 5, /* IPv4 TTL / IPv6 hop limit == 0 */
+	XS_ANOM_PORT_ZERO        = 1u << 6, /* TCP/UDP source or dest port == 0 */
 };
+
+/*
+ * "Impossible" source address (BCP 38 / RFC 1812 spirit): an address that can
+ * never legitimately appear as a SOURCE on the wire. We flag only the
+ * unambiguous cases and leave RFC1918 and IPv4/IPv6 link-local alone, because
+ * those are legitimate on an inline L2 bridge. IPv4: this-network 0.0.0.0/8,
+ * loopback 127.0.0.0/8, and anything multicast/reserved/limited-broadcast used
+ * as a source (first octet >= 224). Bytes are read in wire order, so byte 0 is
+ * the first octet -- no byteswap needed.
+ */
+static __always_inline int xs_bogon_src_v4(__be32 saddr)
+{
+	__u8 o0 = ((const __u8 *)&saddr)[0];
+	return o0 == 0 || o0 == 127 || o0 >= 224;
+}
+
+/* IPv6: unspecified ::, loopback ::1, or multicast ff00::/8 used as a source. */
+static __always_inline int xs_bogon_src_v6(const __be32 s[4])
+{
+	__u8 b0 = ((const __u8 *)s)[0];
+	if (b0 == 0xff)
+		return 1;                               /* multicast as source */
+	if ((s[0] | s[1] | s[2]) == 0 && (s[3] == 0 || s[3] == bpf_htonl(1)))
+		return 1;                               /* :: or ::1 */
+	return 0;
+}
 
 union xs_addr {
 	__be32 v4;     /* IPv4 lives in the first word, rest zero */
@@ -299,6 +328,10 @@ static __always_inline int xs_parse_ipv4(void **pos, void *data_end, struct xs_p
 		p->anomalies |= XS_ANOM_IPV4_OPTIONS;
 	if (iph->saddr == iph->daddr)
 		p->anomalies |= XS_ANOM_LAND;
+	if (xs_bogon_src_v4(iph->saddr))
+		p->anomalies |= XS_ANOM_BOGON_SRC;
+	if (iph->ttl == 0)
+		p->anomalies |= XS_ANOM_TTL_ZERO;
 
 	frag = bpf_ntohs(iph->frag_off);
 	if (frag & XS_IPV4_FRAG_OFFSET)
@@ -335,6 +368,10 @@ static __always_inline int xs_parse_ipv6(void **pos, void *data_end, struct xs_p
 	if (p->saddr.v6[0] == p->daddr.v6[0] && p->saddr.v6[1] == p->daddr.v6[1] &&
 	    p->saddr.v6[2] == p->daddr.v6[2] && p->saddr.v6[3] == p->daddr.v6[3])
 		p->anomalies |= XS_ANOM_LAND;
+	if (xs_bogon_src_v6(p->saddr.v6))
+		p->anomalies |= XS_ANOM_BOGON_SRC;
+	if (ip6->hop_limit == 0)
+		p->anomalies |= XS_ANOM_TTL_ZERO;
 
 	nh = ip6->nexthdr;
 	base = ip6 + 1;
@@ -431,6 +468,8 @@ static __always_inline int xs_parse_l4(void **pos, void *data_end, struct xs_pkt
 		p->tcp_flags = th->flags;
 		if (xs_tcp_flags_bad(th->flags))
 			p->anomalies |= XS_ANOM_TCP_BAD_FLAGS;
+		if (th->source == 0 || th->dest == 0)
+			p->anomalies |= XS_ANOM_PORT_ZERO; /* port 0 is never a real endpoint */
 		p->l4_parsed = 1;
 		return XS_PARSE_OK;
 	}
@@ -454,6 +493,8 @@ static __always_inline int xs_parse_l4(void **pos, void *data_end, struct xs_pkt
 		}
 		p->sport = uh->source;
 		p->dport = uh->dest;
+		if (uh->source == 0 || uh->dest == 0)
+			p->anomalies |= XS_ANOM_PORT_ZERO; /* port 0 is never a real endpoint */
 		p->l4_parsed = 1;
 		return XS_PARSE_OK;
 	}

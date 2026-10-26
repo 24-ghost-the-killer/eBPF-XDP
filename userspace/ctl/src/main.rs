@@ -116,6 +116,12 @@ pub enum Cmd {
         /// interface should be armed; pair with an auto-revert timer.
         #[arg(long, value_enum)]
         lockdown: Option<Toggle>,
+        /// Drop "impossible" packets that no conforming stack emits: a source
+        /// address that can't exist on the wire (bogon/martian), TTL/hop-limit 0,
+        /// or TCP/UDP port 0. Near-zero false positives; RFC1918 and link-local
+        /// are never affected. Applies even to allowlisted sources.
+        #[arg(long, value_enum)]
+        drop_spoofed: Option<Toggle>,
     },
 
     /// Block a source address (drop all its packets) until the TTL expires.

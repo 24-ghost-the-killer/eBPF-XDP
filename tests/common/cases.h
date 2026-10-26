@@ -73,6 +73,10 @@ B(v4_gre)           { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 47, SRC4, DST4, 0, 0)
 B(v4_options)       { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 6, SRC4, DST4, 2, 0); pb_tcp(b, 40000, 443, SYN, 5); pb_finalize(b); }
 B(v4_eth_padding)   { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 1, SRC4, DST4, 0, 0); pb_icmp(b, 8, 0); pb_finalize(b); pb_put(b, 18); }
 B(v4_land)          { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 6, SRC4, SRC4, 0, 0); pb_tcp(b, 139, 139, SYN, 5); pb_finalize(b); }
+/* "Impossible" sources/metadata: loopback source, TTL 0, TCP port 0. */
+B(v4_bogon_src)     { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 6, 0x7F000001u, DST4, 0, 0); pb_tcp(b, 40000, 443, SYN, 5); pb_finalize(b); }
+B(v4_ttl_zero)      { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 6, SRC4, DST4, 0, 0); b->buf[b->ip4_off + 8] = 0; pb_tcp(b, 40000, 443, SYN, 5); pb_finalize(b); }
+B(v4_port_zero)     { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 17, SRC4, DST4, 0, 0); pb_udp(b, 40000, 0); pb_finalize(b); }
 
 /* ---------------- IPv4 fragments ---------------- */
 B(v4_frag_first)    { pb_eth(b, XS_ETH_P_IPV4); pb_ipv4(b, 17, SRC4, DST4, 0, 0x2000); pb_udp(b, 5000, 6000); pb_payload(b, 200); pb_finalize(b);
@@ -117,6 +121,8 @@ B(v6_udp)           { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 17, 1, 2); pb_udp(b, 
 B(v6_icmpv6_echo)   { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 58, 1, 2); pb_icmp(b, 128, 0); pb_payload(b, 56); pb_finalize(b); }
 B(v6_padding)       { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 58, 1, 2); pb_icmp(b, 128, 0); pb_finalize(b); pb_put(b, 10); }
 B(v6_land)          { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 6, 1, 1); pb_tcp(b, 80, 80, SYN, 5); pb_finalize(b); }
+/* IPv6 multicast used as a source (ff00::/8) -- never legitimate. */
+B(v6_bogon_src)     { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 6, 1, 1); b->buf[b->ip6_off + 8] = 0xff; pb_tcp(b, 80, 443, SYN, 5); pb_finalize(b); }
 B(v6_esp)           { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 50, 1, 2); pb_payload(b, 40); pb_finalize(b); }
 B(v6_no_next)       { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 59, 1, 2); pb_payload(b, 8); pb_finalize(b); }
 B(v6_icmp4_in_v6)   { pb_eth(b, XS_ETH_P_IPV6); pb_ipv6(b, 1, 1, 2); pb_icmp(b, 8, 0); pb_finalize(b); }
@@ -181,9 +187,18 @@ static const struct xs_case xs_cases[] = {
 	  .anomalies = XS_ANOM_IPV4_OPTIONS },
 	{ "v4_eth_padding",   v4_eth_padding,   XS_PARSE_OK, P, { XS_CNT_L4_ICMP },
 	  .l3 = V4, .l4_proto = 1, .l4_parsed = 1 },
-	{ "v4_land",          v4_land,          XS_PARSE_OK, P, { XS_CNT_ANOM_LAND },
+	{ "v4_land",          v4_land,          XS_PARSE_OK, D, { XS_CNT_ANOM_LAND },
 	  .l3 = V4, .l4_proto = 6, .tcp_flags = SYN, .l4_parsed = 1, .sport = 139, .dport = 139,
 	  .anomalies = XS_ANOM_LAND },
+	{ "v4_bogon_src",     v4_bogon_src,     XS_PARSE_OK, D, { XS_CNT_ANOM_BOGON_SRC },
+	  .l3 = V4, .l4_proto = 6, .tcp_flags = SYN, .l4_parsed = 1, .sport = 40000, .dport = 443,
+	  .anomalies = XS_ANOM_BOGON_SRC },
+	{ "v4_ttl_zero",      v4_ttl_zero,      XS_PARSE_OK, D, { XS_CNT_ANOM_TTL_ZERO },
+	  .l3 = V4, .l4_proto = 6, .tcp_flags = SYN, .l4_parsed = 1, .sport = 40000, .dport = 443,
+	  .anomalies = XS_ANOM_TTL_ZERO },
+	{ "v4_port_zero",     v4_port_zero,     XS_PARSE_OK, D, { XS_CNT_ANOM_PORT_ZERO },
+	  .l3 = V4, .l4_proto = 17, .l4_parsed = 1, .sport = 40000, .dport = 0,
+	  .anomalies = XS_ANOM_PORT_ZERO },
 
 	/* IPv4 fragments */
 	{ "v4_frag_first",    v4_frag_first,    XS_PARSE_OK, D, { XS_CNT_FRAG_FIRST, XS_CNT_L4_UDP },
@@ -249,9 +264,12 @@ static const struct xs_case xs_cases[] = {
 	  .l3 = V6, .l4_proto = 58, .l4_parsed = 1 },
 	{ "v6_padding",       v6_padding,       XS_PARSE_OK, P, { XS_CNT_L4_ICMPV6 },
 	  .l3 = V6, .l4_proto = 58, .l4_parsed = 1 },
-	{ "v6_land",          v6_land,          XS_PARSE_OK, P, { XS_CNT_ANOM_LAND },
+	{ "v6_land",          v6_land,          XS_PARSE_OK, D, { XS_CNT_ANOM_LAND },
 	  .l3 = V6, .l4_proto = 6, .tcp_flags = SYN, .l4_parsed = 1, .sport = 80, .dport = 80,
 	  .anomalies = XS_ANOM_LAND },
+	{ "v6_bogon_src",     v6_bogon_src,     XS_PARSE_OK, D, { XS_CNT_ANOM_BOGON_SRC },
+	  .l3 = V6, .l4_proto = 6, .tcp_flags = SYN, .l4_parsed = 1, .sport = 80, .dport = 443,
+	  .anomalies = XS_ANOM_BOGON_SRC },
 	{ "v6_esp",           v6_esp,           XS_PARSE_OK, P, { XS_CNT_L4_OTHER },
 	  .l3 = V6, .l4_proto = 50 },
 	{ "v6_no_next",       v6_no_next,       XS_PARSE_OK, P, { XS_CNT_L4_OTHER },

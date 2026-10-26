@@ -73,13 +73,29 @@ confirm() { # prompt -> 0 yes / 1 no
 # ↑/↓ or j/k to move, Space to toggle (multi), Enter to confirm, q to cancel.
 declare -A MENU_PRE=()                 # preselect map for menu_multi (name -> 1)
 MENU_RESULT=(); MENU_ONE=""
-_tui_restore() { printf '\033[?25h' >&2; }   # show cursor again
+# Put the tty into no-echo, char-at-a-time mode for the menu's lifetime, then
+# restore it. Relying on `read -s` alone left the arrow-key escape bytes
+# ([A/[B) echoed as "^[[B" on some terminals (notably over SSH); forcing -echo
+# via stty suppresses that regardless of how `read` behaves.
+_TTY_SAVED=""
+_tui_begin() {
+  printf '\033[?25l' >&2                                   # hide cursor
+  _TTY_SAVED="$(stty -g </dev/tty 2>/dev/null || true)"
+  stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
+}
+_tui_restore() {
+  [ -n "$_TTY_SAVED" ] && stty "$_TTY_SAVED" </dev/tty 2>/dev/null || true
+  _TTY_SAVED=""
+  printf '\033[?25h' >&2                                   # show cursor again
+}
 _read_key() {
   local k rest
-  IFS= read -rsn1 k </dev/tty 2>/dev/null || true
+  IFS= read -rn1 k </dev/tty 2>/dev/null || true
   if [ "$k" = $'\x1b' ]; then
-    IFS= read -rsn2 -t 0.1 rest </dev/tty 2>/dev/null || true
-    case "$rest" in '[A') echo up;; '[B') echo down;; *) echo other;; esac
+    # Drain the rest of the CSI/SS3 sequence. Allow more time than one frame so
+    # a laggy SSH link can't split "\e" from "[B" and leak the tail to screen.
+    IFS= read -rn2 -t 0.5 rest </dev/tty 2>/dev/null || true
+    case "$rest" in '[A'|'OA') echo up;; '[B'|'OB') echo down;; *) echo other;; esac
   elif [ -z "$k" ]; then echo enter
   elif [ "$k" = ' ' ]; then echo space
   elif [ "$k" = j ]; then echo down
@@ -91,7 +107,7 @@ menu_multi() { # TITLE OPT... ; preselect via MENU_PRE ; result -> MENU_RESULT[]
   local title="$1"; shift
   local -a opts=("$@") chk=(); local n=${#opts[@]} cur=0 i key drawn=0
   for i in "${!opts[@]}"; do chk[$i]=0; [ "${MENU_PRE[${opts[$i]}]:-0}" = 1 ] && chk[$i]=1; done
-  printf '\033[?25l' >&2; trap _tui_restore EXIT
+  _tui_begin; trap _tui_restore EXIT
   printf '\n%s%s%s\n   %s↑/↓ move · Space toggle · Enter confirm%s\n' "$(c '1;37')" "$title" "$(c 0)" "$(c 2)" "$(c 0)" >&2
   while true; do
     [ "$drawn" = 1 ] && printf '\033[%dA' "$n" >&2
@@ -111,7 +127,7 @@ menu_multi() { # TITLE OPT... ; preselect via MENU_PRE ; result -> MENU_RESULT[]
 menu_single() { # TITLE OPT... ; result -> MENU_ONE
   local title="$1"; shift
   local -a opts=("$@"); local n=${#opts[@]} cur=0 i key drawn=0
-  printf '\033[?25l' >&2; trap _tui_restore EXIT
+  _tui_begin; trap _tui_restore EXIT
   printf '\n%s%s%s\n   %s↑/↓ move · Enter select%s\n' "$(c '1;37')" "$title" "$(c 0)" "$(c 2)" "$(c 0)" >&2
   while true; do
     [ "$drawn" = 1 ] && printf '\033[%dA' "$n" >&2
@@ -370,6 +386,13 @@ install -m0755 "$REPO_ROOT/scripts/xs-lockdown-apply"     "$PREFIX_BIN/xs-lockdo
 }
 [ "$WITH_UFW_SYNC" = yes ] && install -m0755 "$REPO_ROOT/scripts/xs-ufw-sync" "$PREFIX_BIN/xs-ufw-sync"
 [ "$WITH_HTTPS" = yes ] && install -m0755 "$REPO_ROOT/scripts/xs-https-setup" "$PREFIX_BIN/xs-https-setup"
+# Pentest / regression suite (injects via bpftool prog run — nothing on the wire).
+if [ -f "$REPO_ROOT/pentest/xdp_pentest.py" ]; then
+  install -d -m0755 /opt/xdp-sentinel/pentest
+  cp -a "$REPO_ROOT/pentest/." /opt/xdp-sentinel/pentest/
+  install -m0755 "$REPO_ROOT/scripts/xs-pentest" "$PREFIX_BIN/xs-pentest"
+  ok "pentest suite -> /opt/xdp-sentinel/pentest; launcher 'xs-pentest' installed"
+fi
 ok "installed to $PREFIX_BIN and $OBJ_DIR"
 
 # =============================================================================
@@ -561,6 +584,7 @@ if [ -f "$UNIT_DIR/xdp-dashboard.service" ]; then
   else echo "   dashboard : $(systemctl is-active xdp-dashboard)  ->  http://${MGMT_IPS%%,*}:$DASH_PORT/analytics"; fi
 fi
 echo "   config    : $ETC/config.toml   data: $DATA_DIR"
+[ -x "$PREFIX_BIN/xs-pentest" ] && echo "   pentest   : 'xs-pentest --coverage' (safe), 'sudo xs-pentest --run' (full suite)"
 echo
 warn "SECURITY — do this now:"
 if [ "$WITH_HTTPS" = yes ]; then

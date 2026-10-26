@@ -33,10 +33,23 @@ pub fn file(iface: &str) -> PathBuf {
 /// typically ignore the error so a read-only state dir never fails a command.
 pub fn save(iface: &str, cfg: &Config) -> io::Result<()> {
     let mut c = *cfg;
+    // CHECK_* / SERVICE_ALLOW are derived from the ephemeral policy maps and must
+    // start clear on a fresh boot. GLOBAL_RL / DROP_UNTRACKED / DROP_UDP_STRICT are
+    // armed only by the risk engine (no operator CLI sets them), so they must never
+    // be persisted either: a `config` read-modify-write issued while the agent had
+    // them armed would otherwise freeze an active mitigation into the "operator"
+    // baseline and pin it on forever (per-source RATELIMIT stays persistable — it
+    // is an operator-settable baseline via `sentinelctl ratelimit`).
     let managed = ConfigFlags::CHECK_ALLOW.bits()
         | ConfigFlags::CHECK_POLICY.bits()
-        | ConfigFlags::SERVICE_ALLOW.bits();
+        | ConfigFlags::SERVICE_ALLOW.bits()
+        | ConfigFlags::GLOBAL_RL.bits()
+        | ConfigFlags::DROP_UNTRACKED.bits()
+        | ConfigFlags::DROP_UDP_STRICT.bits();
     c.flags = ConfigFlags::from_bits_retain(c.flags.bits() & !managed);
+    // The aggregate-limiter params belong to GLOBAL_RL; drop them with the flag.
+    c.global_rl_interval_ns = 0;
+    c.global_rl_burst = 0;
     std::fs::create_dir_all(dir())?;
     let path = file(iface);
     // Write-then-rename so a reader never sees a half-written file.

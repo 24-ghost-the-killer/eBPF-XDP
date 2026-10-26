@@ -144,7 +144,7 @@ fn restore_config(layout: &PinLayout) -> Result<()> {
     let current = DpConfig::from_bytes(&raw).unwrap_or_default();
 
     let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
-            | ConfigFlags::SERVICE_ALLOW.bits();
+            | ConfigFlags::SERVICE_ALLOW.bits() | ConfigFlags::LOCKDOWN.bits();
     let flags = ConfigFlags::from_bits_retain(
         (saved.flags.bits() & !managed) | (current.flags.bits() & managed),
     );
@@ -766,8 +766,42 @@ struct Analyzer {
     auto_actions: u64,
     global_cap: u32,                // aggregate pps cap at full escalation (tunable)
     ct_enforce: bool,               // actually drop untracked TCP (else conntrack is shadow-only)
+    steady_drops: u32,              // drop flags kept on at all risk levels (auto-managed)
     // multi-layer detector baseline over the LAYER_DEF rates
     layer_base: RobustBaseline,
+}
+
+/// Drop flags the agent keeps enabled at steady state, from `XS_STEADY_DROPS`
+/// (comma-separated flag names, or "safe" for the default set, or "" to
+/// disable). Unset defaults to the always-safe, near-zero-false-positive
+/// validity drops: malformed/LAND, bad TCP flag combinations, and "impossible"
+/// spoofed packets. These are managed like CHECK_* -- re-applied every window --
+/// so the appliance self-arms them and they survive restart, reattach and
+/// de-escalation without a manual `sentinelctl config`.
+fn parse_steady_drops() -> u32 {
+    let safe: u32 = ConfigFlags::DROP_MALFORMED.bits()
+        | ConfigFlags::DROP_BAD_TCP_FLAGS.bits()
+        | ConfigFlags::DROP_SPOOFED.bits();
+    match std::env::var("XS_STEADY_DROPS") {
+        Err(_) => safe,
+        Ok(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return 0;
+            }
+            if s.eq_ignore_ascii_case("safe") {
+                return safe;
+            }
+            let mut bits = 0u32;
+            for name in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                match ConfigFlags::NAMES.iter().find(|(_, n)| *n == name) {
+                    Some((fl, _)) => bits |= fl.bits(),
+                    None => eprintln!("XS_STEADY_DROPS: unknown flag '{name}' (ignored)"),
+                }
+            }
+            bits
+        }
+    }
 }
 
 impl Analyzer {
@@ -783,11 +817,18 @@ impl Analyzer {
             .and_then(|b| Forest::from_json(&b).ok())
             .filter(|m| m.schema_hash() == want);
         let auto = std::env::var("XS_AUTO_MITIGATE").map(|v| v == "1" || v == "true").unwrap_or(false);
+        let steady_drops = parse_steady_drops();
+        let steady_names: Vec<&str> = ConfigFlags::NAMES
+            .iter()
+            .filter(|(fl, _)| steady_drops & fl.bits() != 0)
+            .map(|(_, n)| *n)
+            .collect();
         eprintln!(
-            "analysis: detector on; classifier {}; anomaly model {}; auto-mitigate {}",
+            "analysis: detector on; classifier {}; anomaly model {}; auto-mitigate {}; steady-drops [{}]",
             if classifier.is_some() { "loaded" } else { "absent" },
             if iforest.is_some() { "loaded" } else { "absent" },
             if auto { "ON" } else { "off" },
+            steady_names.join(","),
         );
         Analyzer {
             detector: Detector::new(features::N),
@@ -816,6 +857,7 @@ impl Analyzer {
             ct_enforce: std::env::var("XS_CONNTRACK_ENFORCE")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false),
+            steady_drops,
             layer_base: RobustBaseline::new(LAYER_DEF.len(), 256),
         }
     }
@@ -838,11 +880,25 @@ impl Analyzer {
             // clean. Preserve the live CHECK_* bits (allowlist/policy presence).
             let saved = xs_common::state::load(layout.iface()).unwrap_or(cur);
             let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
-            | ConfigFlags::SERVICE_ALLOW.bits();
+            | ConfigFlags::SERVICE_ALLOW.bits() | ConfigFlags::LOCKDOWN.bits();
             let mut b = saved;
             b.flags = ConfigFlags::from_bits_retain(
                 (saved.flags.bits() & !managed) | (cur.flags.bits() & managed),
             );
+            // Agent-only mitigation flags must never survive in the baseline. If a
+            // `sentinelctl config` read-modify-write snapshotted the live config
+            // while the risk engine had them armed (e.g. GLOBAL_RL + a level-5
+            // per-source cap), state::save froze them into the "operator" state,
+            // and restoring that would pin the aggregate limiter on forever at
+            // idle. None of these is ever operator-set (there is no CLI for
+            // GLOBAL_RL), so strip them -- and the aggregate-limiter params -- so
+            // de-escalation always returns to a truly clean baseline.
+            let auto_only = ConfigFlags::GLOBAL_RL.bits()
+                | ConfigFlags::DROP_UNTRACKED.bits()
+                | ConfigFlags::DROP_UDP_STRICT.bits();
+            b.flags = ConfigFlags::from_bits_retain(b.flags.bits() & !auto_only);
+            b.global_rl_interval_ns = 0;
+            b.global_rl_burst = 0;
             self.baseline = Some(b);
         }
         let base = self.baseline.unwrap_or(cur);
@@ -864,10 +920,17 @@ impl Analyzer {
         // management-plane exemption. Re-applying the current bits each window
         // makes the exemption durable regardless of start order.
         let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
-            | ConfigFlags::SERVICE_ALLOW.bits();
+            | ConfigFlags::SERVICE_ALLOW.bits() | ConfigFlags::LOCKDOWN.bits();
         want.flags = ConfigFlags::from_bits_retain(
             (want.flags.bits() & !managed) | (cur.flags.bits() & managed),
         );
+        // Steady-state drops the appliance keeps on at every risk level (default:
+        // the always-safe malformed / bad-TCP-flags / spoofed set). Applied here,
+        // before the level branches, so they hold even at level 0 -- the box
+        // self-arms them and they survive restart, reattach and de-escalation.
+        // Managed like CHECK_*: a manual `--drop-* off` is re-asserted next
+        // window, so change the set via XS_STEADY_DROPS, not sentinelctl.
+        want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | self.steady_drops);
         // Connection tracking runs continuously (steady state) so legitimate
         // flows are already known before a flood hits -- it is harmless in
         // shadow (counts untracked TCP; only drops when DROP_UNTRACKED is set).
@@ -920,6 +983,19 @@ impl Analyzer {
                     "ack_flood" | "rst_flood" | "fin_flood" => ConfigFlags::DROP_UNTRACKED.bits(),
                     _ => ConfigFlags::DROP_BAD_TCP_FLAGS.bits(),
                 };
+                // Always safe at this level: DROP_MALFORMED only ever drops
+                // parse-error and LAND (src==dst) frames, never valid traffic.
+                // Unlike the rate limiters it applies to allowlist-exempt sources,
+                // so it closes the gap where a LAND flood spoofs an exempt address
+                // (it classifies as syn_flood, which otherwise gets rate-limited
+                // only -- and the spoofed source is exempt, so nothing dropped).
+                extra |= ConfigFlags::DROP_MALFORMED.bits();
+                // Also always safe: DROP_SPOOFED only ever drops "impossible"
+                // packets (bogon/martian source, TTL/hop-limit 0, port 0) that no
+                // conforming stack emits -- never legitimate RFC1918 or link-local
+                // traffic. Like DROP_MALFORMED it applies to allowlist-exempt
+                // sources, so it sheds a spoofed flood that forges an exempt IP.
+                extra |= ConfigFlags::DROP_SPOOFED.bits();
                 // Connection-tracking enforcement (opt-in via XS_CONNTRACK_ENFORCE
                 // after validating the shadow counts): drop untracked TCP for any
                 // TCP flood. It only affects TCP with no learned flow, so ACK/RST

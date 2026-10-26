@@ -38,16 +38,20 @@ function Drawer({ a, onClose, onExplore }: { a: Episode; onClose: () => void; on
   const step = niceStep(end - start, 200)
   const rw = `${Math.max(60, step)}s`
   const q = usePoll(async () => {
-    const [bw, verdict, rl, risk] = await Promise.all([
+    const [bw, verdict, rl, risk, l4, tcp] = await Promise.all([
       rangeAbs(`sum by(iface)(rate(xs_rx_bytes_total[${rw}]))*8`, start, end, step),
       rangeAbs(`sum by(verdict)(rate(xs_verdict_packets_total{verdict=~"pass|drop"}[${rw}]))`, start, end, step),
       rangeAbs(`sum(rate(xs_policy_event_packets_total{event="rate_limited"}[${rw}]))`, start, end, step),
       rangeAbs('max(xs_risk)', start, end, step),
+      rangeAbs(`sum by(proto)(rate(xs_l4_packets_total[${rw}]))`, start, end, step),
+      rangeAbs(`sum by(class)(rate(xs_tcp_flags_packets_total[${rw}]))`, start, end, step),
     ])
     return {
       bw: toSeries(bw, (m) => m.iface ?? 'all'), bwKeys: bw.map((s) => s.metric.iface ?? 'all'),
       pk: toSeries([...verdict.map((s) => ({ metric: { k: s.metric.verdict }, values: s.values })), ...rl.map((s) => ({ metric: { k: 'rate_limited' }, values: s.values }))], (m) => m.k),
       risk: toSeries(risk, () => 'risk'),
+      proto: toSeries(l4, (m) => m.proto ?? 'other'), protoKeys: l4.map((s) => s.metric.proto ?? 'other'),
+      tcp: toSeries(tcp, (m) => m.class ?? 'other'), tcpKeys: tcp.map((s) => s.metric.class ?? 'other'),
     }
   }, 600_000, [a.id, a.start])
   const spanMs = (end - start) * 1000
@@ -85,6 +89,14 @@ function Drawer({ a, onClose, onExplore }: { a: Episode; onClose: () => void; on
           <Panel icon={Network} title="Bandwidth by interface" sub="Episode window ± padding">
             <TimeChart kind="area" stacked loading={!q.data} data={q.data?.bw ?? []} series={(q.data?.bwKeys ?? []).map((k, i) => ({ key: k, label: k, color: SERIES[i % SERIES.length] }))} yfmt={bps} spanMs={spanMs} height={200} />
           </Panel>
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+            <Panel icon={Network} title="Protocols sent" sub="Transport protocol, packets per second">
+              <TimeChart kind="area" stacked loading={!q.data} data={q.data?.proto ?? []} series={(q.data?.protoKeys ?? []).map((k, i) => ({ key: k, label: pretty(k), color: SERIES[i % SERIES.length] }))} yfmt={pps} spanMs={spanMs} height={190} />
+            </Panel>
+            <Panel icon={Activity} title="TCP flag types" sub="SYN · ACK · RST · FIN · SYN-ACK, packets per second">
+              <TimeChart kind="area" stacked loading={!q.data} data={q.data?.tcp ?? []} series={(q.data?.tcpKeys ?? []).map((k, i) => ({ key: k, label: pretty(k), color: SERIES[i % SERIES.length] }))} yfmt={pps} spanMs={spanMs} height={190} />
+            </Panel>
+          </div>
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
             <Panel icon={ShieldCheck} title="Passed · dropped · rate-limited" sub="Packets per second">
               <TimeChart loading={!q.data} data={q.data?.pk ?? []} series={[{ key: 'pass', label: 'Passed', color: SERIES[2] }, { key: 'drop', label: 'Dropped', color: SERIES[1] }, { key: 'rate_limited', label: 'Rate-limited', color: SERIES[4] }]} yfmt={pps} spanMs={spanMs} height={190} />

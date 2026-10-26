@@ -96,6 +96,12 @@ static __always_inline void xs_account_parse(struct xs_stats *st, const struct x
 			xs_count(st, XS_CNT_ANOM_UDP_LEN_MISMATCH, len);
 		if (p->anomalies & XS_ANOM_LAND)
 			xs_count(st, XS_CNT_ANOM_LAND, len);
+		if (p->anomalies & XS_ANOM_BOGON_SRC)
+			xs_count(st, XS_CNT_ANOM_BOGON_SRC, len);
+		if (p->anomalies & XS_ANOM_TTL_ZERO)
+			xs_count(st, XS_CNT_ANOM_TTL_ZERO, len);
+		if (p->anomalies & XS_ANOM_PORT_ZERO)
+			xs_count(st, XS_CNT_ANOM_PORT_ZERO, len);
 	}
 }
 

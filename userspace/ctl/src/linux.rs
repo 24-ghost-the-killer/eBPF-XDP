@@ -54,6 +54,7 @@ pub fn run(cli: Cli) -> Result<()> {
             drop_udp_dns,
             drop_udp,
             lockdown,
+            drop_spoofed,
         } => config(
             &layout(&cli, iface)?,
             [
@@ -63,6 +64,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 (ConfigFlags::DROP_UDP_DNS, drop_udp_dns),
                 (ConfigFlags::DROP_UDP, drop_udp),
                 (ConfigFlags::LOCKDOWN, lockdown),
+                (ConfigFlags::DROP_SPOOFED, drop_spoofed),
             ],
         ),
         Cmd::Block { ref iface, ip, ttl } => policy::block(&layout(&cli, iface)?, ip, ttl),
@@ -426,7 +428,7 @@ fn write_config(map: &MapHandle, cfg: Config) -> Result<()> {
     Ok(())
 }
 
-fn config(layout: &PinLayout, changes: [(ConfigFlags, Option<Toggle>); 6]) -> Result<()> {
+fn config(layout: &PinLayout, changes: [(ConfigFlags, Option<Toggle>); 7]) -> Result<()> {
     let path = layout.map(MAP_CONFIG);
     let map = MapHandle::from_pinned_path(&path)
         .with_context(|| format!("open {path:?} (is the program attached?)"))?;
