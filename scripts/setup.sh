@@ -57,6 +57,15 @@ RUN_TESTS=yes
 WITH_HTTPS=no                                      # serve the dashboard over TLS (nginx proxy)
 TLS_PORT=443
 
+# Network provisioning (fresh box only — never touches an existing VLAN/bridge).
+WITH_NETWORK=auto                                  # auto|yes|no
+NET_TRUNK=""                                        # physical NIC carrying the VLAN trunk
+NET_WAN_VLAN=10
+NET_LAN_VLAN=20
+NET_BRIDGE_CIDR=""                                  # management IP on br0, e.g. 192.168.1.10/24
+NET_GATEWAY=""
+NET_DNS="1.1.1.1,9.9.9.9"
+
 # ---- pretty logging ---------------------------------------------------------
 c() { printf '\033[%sm' "$1"; }
 say()  { printf '\n%s== %s ==%s\n' "$(c '1;36')" "$*" "$(c 0)"; }
@@ -81,7 +90,9 @@ _TTY_SAVED=""
 _tui_begin() {
   printf '\033[?25l' >&2                                   # hide cursor
   _TTY_SAVED="$(stty -g </dev/tty 2>/dev/null || true)"
-  stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
+  # Only force echo off (that is what stopped "^[[B" leaking). Leave canonical
+  # mode alone so bash's own `read -n1` keeps delivering Enter as before.
+  stty -echo </dev/tty 2>/dev/null || true
 }
 _tui_restore() {
   [ -n "$_TTY_SAVED" ] && stty "$_TTY_SAVED" </dev/tty 2>/dev/null || true
@@ -90,13 +101,13 @@ _tui_restore() {
 }
 _read_key() {
   local k rest
-  IFS= read -rn1 k </dev/tty 2>/dev/null || true
+  IFS= read -rsn1 k </dev/tty 2>/dev/null || true
   if [ "$k" = $'\x1b' ]; then
     # Drain the rest of the CSI/SS3 sequence. Allow more time than one frame so
     # a laggy SSH link can't split "\e" from "[B" and leak the tail to screen.
-    IFS= read -rn2 -t 0.5 rest </dev/tty 2>/dev/null || true
+    IFS= read -rsn2 -t 0.5 rest </dev/tty 2>/dev/null || true
     case "$rest" in '[A'|'OA') echo up;; '[B'|'OB') echo down;; *) echo other;; esac
-  elif [ -z "$k" ]; then echo enter
+  elif [ -z "$k" ] || [ "$k" = $'\r' ] || [ "$k" = $'\n' ]; then echo enter
   elif [ "$k" = ' ' ]; then echo space
   elif [ "$k" = j ]; then echo down
   elif [ "$k" = k ]; then echo up
@@ -106,6 +117,7 @@ _read_key() {
 menu_multi() { # TITLE OPT... ; preselect via MENU_PRE ; result -> MENU_RESULT[]
   local title="$1"; shift
   local -a opts=("$@") chk=(); local n=${#opts[@]} cur=0 i key drawn=0
+  MENU_RESULT=(); [ "$n" -gt 0 ] || return 0      # nothing to choose from
   for i in "${!opts[@]}"; do chk[$i]=0; [ "${MENU_PRE[${opts[$i]}]:-0}" = 1 ] && chk[$i]=1; done
   _tui_begin; trap _tui_restore EXIT
   printf '\n%s%s%s\n   %s↑/↓ move · Space toggle · Enter confirm%s\n' "$(c '1;37')" "$title" "$(c 0)" "$(c 2)" "$(c 0)" >&2
@@ -127,6 +139,7 @@ menu_multi() { # TITLE OPT... ; preselect via MENU_PRE ; result -> MENU_RESULT[]
 menu_single() { # TITLE OPT... ; result -> MENU_ONE
   local title="$1"; shift
   local -a opts=("$@"); local n=${#opts[@]} cur=0 i key drawn=0
+  MENU_ONE=""; [ "$n" -gt 0 ] || return 0         # nothing to choose from
   _tui_begin; trap _tui_restore EXIT
   printf '\n%s%s%s\n   %s↑/↓ move · Enter select%s\n' "$(c '1;37')" "$title" "$(c 0)" "$(c 2)" "$(c 0)" >&2
   while true; do
@@ -140,6 +153,86 @@ menu_single() { # TITLE OPT... ; result -> MENU_ONE
   done
   _tui_restore; trap - EXIT; MENU_ONE="${opts[$cur]}"
   return 0
+}
+
+# ---- network provisioning (fresh box only) ----------------------------------
+# True when the box already has VLAN interfaces (=> an inline bridge is set up
+# and we must NOT touch the network — fresh-box provisioning only).
+have_vlans() { ip -o link show type vlan 2>/dev/null | grep -q .; }
+
+provision_network() { # writes /etc/netplan + applies with auto-revert
+  command -v netplan >/dev/null || { warn "netplan not found — skipping network setup (install netplan.io or configure the VLAN/bridge manually)"; return 0; }
+
+  # Trunk NIC: flag, else a menu of physical NICs (exclude lo/bridges/vlans/veths).
+  local nic a
+  if [ -n "$NET_TRUNK" ]; then
+    nic="$NET_TRUNK"
+  elif [ "$TUI" = yes ]; then
+    mapfile -t PHYS < <(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' \
+      | grep -vxE 'lo|br0|docker0|vlan[0-9]+' | grep -vE '^(veth|br-)')
+    [ "${#PHYS[@]}" -gt 0 ] || die "no physical NIC found to use as the VLAN trunk."
+    menu_single "Physical NIC that carries the VLAN trunk:" "${PHYS[@]}"
+    nic="$MENU_ONE"
+  else
+    die "network provisioning needs --trunk NIC in non-interactive mode."
+  fi
+
+  # Parameters — prompt when interactive and not already supplied by a flag.
+  if [ "$TUI" = yes ]; then
+    read -r -p "   WAN VLAN id [$NET_WAN_VLAN]: " a </dev/tty; NET_WAN_VLAN="${a:-$NET_WAN_VLAN}"
+    read -r -p "   LAN VLAN id [$NET_LAN_VLAN]: " a </dev/tty; NET_LAN_VLAN="${a:-$NET_LAN_VLAN}"
+    read -r -p "   Bridge (management) IP/CIDR, e.g. 192.168.1.10/24 [${NET_BRIDGE_CIDR:-none}]: " a </dev/tty; NET_BRIDGE_CIDR="${a:-$NET_BRIDGE_CIDR}"
+    read -r -p "   Default gateway [${NET_GATEWAY:-none}]: " a </dev/tty; NET_GATEWAY="${a:-$NET_GATEWAY}"
+    read -r -p "   DNS servers (comma) [$NET_DNS]: " a </dev/tty; NET_DNS="${a:-$NET_DNS}"
+  fi
+  [[ "$NET_WAN_VLAN" =~ ^[0-9]+$ && "$NET_LAN_VLAN" =~ ^[0-9]+$ ]] || die "VLAN ids must be numeric."
+  [ "$NET_WAN_VLAN" != "$NET_LAN_VLAN" ] || die "WAN and LAN VLAN ids must differ."
+  [ -n "$NET_BRIDGE_CIDR" ] || die "bridge IP/CIDR required (--bridge-cidr)."
+  [[ "$NET_BRIDGE_CIDR" == */* ]] || die "bridge IP must include a prefix, e.g. 192.168.1.10/24."
+
+  local wan="vlan${NET_WAN_VLAN}" lan="vlan${NET_LAN_VLAN}" target=/etc/netplan/01-xdp-vlan-bridge.yaml
+  local dns_yaml; dns_yaml="$(printf '%s' "$NET_DNS" | tr ',' '\n' | sed '/^$/d;s/^/          - /')"
+
+  install -d -m0755 /etc/netplan
+  [ -f "$target" ] && { cp -a "$target" "$target.bak.$(date +%s)" && warn "backed up existing $target"; }
+  {
+    echo "# Generated by scripts/setup.sh — xdp-sentinel inline-bridge network."
+    echo "# $nic trunks VLAN $NET_WAN_VLAN (WAN) + $NET_LAN_VLAN (LAN); both bridge into br0,"
+    echo "# which holds the management IP. The XDP dataplane attaches to $wan / $lan."
+    echo "network:"
+    echo "  version: 2"
+    echo "  renderer: networkd"
+    echo "  ethernets:"
+    echo "    $nic: {dhcp4: no, dhcp6: no, optional: true}"
+    echo "  vlans:"
+    echo "    $wan: {id: $NET_WAN_VLAN, link: $nic}"
+    echo "    $lan: {id: $NET_LAN_VLAN, link: $nic}"
+    echo "  bridges:"
+    echo "    br0:"
+    echo "      interfaces: [$wan, $lan]"
+    echo "      addresses: [$NET_BRIDGE_CIDR]"
+    [ -n "$NET_GATEWAY" ] && { echo "      routes:"; echo "        - {to: default, via: $NET_GATEWAY}"; }
+    echo "      nameservers:"
+    echo "        addresses:"
+    echo "$dns_yaml"
+    echo "      parameters: {stp: false, forward-delay: 0}"
+    echo "      dhcp4: no"
+    echo "      dhcp6: no"
+  } > "$target"
+  chmod 0600 "$target"
+  ok "wrote $target (trunk $nic, VLANs $NET_WAN_VLAN/$NET_LAN_VLAN, br0 $NET_BRIDGE_CIDR)"
+
+  netplan generate || die "netplan generate failed — config invalid, NOT applied (your network is unchanged)."
+  if [ "$ASSUME_YES" = yes ]; then
+    warn "applying network config non-interactively (NO auto-revert)…"
+    netplan apply || die "netplan apply failed."
+  else
+    warn "Applying with 'netplan try': if this session drops, it AUTO-REVERTS in 120s."
+    warn "If your connection stays up, press ENTER at netplan's prompt to keep the config."
+    netplan try --timeout 120 || die "netplan try reverted or failed — network left as it was."
+  fi
+  local _i; for _i in $(seq 10); do have_vlans && break; sleep 1; done
+  ok "network up: br0 = $(ip -br addr show br0 2>/dev/null | awk '{$1=$1;print}')"
 }
 
 usage() {
@@ -167,6 +260,14 @@ Options:
   --no-dashboard       Skip building/installing the dashboard.
   --https              Serve the dashboard over TLS (nginx proxy + self-signed cert).
   --tls-port N         HTTPS port (default 443).
+  --with-network       Provision the VLAN/bridge network (fresh box with no VLANs).
+  --no-network         Never provision the network (default on an already-configured box).
+  --trunk NIC          Physical NIC carrying the VLAN trunk (else prompted/menu).
+  --wan-vlan ID        WAN VLAN id (default 10).
+  --lan-vlan ID        LAN VLAN id (default 20).
+  --bridge-cidr CIDR   Management IP/CIDR on br0, e.g. 192.168.1.10/24.
+  --gateway IP         Default gateway for br0.
+  --net-dns LIST       DNS servers, comma separated (default 1.1.1.1,9.9.9.9).
   --with-twingate NAME Also route the Twingate connector container NAME through XDP.
   --with-ufw-sync      Install the ufw -> allowlist sync automation.
   --skip-deps          Do not apt-get install build dependencies.
@@ -193,6 +294,14 @@ while [ $# -gt 0 ]; do
     --https) WITH_HTTPS=yes; shift;;
     --no-https) WITH_HTTPS=no; shift;;
     --tls-port) TLS_PORT="$2"; shift 2;;
+    --with-network) WITH_NETWORK=yes; shift;;
+    --no-network) WITH_NETWORK=no; shift;;
+    --trunk) NET_TRUNK="$2"; shift 2;;
+    --wan-vlan) NET_WAN_VLAN="$2"; shift 2;;
+    --lan-vlan) NET_LAN_VLAN="$2"; shift 2;;
+    --bridge-cidr) NET_BRIDGE_CIDR="$2"; shift 2;;
+    --gateway) NET_GATEWAY="$2"; shift 2;;
+    --net-dns) NET_DNS="$2"; shift 2;;
     --with-twingate) WITH_TWINGATE=yes; TWINGATE_CONTAINER="$2"; shift 2;;
     --with-ufw-sync) WITH_UFW_SYNC=yes; shift;;
     --skip-deps) SKIP_DEPS=yes; shift;;
@@ -216,7 +325,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # =============================================================================
-say "0/9  Preflight"
+say "0/10 Preflight"
 # =============================================================================
 [ "$(uname -s)" = Linux ] || die "this installer targets Linux."
 command -v apt-get >/dev/null || die "need apt-get (Debian/Ubuntu); install deps manually and use --skip-deps."
@@ -257,7 +366,7 @@ fi
 id "$DASH_USER" >/dev/null 2>&1 || die "dashboard user '$DASH_USER' does not exist (pass --dash-user)."
 
 # =============================================================================
-say "1/9  Build dependencies"
+say "1/10 Build dependencies"
 # =============================================================================
 if [ "$SKIP_DEPS" = yes ]; then
   info "skipping (--skip-deps)"
@@ -275,7 +384,7 @@ fi
 command -v cargo >/dev/null || die "cargo/rustc required to build the userspace."
 
 # =============================================================================
-say "2/9  Build (eBPF object + userspace)"
+say "2/10 Build (eBPF object + userspace)"
 # =============================================================================
 ( cd "$REPO_ROOT" && make ebpf userspace )
 [ -f "$REPO_ROOT/ebpf/build/xdp_main.bpf.o" ] || die "eBPF object not built."
@@ -287,7 +396,30 @@ if [ "$RUN_TESTS" = yes ]; then
 fi
 
 # =============================================================================
-say "3/9  Select interfaces"
+say "3/10 Network (VLAN/bridge)"
+# =============================================================================
+# Fresh-box only: if the inline bridge isn't set up yet (no VLAN interfaces),
+# optionally create it so the interface picker below has vlanWAN/vlanLAN to show.
+# An already-configured box is detected and left completely untouched.
+if [ "$WITH_NETWORK" = no ]; then
+  info "network provisioning disabled (--no-network)"
+elif have_vlans; then
+  [ "$WITH_NETWORK" = yes ] && warn "VLAN interfaces already exist — NOT reconfiguring the network (fresh-box only)."
+  ok "existing VLAN/bridge network detected — leaving it untouched"
+else
+  DO_NET=no
+  if [ "$WITH_NETWORK" = yes ]; then DO_NET=yes
+  elif [ "$TUI" = yes ]; then
+    menu_single "No VLAN/bridge network found. Set it up now (trunk + 2 VLANs + br0)?" \
+      "No — interfaces already exist / I'll configure networking myself" \
+      "Yes — provision the VLAN/bridge network now"
+    [ "$MENU_ONE" = "Yes — provision the VLAN/bridge network now" ] && DO_NET=yes
+  fi
+  [ "$DO_NET" = yes ] && provision_network || info "skipping network provisioning"
+fi
+
+# =============================================================================
+say "4/10 Select interfaces"
 # =============================================================================
 # Candidates = real links, minus loopback. Show state so you can tell which are up.
 mapfile -t CAND < <(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -vx lo)
@@ -372,7 +504,7 @@ fi
 info "management IPs (lifeline SSH+dashboard): ${MGMT_IPS:-none}"
 
 # =============================================================================
-say "4/9  Install binaries, object and scripts"
+say "5/10 Install binaries, object and scripts"
 # =============================================================================
 install -d -m0755 "$OBJ_DIR" "$ETC" "$DATA_DIR"
 install -m0755 "$REPO_ROOT/target/release/sentinelctl"    "$PREFIX_BIN/sentinelctl"
@@ -396,7 +528,7 @@ fi
 ok "installed to $PREFIX_BIN and $OBJ_DIR"
 
 # =============================================================================
-say "5/9  Configuration"
+say "6/10 Configuration"
 # =============================================================================
 # 5a. agent config.toml — the interface list the agent attaches.
 if [ -f "$ETC/config.toml" ] && ! confirm "Overwrite existing $ETC/config.toml?"; then
@@ -453,7 +585,7 @@ if [ "$WITH_TWINGATE" = yes ]; then
 fi
 
 # =============================================================================
-say "6/9  systemd units"
+say "7/10 systemd units"
 # =============================================================================
 D="$REPO_ROOT/deploy/systemd"
 install -m0644 "$D/sentinel-agent.service" "$UNIT_DIR/"
@@ -475,7 +607,7 @@ systemctl daemon-reload
 ok "units installed"
 
 # =============================================================================
-say "7/9  Dashboard"
+say "8/10 Dashboard"
 # =============================================================================
 if [ "$WITH_DASHBOARD" = no ] || ! command -v npm >/dev/null; then
   [ "$WITH_DASHBOARD" = no ] && info "skipped (--no-dashboard)" || warn "npm missing — skipping dashboard"
@@ -547,7 +679,7 @@ EOF
 fi
 
 # =============================================================================
-say "8/9  Enable and start services"
+say "9/10 Enable and start services"
 # =============================================================================
 chown -R "$DASH_USER": "$DATA_DIR"
 systemctl enable --now sentinel-agent.service
@@ -574,7 +706,7 @@ if [ "$WITH_HTTPS" = yes ] && [ -f "$UNIT_DIR/xdp-dashboard.service" ]; then
 fi
 
 # =============================================================================
-say "9/9  Summary"
+say "10/10 Summary"
 # =============================================================================
 echo
 ok "Install complete."
