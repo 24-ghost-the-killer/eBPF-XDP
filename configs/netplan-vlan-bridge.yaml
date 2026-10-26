@@ -49,4 +49,4 @@ network:
       nameservers: {addresses: [185.232.148.2, 185.232.149.2]}
       access-points:
         "VBFF":                                      # SSID is case-sensitive: the school broadcasts "VBFF"
-          password: "aske1212"                    # the vbff WiFi password
+          password: "CHANGE_ME"                   # set the vbff WiFi password here (do NOT commit the real one)

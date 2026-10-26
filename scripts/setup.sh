@@ -51,6 +51,8 @@ WITH_DASHBOARD=auto                                # auto|yes|no
 WITH_TWINGATE=no
 TWINGATE_CONTAINER=""
 WITH_UFW_SYNC=no
+WITH_CLICKHOUSE=no                                 # opt-in Docker: event/flow store
+WITH_MONITORING=no                                 # opt-in Docker: Grafana + exporters
 ASSUME_YES=no
 SKIP_DEPS=no
 RUN_TESTS=yes
@@ -222,6 +224,23 @@ provision_network() { # copy the repo netplan template, swap per-box values, app
   ok "network up: br0 = $(ip -br addr show br0 2>/dev/null | awk '{$1=$1;print}')"
 }
 
+# ---- docker (only when an opt-in Docker component is selected) ---------------
+# Returns 0 if docker + a compose command are available afterwards, else 1.
+DOCKER_COMPOSE=""
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    info "installing Docker (needed by a selected component)…"
+    apt-get install -y -qq docker.io >/dev/null 2>&1 || { warn "could not install docker.io via apt"; return 1; }
+    apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || apt-get install -y -qq docker-compose >/dev/null 2>&1 || true
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  fi
+  command -v docker >/dev/null 2>&1 || { warn "docker not available"; return 1; }
+  if docker compose version >/dev/null 2>&1; then DOCKER_COMPOSE="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then DOCKER_COMPOSE="docker-compose"
+  else warn "docker compose not available (install docker-compose-plugin)"; return 1; fi
+  return 0
+}
+
 usage() {
   cat <<'EOF'
 xdp-sentinel installer — builds and installs the whole system, lets you pick
@@ -257,6 +276,8 @@ Options:
   --net-dns LIST       DNS servers, comma separated (default 1.1.1.1,9.9.9.9).
   --with-twingate NAME Also route the Twingate connector container NAME through XDP.
   --with-ufw-sync      Install the ufw -> allowlist sync automation.
+  --with-clickhouse    Opt-in Docker: ClickHouse event/flow store (installs Docker if needed).
+  --with-monitoring    Opt-in Docker: Grafana + exporters stack (installs Docker if needed).
   --skip-deps          Do not apt-get install build dependencies.
   --no-tests           Skip 'make test-bpf' (the verifier load check).
   -y, --yes            Non-interactive: accept defaults, no prompts.
@@ -291,6 +312,8 @@ while [ $# -gt 0 ]; do
     --net-dns) NET_DNS="$2"; shift 2;;
     --with-twingate) WITH_TWINGATE=yes; TWINGATE_CONTAINER="$2"; shift 2;;
     --with-ufw-sync) WITH_UFW_SYNC=yes; shift;;
+    --with-clickhouse) WITH_CLICKHOUSE=yes; shift;;
+    --with-monitoring) WITH_MONITORING=yes; shift;;
     --skip-deps) SKIP_DEPS=yes; shift;;
     --no-tests) RUN_TESTS=no; shift;;
     -y|--yes) ASSUME_YES=yes; shift;;
@@ -477,14 +500,16 @@ info "will attach: $(for n in "${!IFMODE[@]}"; do printf '%s(%s) ' "$n" "${IFMOD
 # Optional components (arrow multi-select when interactive).
 if [ "$TUI" = yes ] && [ -z "$IFACES_SPEC" ]; then
   MENU_PRE=([Dashboard]=1 ["Dashboard over HTTPS (nginx TLS)"]=1)
-  menu_multi "Optional components to install (Space toggles):" "Dashboard" "Dashboard over HTTPS (nginx TLS)" "Twingate through-XDP" "ufw → allowlist sync"
-  WITH_DASHBOARD=no; WITH_HTTPS=no; WITH_TWINGATE=no; WITH_UFW_SYNC=no
+  menu_multi "Optional components to install (Space toggles):" "Dashboard" "Dashboard over HTTPS (nginx TLS)" "Twingate through-XDP" "ufw → allowlist sync" "ClickHouse event store (Docker)" "Grafana monitoring (Docker)"
+  WITH_DASHBOARD=no; WITH_HTTPS=no; WITH_TWINGATE=no; WITH_UFW_SYNC=no; WITH_CLICKHOUSE=no; WITH_MONITORING=no
   for sel in "${MENU_RESULT[@]}"; do
     case "$sel" in
       Dashboard) WITH_DASHBOARD=yes;;
       "Dashboard over HTTPS"*) WITH_HTTPS=yes;;
       "Twingate through-XDP") WITH_TWINGATE=yes;;
       "ufw"*) WITH_UFW_SYNC=yes;;
+      "ClickHouse"*) WITH_CLICKHOUSE=yes;;
+      "Grafana"*) WITH_MONITORING=yes;;
     esac
   done
   [ "$WITH_HTTPS" = yes ] && [ "$WITH_DASHBOARD" = no ] && { warn "HTTPS needs the dashboard — enabling it too."; WITH_DASHBOARD=yes; }
@@ -521,6 +546,15 @@ install -m0755 "$REPO_ROOT/scripts/xs-lockdown-apply"     "$PREFIX_BIN/xs-lockdo
 }
 [ "$WITH_UFW_SYNC" = yes ] && install -m0755 "$REPO_ROOT/scripts/xs-ufw-sync" "$PREFIX_BIN/xs-ufw-sync"
 [ "$WITH_HTTPS" = yes ] && install -m0755 "$REPO_ROOT/scripts/xs-https-setup" "$PREFIX_BIN/xs-https-setup"
+# ML models (classifier/anomaly/bot) the agent loads from $OBJ_DIR/models.
+# Without these the agent runs rule-based only ("classifier/anomaly model absent").
+if [ -d "$REPO_ROOT/ml/models" ]; then
+  install -d -m0755 "$OBJ_DIR/models"
+  cp -a "$REPO_ROOT/ml/models/." "$OBJ_DIR/models/"
+  ok "ML models -> $OBJ_DIR/models ($(find "$OBJ_DIR/models" -name model.json | wc -l | tr -d ' ') model(s))"
+else
+  warn "no ml/models in the repo — agent will run rule-based only (classifier/anomaly off)."
+fi
 # Pentest / regression suite (injects via bpftool prog run — nothing on the wire).
 if [ -f "$REPO_ROOT/pentest/xdp_pentest.py" ]; then
   install -d -m0755 /opt/xdp-sentinel/pentest
@@ -579,6 +613,11 @@ if [ ! -f "$ETC/protect.conf" ]; then
   ok "wrote $ETC/protect.conf"
 fi
 
+# 5f. allowlist.conf reference (used by the optional xs-baseline unit).
+[ -f "$REPO_ROOT/configs/allowlist.conf" ] && [ ! -f "$ETC/allowlist.conf" ] && \
+  install -m0644 "$REPO_ROOT/configs/allowlist.conf" "$ETC/allowlist.conf.example" 2>/dev/null && \
+  info "allowlist reference -> $ETC/allowlist.conf.example (rename to allowlist.conf + enable xs-baseline to use)"
+
 # 5e. Twingate env (shared container name for attach + lockdown).
 if [ "$WITH_TWINGATE" = yes ]; then
   [ -n "$TWINGATE_CONTAINER" ] || die "--with-twingate needs the connector container NAME."
@@ -591,23 +630,31 @@ fi
 say "7/10 systemd units"
 # =============================================================================
 D="$REPO_ROOT/deploy/systemd"
-install -m0644 "$D/sentinel-agent.service" "$UNIT_DIR/"
-install -m0644 "$D/xdp-sentinel-protect-apply.service" "$D/xdp-sentinel-protect-apply.path" "$UNIT_DIR/"
-install -m0644 "$D/xdp-sentinel-lockdown.service" "$D/xdp-sentinel-lockdown.path" "$D/xdp-sentinel-lockdown.timer" "$UNIT_DIR/"
-if [ "$WITH_TWINGATE" = yes ]; then
-  install -m0644 "$D/xdp-sentinel-twingate-attach.service" "$D/xdp-sentinel-twingate-attach.path" "$UNIT_DIR/" 2>/dev/null || true
-  install -m0644 "$D/xdp-sentinel-twingate-watchdog.service" "$D/xdp-sentinel-twingate-watchdog.timer" "$UNIT_DIR/" 2>/dev/null || true
-fi
-[ "$WITH_UFW_SYNC" = yes ] && install -m0644 "$D/xdp-sentinel-ufw-sync.service" "$D/xdp-sentinel-ufw-sync.path" "$UNIT_DIR/" 2>/dev/null || true
+# Install EVERY shipped unit so the whole system is present. The core set is
+# enabled in step 9; situational units are installed-but-left-disabled (see the
+# note below) so they are available without changing the box's behaviour.
+install -m0644 "$D"/*.service "$D"/*.path "$D"/*.timer "$UNIT_DIR/" 2>/dev/null || true
+# NOTE: the shipped sentinel-agent.service.d/auto-mitigate.conf (XS_AUTO_MITIGATE=1)
+# is deliberately NOT installed — a fresh box runs observe-only so auto-mitigation
+# can't self-DoS before you've watched traffic. Enable it later with:
+#   sudo install -Dm0644 $REPO_ROOT/deploy/systemd/sentinel-agent.service.d/auto-mitigate.conf \
+#     /etc/systemd/system/sentinel-agent.service.d/auto-mitigate.conf && sudo systemctl daemon-reload && sudo systemctl restart sentinel-agent
+# Situational units that are installed but NOT enabled by this installer:
+#   xdp-sentinel-attach@.service  — sentinel-agent already attaches (config attach=true)
+#   xs-cutover-auto.{service,timer} — not needed; setup already wrote the netplan
+#   xs-textfile-exporter.service  — only for the Grafana stack (dashboard uses agent metrics)
+#   xs-baseline.service           — needs /etc/xdp-sentinel/allowlist.conf
+# (Twingate + ufw-sync units are shipped here; they are only *enabled* in step 9
+#  when --with-twingate / --with-ufw-sync is selected.)
 
 # Drop-ins so the jobs read paths.env (data-file locations) without editing shipped units.
-for unit in xdp-sentinel-protect-apply xdp-sentinel-lockdown xdp-sentinel-twingate-attach; do
+for unit in xdp-sentinel-protect-apply xdp-sentinel-lockdown xdp-sentinel-twingate-attach xdp-sentinel-twingate-sync; do
   [ -f "$UNIT_DIR/$unit.service" ] || continue
   install -d -m0755 "$UNIT_DIR/$unit.service.d"
   printf '[Service]\nEnvironmentFile=-%s\n' "$ETC/paths.env" > "$UNIT_DIR/$unit.service.d/paths.conf"
 done
 systemctl daemon-reload
-ok "units installed"
+ok "all systemd units installed ($(ls "$D"/*.service 2>/dev/null | wc -l | tr -d ' ') services; core enabled in step 9)"
 
 # =============================================================================
 say "8/10 Dashboard"
@@ -631,7 +678,7 @@ else
     cat > "$ETC/dashboard.env" <<EOF
 # Generated by scripts/setup.sh
 DASH_SESSION=$SESSION_KEY
-DASH_USERS_FILE=$ETC/dash-users.json
+DASH_USERS_FILE=$DATA_DIR/dash-users.json
 DASH_PROTECT_PLAN=$DATA_DIR/protect-plan.json
 DASH_LOCKDOWN_FILE=$DATA_DIR/lockdown.json
 DASH_PROTECT_MANAGEMENT=$MGMT_IPS
@@ -651,15 +698,46 @@ EOF
     read -rs -p "   Set dashboard admin ('$ADMIN_USER') password: " ADMIN_PASS </dev/tty; echo
   fi
   if [ -n "$ADMIN_PASS" ]; then
-    DASH_USERS_FILE="$ETC/dash-users.json" DASH_NEW_PASSWORD="$ADMIN_PASS" \
+    DASH_USERS_FILE="$DATA_DIR/dash-users.json" DASH_NEW_PASSWORD="$ADMIN_PASS" \
       node "$DASH_DST/scripts/dash-users.mjs" add "$ADMIN_USER" admins >/dev/null \
       && ok "created admin '$ADMIN_USER' (built-in admin/admin now disabled)" \
       || warn "could not create admin automatically; run dash-users.mjs manually — admin/admin stays active until you do"
   else
     warn "no admin password given: the INSECURE built-in admin/admin remains active. Create a real admin ASAP."
   fi
-  chown "$DASH_USER": "$ETC/dash-users.json" "$ETC/dashboard.env" 2>/dev/null || true
+  chown "$DASH_USER": "$ETC/dashboard.env" 2>/dev/null || true   # dash-users.json is in DATA_DIR (chowned below)
   chown -R "$DASH_USER": "$DATA_DIR"
+
+  # Prometheus — the dashboard's data views query it (PROM_URL=:9091). Without a
+  # Prometheus serving that port, every data panel returns HTTP 502. Install it
+  # and scrape the agent's /metrics, listening where the dashboard expects.
+  if ss -ltn 2>/dev/null | grep -q ":9091"; then
+    ok "prometheus already listening on :9091"
+  elif apt-get install -y -qq prometheus >/dev/null 2>&1 || command -v prometheus >/dev/null 2>&1; then
+    install -d -m0755 /etc/prometheus
+    cat > /etc/prometheus/prometheus.yml <<'PROMEOF'
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+  - job_name: xdp-sentinel-agent
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+PROMEOF
+    if [ -f /etc/default/prometheus ]; then
+      sed -i 's#^ARGS=.*#ARGS="--web.listen-address=127.0.0.1:9091"#' /etc/default/prometheus
+      grep -q "web.listen-address" /etc/default/prometheus || printf 'ARGS="--web.listen-address=127.0.0.1:9091"\n' >> /etc/default/prometheus
+    else
+      printf 'ARGS="--web.listen-address=127.0.0.1:9091"\n' > /etc/default/prometheus
+    fi
+    systemctl enable --now prometheus >/dev/null 2>&1 || true
+    systemctl restart prometheus >/dev/null 2>&1 || true
+    sleep 1
+    ss -ltn 2>/dev/null | grep -q ":9091" && ok "prometheus on 127.0.0.1:9091 (scraping the agent)" \
+      || warn "prometheus installed but :9091 not up yet — check 'journalctl -u prometheus'"
+  else
+    warn "prometheus not available via apt — dashboard data panels will 502 until a Prometheus serves :9091 (see deploy/monitoring/)."
+  fi
 
   cat > "$UNIT_DIR/xdp-dashboard.service" <<EOF
 [Unit]
@@ -708,6 +786,39 @@ if [ "$WITH_HTTPS" = yes ] && [ -f "$UNIT_DIR/xdp-dashboard.service" ]; then
     || warn "HTTPS setup reported a problem; dashboard still reachable on http://…:$DASH_PORT"
 fi
 
+# ---- opt-in Docker components ----------------------------------------------
+# Only runs when selected; installs Docker on demand and never fails the core.
+CH_STARTED=no; MON_STARTED=no
+if [ "$WITH_CLICKHOUSE" = yes ] || [ "$WITH_MONITORING" = yes ]; then
+  say "9b   Docker components (opt-in)"
+  if ensure_docker; then
+    if [ "$WITH_CLICKHOUSE" = yes ]; then
+      CHDIR="$REPO_ROOT/deploy/clickhouse"
+      if [ -f "$CHDIR/docker-compose.yml" ]; then
+        [ -f "$CHDIR/.env" ] || { umask 077; printf 'CLICKHOUSE_PASSWORD=%s\n' "$(head -c18 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$CHDIR/.env"; }
+        if ( cd "$CHDIR" && $DOCKER_COMPOSE up -d >/dev/null 2>&1 ); then
+          CH_STARTED=yes
+          # Apply the schema (best-effort; the store is optional for the dashboard).
+          CHPW="$(sed -n 's/^CLICKHOUSE_PASSWORD=//p' "$CHDIR/.env")"
+          [ -f "$CHDIR/schema.sql" ] && ( cd "$CHDIR" && $DOCKER_COMPOSE exec -T clickhouse clickhouse-client --user xs --password "$CHPW" --multiquery < schema.sql >/dev/null 2>&1 ) || true
+          ok "ClickHouse up (127.0.0.1:8123/9000; password in $CHDIR/.env) — optional, not required by the dashboard"
+        else warn "ClickHouse compose failed to start (see 'docker compose -f $CHDIR/docker-compose.yml logs')"; fi
+      else warn "no $CHDIR/docker-compose.yml"; fi
+    fi
+    if [ "$WITH_MONITORING" = yes ]; then
+      MONDIR="$REPO_ROOT/deploy/monitoring"
+      if [ -f "$MONDIR/docker-compose.yml" ]; then
+        [ -f "$MONDIR/.env" ] || { umask 077; printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$(head -c18 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$MONDIR/.env"; }
+        if ( cd "$MONDIR" && $DOCKER_COMPOSE up -d >/dev/null 2>&1 ); then
+          MON_STARTED=yes; ok "Grafana monitoring up (admin password in $MONDIR/.env). The dashboard still uses native Prometheus."
+        else warn "monitoring compose failed to start (see 'docker compose -f $MONDIR/docker-compose.yml logs')"; fi
+      else warn "no $MONDIR/docker-compose.yml"; fi
+    fi
+  else
+    warn "Docker unavailable — skipping ClickHouse/Grafana (the core install and dashboard are unaffected)."
+  fi
+fi
+
 # =============================================================================
 say "10/10 Summary"
 # =============================================================================
@@ -718,6 +829,12 @@ if [ -f "$UNIT_DIR/xdp-dashboard.service" ]; then
   if [ "$WITH_HTTPS" = yes ]; then echo "   dashboard : $(systemctl is-active xdp-dashboard)  ->  https://${MGMT_IPS%%,*}:$TLS_PORT/analytics  (self-signed)"
   else echo "   dashboard : $(systemctl is-active xdp-dashboard)  ->  http://${MGMT_IPS%%,*}:$DASH_PORT/analytics"; fi
 fi
+echo "   models    : $(find "$OBJ_DIR/models" -name model.json 2>/dev/null | wc -l | tr -d ' ') loaded from $OBJ_DIR/models  ($(journalctl -u sentinel-agent -n 50 --no-pager 2>/dev/null | grep -oE 'classifier [a-z0-9]+; anomaly model [a-z0-9]+' | tail -1))"
+echo "   prometheus: $(ss -ltn 2>/dev/null | grep -q ':9091' && echo 'up on 127.0.0.1:9091' || echo 'NOT on :9091 — dashboard data will 502')"
+[ "$WITH_HTTPS" = yes ] && echo "   tls cert  : trust it from  https://${MGMT_IPS%%,*}:$TLS_PORT/dashboard-cert.crt"
+[ "$CH_STARTED" = yes ] && echo "   clickhouse: up (Docker) 127.0.0.1:8123/9000"
+[ "$MON_STARTED" = yes ] && echo "   grafana   : up (Docker) — see deploy/monitoring/.env for the admin password"
+echo "   systemd   : $(systemctl list-unit-files 2>/dev/null | grep -c 'xdp-sentinel\|sentinel-agent') xdp-sentinel units installed"
 echo "   config    : $ETC/config.toml   data: $DATA_DIR"
 [ -x "$PREFIX_BIN/xs-pentest" ] && echo "   pentest   : 'xs-pentest --coverage' (safe), 'sudo xs-pentest --run' (full suite)"
 echo

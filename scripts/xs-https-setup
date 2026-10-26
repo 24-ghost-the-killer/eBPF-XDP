@@ -82,6 +82,19 @@ else
   fi
 fi
 
+# ---- trust on the box + publish the cert for clients ------------------------
+# Add the cert to the box's own trust store (local curl/health checks stop
+# warning). A remote browser still can't trust a self-signed cert until it's
+# imported on THAT device — no server change can do that for it.
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  install -m0644 "$CERT" /usr/local/share/ca-certificates/xdp-sentinel-dashboard.crt 2>/dev/null \
+    && update-ca-certificates >/dev/null 2>&1 && ok "cert trusted on the box" || true
+fi
+
+# Public origin + upstream port, used to rewrite the app's absolute redirects.
+UP_PORT="${UPSTREAM##*:}"
+if [ "$PORT" = 443 ]; then PUB_ORIGIN='https://$host/'; else PUB_ORIGIN="https://\$host:$PORT/"; fi
+
 # ---- nginx site -------------------------------------------------------------
 SITE=/etc/nginx/sites-available/xdp-sentinel
 cat > "$SITE" <<EOF
@@ -110,10 +123,20 @@ server {
         proxy_set_header X-Real-IP          \$remote_addr;
         proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto  https;
+        proxy_set_header X-Forwarded-Host   \$host;
+        proxy_set_header X-Forwarded-Port   $PORT;
+        # The app can emit absolute redirects to its internal upstream port (e.g.
+        # the login redirect). Rewrite them to the public TLS origin, or the
+        # browser is sent to an unreachable :$UP_PORT URL and the page hangs.
+        proxy_redirect https://\$host:$UP_PORT/ $PUB_ORIGIN;
+        proxy_redirect http://\$host:$UP_PORT/  $PUB_ORIGIN;
         # WebSocket / HMR upgrade
         proxy_set_header Upgrade            \$http_upgrade;
         proxy_set_header Connection         \$connection_upgrade;
     }
+
+    # Self-signed cert download, so clients can fetch + trust it in one step.
+    location = /dashboard-cert.crt { default_type application/x-x509-ca-cert; alias $CERT; }
 }
 EOF
 
@@ -140,5 +163,10 @@ warn "XDP lockout check: if the box's IP is protected (default-deny), open the T
 echo "   add 'tcp/$PORT' to DASH_PROTECT_LIFELINE (dashboard.env) and XS_PROTECT_LIFELINE (paths.env),"
 echo "   or run:  sudo sentinelctl service -i <iface> <box-ip> tcp $PORT   on each protected interface."
 echo
-info "self-signed cert will warn in the browser (expected on a LAN IP). To trust it,"
-info "import $CERT into your trust store, or use mkcert for a locally-trusted cert."
+info "Self-signed cert → the browser warns on a LAN IP until you trust it ONCE per device:"
+info "  download:  curl -k https://<box-ip>:$PORT/dashboard-cert.crt -o xdp-dashboard.crt"
+info "  macOS:     sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain xdp-dashboard.crt"
+info "  Linux:     sudo cp xdp-dashboard.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates"
+info "  Windows:   certutil -addstore -f Root xdp-dashboard.crt   (run as admin)"
+info "The cert's SAN already covers the box IP, so once trusted it validates cleanly."
+info "No server-side change can make a browser trust it automatically (that needs a public domain + CA)."
