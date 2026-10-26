@@ -171,8 +171,14 @@ provision_network() { # writes /etc/netplan + applies with auto-revert
     mapfile -t PHYS < <(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' \
       | grep -vxE 'lo|br0|docker0|vlan[0-9]+' | grep -vE '^(veth|br-)')
     [ "${#PHYS[@]}" -gt 0 ] || die "no physical NIC found to use as the VLAN trunk."
-    menu_single "Physical NIC that carries the VLAN trunk:" "${PHYS[@]}"
-    nic="$MENU_ONE"
+    info "Physical NICs available as the VLAN trunk:"
+    local pix=1 p
+    for p in "${PHYS[@]}"; do printf '     %2d) %s\n' "$pix" "$p" >&2; pix=$((pix+1)); done
+    read -r -p "   trunk NIC (number or name) [${PHYS[0]}]: " a </dev/tty || a=""
+    a="${a:-1}"
+    if [[ "$a" =~ ^[0-9]+$ ]]; then
+      local idx=$((a-1)); { [ "$idx" -ge 0 ] && [ "$idx" -lt "${#PHYS[@]}" ]; } || die "invalid number '$a'."; nic="${PHYS[$idx]}"
+    else nic="$a"; fi
   else
     die "network provisioning needs --trunk NIC in non-interactive mode."
   fi
@@ -410,10 +416,7 @@ else
   DO_NET=no
   if [ "$WITH_NETWORK" = yes ]; then DO_NET=yes
   elif [ "$TUI" = yes ]; then
-    menu_single "No VLAN/bridge network found. Set it up now (trunk + 2 VLANs + br0)?" \
-      "No — interfaces already exist / I'll configure networking myself" \
-      "Yes — provision the VLAN/bridge network now"
-    [ "$MENU_ONE" = "Yes — provision the VLAN/bridge network now" ] && DO_NET=yes
+    confirm "No VLAN/bridge network found. Set it up now (trunk + 2 VLANs + br0)?" && DO_NET=yes || DO_NET=no
   fi
   [ "$DO_NET" = yes ] && provision_network || info "skipping network provisioning"
 fi
@@ -445,25 +448,34 @@ if [ -n "$IFACES_SPEC" ]; then
 elif [ "$ASSUME_YES" = yes ]; then
   [ -n "$DEFAULT_SEL" ] || die "no --ifaces given and no sensible default; pass --ifaces."
   parse_ifaces "$DEFAULT_SEL"
-elif [ "$TUI" = yes ]; then
-  MENU_PRE=()
-  for tok in ${DEFAULT_SEL//,/ }; do MENU_PRE["${tok%%:*}"]=1; done
-  menu_multi "Select the interfaces the XDP dataplane attaches to:" "${CAND[@]}"
-  [ "${#MENU_RESULT[@]}" -gt 0 ] || die "no interfaces selected."
-  IFMODE=()
-  for n in "${MENU_RESULT[@]}"; do
-    menu_single "XDP mode for '$n'  (generic = always works; native = NIC driver, faster):" generic native
-    IFMODE["$n"]="$MENU_ONE"
-  done
 else
-  info "Detected interfaces:"
-  ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -vx lo | while read -r n; do
-    printf '     - %-14s %s\n' "$n" "$(ip -br addr show "$n" 2>/dev/null | awk '{$1=$1;print}')"
+  # Robust numbered text picker — always prints the list and reads one line, so
+  # it works over any SSH session / terminal (no arrow-key escape handling that
+  # can misbehave and leave the menu looking empty).
+  info "Interfaces detected on this box:"
+  ix=1
+  for n in "${CAND[@]}"; do
+    printf '     %2d) %-16s %s\n' "$ix" "$n" "$(ip -br addr show "$n" 2>/dev/null | sed -E 's/^[^ ]+ +[^ ]+ +//')"
+    ix=$((ix+1))
   done
-  info "Enter interfaces to protect (space/comma separated, name[:generic|native])."
-  info "VLAN sub-interfaces and veths support generic XDP only."
-  read -r -p "   interfaces [${DEFAULT_SEL:-none}]: " REPLY_IF </dev/tty
-  parse_ifaces "${REPLY_IF:-$DEFAULT_SEL}"
+  info "Type the NUMBERS or names to attach (space/comma separated)."
+  info "Append :native for native-driver XDP (default generic; VLANs/veths = generic only)."
+  info "Examples:  1 2   ·   vlan10:native,vlan20"
+  REPLY_IF=""
+  read -r -p "   interfaces [${DEFAULT_SEL:-none}]: " REPLY_IF </dev/tty || REPLY_IF=""
+  REPLY_IF="${REPLY_IF:-$DEFAULT_SEL}"
+  [ -n "$REPLY_IF" ] || die "no interfaces selected."
+  RESOLVED=""
+  for tok in ${REPLY_IF//,/ }; do
+    nm="${tok%%:*}"; md=""; [[ "$tok" == *:* ]] && md=":${tok#*:}"
+    if [[ "$nm" =~ ^[0-9]+$ ]]; then
+      idx=$((nm-1))
+      { [ "$idx" -ge 0 ] && [ "$idx" -lt "${#CAND[@]}" ]; } || die "invalid number '$nm' (pick 1-${#CAND[@]})."
+      nm="${CAND[$idx]}"
+    fi
+    RESOLVED="${RESOLVED:+$RESOLVED,}${nm}${md}"
+  done
+  parse_ifaces "$RESOLVED"
 fi
 [ "${#IFMODE[@]}" -gt 0 ] || die "no interfaces selected."
 for n in "${!IFMODE[@]}"; do
@@ -471,31 +483,23 @@ for n in "${!IFMODE[@]}"; do
 done
 info "will attach: $(for n in "${!IFMODE[@]}"; do printf '%s(%s) ' "$n" "${IFMODE[$n]}"; done)"
 
-# Optional components (arrow-driven when interactive).
+# Optional components — plain y/N prompts (no arrow menu).
 if [ "$TUI" = yes ] && [ -z "$IFACES_SPEC" ]; then
-  MENU_PRE=([Dashboard]=1 ["Dashboard over HTTPS (nginx TLS)"]=1)
-  menu_multi "Optional components to install:" "Dashboard" "Dashboard over HTTPS (nginx TLS)" "Twingate through-XDP" "ufw → allowlist sync"
-  WITH_DASHBOARD=no; WITH_HTTPS=no; WITH_TWINGATE=no; WITH_UFW_SYNC=no
-  for sel in "${MENU_RESULT[@]}"; do
-    case "$sel" in
-      Dashboard) WITH_DASHBOARD=yes;;
-      "Dashboard over HTTPS"*) WITH_HTTPS=yes;;
-      "Twingate through-XDP") WITH_TWINGATE=yes;;
-      "ufw"*) WITH_UFW_SYNC=yes;;
-    esac
-  done
-  [ "$WITH_HTTPS" = yes ] && [ "$WITH_DASHBOARD" = no ] && { warn "HTTPS needs the dashboard — enabling it too."; WITH_DASHBOARD=yes; }
+  say "Optional components"
+  confirm "Install the dashboard (web UI on :$DASH_PORT)?" && WITH_DASHBOARD=yes || WITH_DASHBOARD=no
+  if [ "$WITH_DASHBOARD" = yes ]; then
+    confirm "Serve the dashboard over HTTPS (nginx TLS proxy)?" && WITH_HTTPS=yes || WITH_HTTPS=no
+  else
+    WITH_HTTPS=no
+  fi
+  confirm "Route a Twingate connector container through XDP?" && WITH_TWINGATE=yes || WITH_TWINGATE=no
+  confirm "Install the ufw -> allowlist sync?" && WITH_UFW_SYNC=yes || WITH_UFW_SYNC=no
   if [ "$WITH_TWINGATE" = yes ] && [ -z "$TWINGATE_CONTAINER" ]; then
     read -r -p "   Twingate connector container name: " TWINGATE_CONTAINER </dev/tty
   fi
 fi
 
-if [ "$TUI" = yes ]; then
-  menu_single "Attach XDP and inspect traffic on: $(echo "${!IFMODE[@]}") — proceed?" "Yes, install now" "No, cancel"
-  [ "$MENU_ONE" = "Yes, install now" ] || die "aborted."
-else
-  confirm "Attaching XDP inspects traffic on these interfaces. Continue?" || die "aborted."
-fi
+confirm "Attach XDP and inspect traffic on: ${!IFMODE[*]} — continue?" || die "aborted."
 
 # Management IPs (kept on a lifeline so default-deny never cuts SSH/dashboard).
 if [ -z "$MGMT_IPS" ]; then
