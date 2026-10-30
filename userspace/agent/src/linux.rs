@@ -28,8 +28,8 @@ use xs_common::iforest::Forest;
 use xs_common::risk::{Evidence, RiskEngine};
 use xs_common::metrics::prometheus;
 use xs_common::pin::{
-    PinLayout, MAP_ATTACKER_V4, MAP_CONFIG, MAP_PROTECTED_V4, MAP_SERVICE_V4, MAP_STATS,
-    MAP_VICTIM_V4, PROG_NAME,
+    PinLayout, MAP_ATTACKER_V4, MAP_CONFIG, MAP_POLICY_V4, MAP_POLICY_V6, MAP_PROTECTED_V4,
+    MAP_SERVICE_V4, MAP_STATS, MAP_VICTIM_V4, PROG_NAME,
 };
 use xs_common::{Config as DpConfig, ConfigFlags, Snapshot};
 
@@ -42,6 +42,39 @@ static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: i32) {
     STOP.store(true, Ordering::SeqCst);
+}
+
+/// CLOCK_MONOTONIC in ns — the same clock the dataplane's `bpf_ktime_get_ns()`
+/// reads, so a policy's `expires_ns` means the same thing on both sides.
+fn now_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: CLOCK_MONOTONIC is a valid clock id and &mut ts is writable.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
+}
+
+/// Reclaim expired entries from one per-source policy map (plain HASH, so they
+/// never auto-evict). Expiry is ALSO enforced in-kernel — an entry past its
+/// deadline is already inert — so this only frees map slots; it never changes a
+/// verdict. `expires_ns` is the first 8 bytes of `struct xs_policy` (native
+/// endian); 0 means "never expires". Returns the number deleted.
+fn gc_policy_map(path: &Path, now: u64) -> usize {
+    let Ok(map) = MapHandle::from_pinned_path(path) else { return 0 };
+    // Collect first, then delete, so we never delete the key the iterator is on.
+    let mut expired: Vec<Vec<u8>> = Vec::new();
+    for key in map.keys() {
+        if let Ok(Some(val)) = map.lookup(&key, MapFlags::ANY) {
+            if val.len() >= 8 {
+                let exp = u64::from_ne_bytes(val[0..8].try_into().unwrap());
+                if exp != 0 && exp < now {
+                    expired.push(key);
+                }
+            }
+        }
+    }
+    expired.iter().filter(|k| map.delete(k).is_ok()).count()
 }
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -1311,6 +1344,34 @@ fn serve(cfg: &Config) -> Result<()> {
                     *g = result;
                 }
                 thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    // Background GC: every ~60s, reclaim expired per-source policy entries.
+    // These maps are plain HASH (no LRU), so expired blocks would otherwise sit
+    // until the map fills. Expiry is enforced in-kernel regardless; this only
+    // frees slots. Best-effort — failures are logged and ignored.
+    {
+        let ifaces: Vec<String> = cfg.interfaces.iter().map(|i| i.name.clone()).collect();
+        let pin_root = cfg.pin_root.clone();
+        thread::spawn(move || {
+            while !STOP.load(Ordering::SeqCst) {
+                for _ in 0..60 {
+                    if STOP.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                let now = now_monotonic_ns();
+                for name in &ifaces {
+                    let Ok(layout) = PinLayout::new(&pin_root, name) else { continue };
+                    let n = gc_policy_map(&layout.map(MAP_POLICY_V4), now)
+                        + gc_policy_map(&layout.map(MAP_POLICY_V6), now);
+                    if n > 0 {
+                        eprintln!("policy-gc {name}: removed {n} expired entrie(s)");
+                    }
+                }
             }
         });
     }

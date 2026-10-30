@@ -216,6 +216,10 @@ int xs_xdp_main(struct xdp_md *ctx)
 				     : xs_rl_params_of(0, 0);
 	struct xs_rl_params grl = cfg ? xs_rl_params_of(cfg->global_rl_interval_ns, cfg->global_rl_burst)
 				      : xs_rl_params_of(0, 0);
+	/* One monotonic clock read per packet, shared by the policy stage,
+	 * conntrack, the aggregate rate limiter and the sampler. Reading it once
+	 * is cheaper on the armed hot path and keeps the stages time-consistent. */
+	__u64 now = bpf_ktime_get_ns();
 
 	xs_count(st, XS_CNT_RX, len);
 
@@ -240,7 +244,7 @@ int xs_xdp_main(struct xdp_md *ctx)
 	int decision = XS_POL_CONTINUE;
 
 	if (flags & (XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT))
-		decision = xs_policy_stage(st, &pkt, flags, &rl, bpf_ktime_get_ns(), len);
+		decision = xs_policy_stage(st, &pkt, flags, &rl, now, len);
 
 	/* Allowlisted (dynamic-exempt) sources are validity-checked but skip the
 	 * aggregate cap and conntrack drop, so the operator's own box is never cut
@@ -294,7 +298,7 @@ int xs_xdp_main(struct xdp_md *ctx)
 		 */
 		if (!exempt && verdict != XDP_DROP && (flags & XS_CFG_CONNTRACK) && rc == XS_PARSE_OK &&
 		    pkt.l4_parsed && pkt.l4_proto == XS_IPPROTO_TCP &&
-		    xs_conntrack_untracked(&pkt, bpf_ktime_get_ns())) {
+		    xs_conntrack_untracked(&pkt, now)) {
 			xs_count(st, XS_CNT_CT_UNTRACKED, len);
 			if (flags & XS_CFG_DROP_UNTRACKED)
 				verdict = XDP_DROP;
@@ -307,7 +311,7 @@ int xs_xdp_main(struct xdp_md *ctx)
 		 * Still counted as a rate-limiter drop.
 		 */
 		if (verdict != XDP_DROP && !exempt && (flags & XS_CFG_GLOBAL_RL) && grl.interval_ns &&
-		    rc == XS_PARSE_OK && xs_global_rl_drop(&grl, bpf_ktime_get_ns())) {
+		    rc == XS_PARSE_OK && xs_global_rl_drop(&grl, now)) {
 			xs_count(st, XS_CNT_RATE_LIMITED, len);
 			verdict = XDP_DROP;
 		}
@@ -321,7 +325,16 @@ int xs_xdp_main(struct xdp_md *ctx)
 	 * the control plane can name which host the flood was aimed at. IPv6 is
 	 * a later addition.
 	 */
-	if (verdict == XDP_DROP && pkt.l3 == XS_L3_IPV4) {
+	/*
+	 * Sample the per-IP attribution maps: credit victim/attacker on ~1/16 of
+	 * drops instead of every one, so a fully source-spoofed flood no longer
+	 * does an LRU insert+evict per packet on the drop fast path. The exact
+	 * per-CPU drop/byte totals above are untouched; top-talker ranking is
+	 * statistical and unaffected by 16x downsampling. (The VERDICT_DROP counter
+	 * was just incremented, so its low nibble cycles 0..15 across drops.)
+	 */
+	if (verdict == XDP_DROP && pkt.l3 == XS_L3_IPV4 &&
+	    (st->c[XS_CNT_VERDICT_DROP].packets & 0xF) == 0) {
 		__be32 dkey = pkt.daddr.v4;
 		struct xs_victim *v = bpf_map_lookup_elem(&xs_victim_v4, &dkey);
 		__be32 skey = pkt.saddr.v4;
@@ -356,7 +369,7 @@ int xs_xdp_main(struct xdp_md *ctx)
 		if (flags & XS_CFG_DPORT_HIST)
 			xs_dport_bump(&pkt);
 		if (flags & XS_CFG_SAMPLING)
-			xs_maybe_sample(&pkt, sample_shift, bpf_ktime_get_ns(), verdict, rc, len);
+			xs_maybe_sample(&pkt, sample_shift, now, verdict, rc, len);
 	}
 	return verdict;
 }
