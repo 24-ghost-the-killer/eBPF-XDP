@@ -1,0 +1,20 @@
+# Auto-tunes the host NIC for xdp-sentinel. AUTO-DETECTS the NIC type and applies
+# the right RX core-spreading with no manual choice:
+#   * multi-queue NIC  -> HARDWARE RSS (combined queues + per-IRQ core pinning)
+#   * single-queue NIC -> SOFTWARE RSS via RPS
+# plus reserves 1 core for the control plane and pins the agent to it, so an RX
+# flood can never starve detection / SSH / the dashboard. See scripts/tune_host.sh.
+[Unit]
+Description=xdp-sentinel host/NIC auto-tune (auto RSS vs RPS + core reservation)
+# After the agent so the managed interfaces exist and --pin-agent can find it.
+After=sentinel-agent.service network-online.target sys-fs-bpf.mount
+Wants=sentinel-agent.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# tune_host.sh decides HARDWARE RSS vs RPS by probing the NIC; nothing to choose.
+ExecStart=/usr/local/sbin/tune_host.sh --reserve-cores 1 --pin-agent
+
+[Install]
+WantedBy=multi-user.target

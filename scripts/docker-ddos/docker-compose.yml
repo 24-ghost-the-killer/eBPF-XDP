@@ -1,0 +1,27 @@
+# Containerized multi-source UDP DDoS simulator for xdp-sentinel.
+#
+# Each `attacker` replica runs the raw-socket flood engine, emitting a
+# random-source (spoofed) UDP flood out the test veth. Scale up for a bigger,
+# more distributed-looking attack:
+#
+#     docker compose up --scale attacker=8
+#
+# network_mode: host so the container can raw-send on the host's test veth
+# (veth-xs1). NET_RAW/NET_ADMIN for AF_PACKET. It targets ONLY the isolated
+# veth — never a production interface. Driven by scripts/ddos-test.sh, which
+# sets up the veth + the XDP program + a dedicated agent first.
+services:
+  attacker:
+    image: ${ATK_IMAGE:-python:3.14.7-alpine3.24}
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./e2e_flood.py:/e2e_flood.py:ro
+      - ${XS_PENTEST_DIR:-/home/test_server/xs-verify/pentest}:/pentest:ro
+    environment:
+      XS_PENTEST_DIR: /pentest
+      XS_VICTIM: ${XS_VICTIM:-10.123.0.2}
+    command: ["python3", "/e2e_flood.py", "${ATK_IFACE:-veth-xs1}", "${ATK_VECTOR:-udp_flood}", "${DUR:-20}"]
+    restart: "no"

@@ -777,6 +777,7 @@ struct Analysis {
     risk_level: f64,
     state: u8, // 0 normal, 1 suspect, 2 under attack
     // auto-mitigation (Phase 13 enforcement)
+    auto_enabled: bool, // false = detect-only (mitigation DISARMED); surfaced loudly
     mit_active: bool,
     mit_pps: f64,      // per-source rate limit currently applied (0 = none)
     auto_actions: u64, // cumulative auto-mitigation changes applied
@@ -837,6 +838,22 @@ fn parse_steady_drops() -> u32 {
     }
 }
 
+/// Whether auto-mitigation is enabled, given the raw `XS_AUTO_MITIGATE` value.
+///
+/// Default is ON (opt-out): unset, empty, or any value other than an explicit
+/// disable word enables enforcement. Only `0/false/off/no` (any case, trimmed)
+/// disarm it. A DDoS appliance must block by default; detect-only is opt-in and
+/// surfaced loudly (startup warning + `xs_mitigation_disarmed=1`).
+fn auto_mitigate_enabled(var: Option<&str>) -> bool {
+    match var {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
 impl Analyzer {
     fn new() -> Self {
         let dir = model_dir();
@@ -849,7 +866,19 @@ impl Analyzer {
             .ok()
             .and_then(|b| Forest::from_json(&b).ok())
             .filter(|m| m.schema_hash() == want);
-        let auto = std::env::var("XS_AUTO_MITIGATE").map(|v| v == "1" || v == "true").unwrap_or(false);
+        // Auto-mitigation is ON by default (opt-OUT): a DDoS appliance that
+        // detects but never blocks until an operator flips a flag is a silent
+        // production failure ("detected, 0% blocked"). Set XS_AUTO_MITIGATE=0
+        // (or false/off/no) to deliberately run detect-only; any other value,
+        // or unset, enables enforcement. When disarmed we say so LOUDLY here and
+        // expose xs_mitigation_disarmed=1 so detect-only mode can never be silent.
+        let auto = auto_mitigate_enabled(std::env::var("XS_AUTO_MITIGATE").ok().as_deref());
+        if !auto {
+            eprintln!(
+                "WARNING: auto-mitigation DISARMED (XS_AUTO_MITIGATE=0) -- attacks will be \
+                 DETECTED but NOT blocked until flags are set manually. xs_mitigation_disarmed=1."
+            );
+        }
         let steady_drops = parse_steady_drops();
         let steady_names: Vec<&str> = ConfigFlags::NAMES
             .iter()
@@ -1070,7 +1099,7 @@ impl Analyzer {
 
     /// Run one analysis window for `iface`; returns the latest scores.
     fn step(&mut self, iface: &str, pin_root: &Path) -> Analysis {
-        let none = Analysis { iface: iface.into(), ..Default::default() };
+        let none = Analysis { iface: iface.into(), auto_enabled: self.auto, ..Default::default() };
         let Ok(layout) = PinLayout::new(pin_root, iface) else { return none };
         let Ok(snap) = read_snapshot(iface, &layout) else { return none };
         let now = Instant::now();
@@ -1211,6 +1240,7 @@ impl Analyzer {
             risk: decision.risk,
             risk_level: level as f64,
             state,
+            auto_enabled: self.auto,
             mit_active,
             mit_pps,
             auto_actions: self.auto_actions,
@@ -1272,6 +1302,9 @@ fn render_analysis(a: &Analysis) -> String {
           if a.detection_type.is_empty() { 0.0 } else { 1.0 });
     gauge(&mut s, &il, "xs_mitigation_active", "1 while auto-mitigation is applied, else 0.",
           if a.mit_active { 1.0 } else { 0.0 });
+    gauge(&mut s, &il, "xs_mitigation_disarmed",
+          "1 when auto-mitigation is OFF (detect-only): attacks are detected but NOT blocked.",
+          if a.auto_enabled { 0.0 } else { 1.0 });
     gauge(&mut s, &il, "xs_mitigation_rate_pps",
           "Per-source rate limit the risk engine currently enforces (0 = none).", a.mit_pps);
     s.push_str("# HELP xs_auto_actions_total Auto-mitigation changes applied since start.\n");
@@ -1447,4 +1480,31 @@ fn handle(
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod f1_tests {
+    use super::auto_mitigate_enabled;
+
+    #[test]
+    fn auto_mitigation_defaults_on_when_unset_or_empty() {
+        // F1: a DDoS appliance must block by default. Unset => enforce.
+        assert!(auto_mitigate_enabled(None));
+        assert!(auto_mitigate_enabled(Some("")));
+        assert!(auto_mitigate_enabled(Some("   ")));
+    }
+
+    #[test]
+    fn explicit_enable_values_enable() {
+        for v in ["1", "true", "TRUE", "yes", "on", "anything"] {
+            assert!(auto_mitigate_enabled(Some(v)), "{v} should enable");
+        }
+    }
+
+    #[test]
+    fn only_explicit_disable_words_disarm() {
+        for v in ["0", "false", "FALSE", "off", "no", " No ", "OFF"] {
+            assert!(!auto_mitigate_enabled(Some(v)), "{v} should disarm");
+        }
+    }
 }

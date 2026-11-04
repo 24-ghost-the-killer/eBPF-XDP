@@ -16,11 +16,25 @@
 # help, and the NIC steps light up automatically on an Intel/Mellanox NIC in
 # native XDP mode.
 #
+# RX core-spreading is AUTO-DETECTED per NIC:
+#   * multi-queue NIC (ethtool reports Combined > 1): HARDWARE RSS — set the
+#     combined channel count and pin each RX IRQ to its own core, so XDP runs in
+#     parallel across cores.
+#   * single-queue NIC (e.g. the r8169 here): SOFTWARE RSS via RPS — spread the
+#     one queue's RX softirq across cores in sysfs. (Note: on a 1 GbE link the
+#     per-core ceiling already exceeds the ~1.49 Mpps the link can deliver, so
+#     this mostly buys management-plane isolation, not more throughput.)
+# Either way, --reserve-cores N keeps the top N cores off the RX set so the
+# control plane (agent, SSH, dashboard) has dedicated CPU under a flood;
+# --pin-agent also taskset-pins the running agent onto those reserved cores.
+#
 # Usage:
-#   sudo bash scripts/tune_host.sh                 # tune the agent's interfaces
-#   sudo bash scripts/tune_host.sh --iface enp1s0  # tune a specific NIC
-#   sudo bash scripts/tune_host.sh --pin-irqs      # also pin NIC IRQs to CPUs
-#   sudo bash scripts/tune_host.sh --revert        # remove the sysctl drop-in
+#   sudo bash scripts/tune_host.sh                      # tune + auto RSS/RPS, reserve 1 core
+#   sudo bash scripts/tune_host.sh --iface enp1s0
+#   sudo bash scripts/tune_host.sh --reserve-cores 2    # keep 2 cores for the control plane
+#   sudo bash scripts/tune_host.sh --pin-agent          # also pin the agent to the reserved cores
+#   sudo bash scripts/tune_host.sh --no-rxspread        # skip RSS/RPS core-spreading
+#   sudo bash scripts/tune_host.sh --revert             # remove the sysctl drop-in
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -29,6 +43,9 @@ CONFIG=${XS_CONFIG:-/etc/xdp-sentinel/config.toml}
 IFACES=()
 PIN_IRQS=no
 REVERT=no
+RESERVE=1          # cores kept off the RX set for the control plane
+PIN_AGENT=no
+RXSPREAD=yes       # auto RSS (multi-queue) or RPS (single-queue)
 
 c(){ printf '\033[%sm' "$1"; }
 info(){ printf '   %s\n' "$*"; }
@@ -40,13 +57,17 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --iface) IFACES+=("$2"); shift 2;;
     --pin-irqs) PIN_IRQS=yes; shift;;
+    --reserve-cores) RESERVE="$2"; shift 2;;
+    --pin-agent) PIN_AGENT=yes; shift;;
+    --no-rxspread) RXSPREAD=no; shift;;
     --revert) REVERT=yes; shift;;
-    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1";;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)."
+case "$RESERVE" in ''|*[!0-9]*) die "--reserve-cores must be a non-negative integer";; esac
 
 if [ "$REVERT" = yes ]; then
   rm -f "$SYSCTL_FILE" && sysctl --system >/dev/null 2>&1 || true
@@ -105,11 +126,11 @@ for IF in "${IFACES[@]}"; do
   printf '\n%s== NIC: %s ==%s\n' "$(c '1;36')" "$PHY" "$(c 0)"
 
   # Driver + XDP capability note.
-  drv="$(ethtool -i "$PHY" 2>/dev/null | awk -F': ' '/^driver/{print $2}')"
+  drv="$(ethtool -i "$PHY" 2>/dev/null | awk -F': ' '/^driver/{print $2}' || true)"
   info "driver: ${drv:-unknown}  (native XDP + RSS/IRQ tuning apply mostly to ixgbe/i40e/mlx5)"
 
   # 2a. Maximize RX/TX ring buffers to the hardware max.
-  rxmax="$(ethtool -g "$PHY" 2>/dev/null | awk '/^RX:/{print $2; exit}')"
+  rxmax="$(ethtool -g "$PHY" 2>/dev/null | awk '/^RX:/{print $2; exit}' || true)"
   if [ -n "${rxmax:-}" ] && [ "$rxmax" -gt 0 ] 2>/dev/null; then
     ethtool -G "$PHY" rx "$rxmax" tx "$rxmax" 2>/dev/null \
       && ok "$PHY: RX/TX rings -> $rxmax" \
@@ -118,14 +139,53 @@ for IF in "${IFACES[@]}"; do
     info "$PHY: ring resize unsupported (common on r8169) — skipped"
   fi
 
-  # 2b. Enable all RSS combined channels (spread RX across CPUs).
-  chmax="$(ethtool -l "$PHY" 2>/dev/null | awk '/^Combined:/{print $2; exit}')"
-  if [ -n "${chmax:-}" ] && [ "$chmax" -gt 1 ] 2>/dev/null; then
-    ethtool -L "$PHY" combined "$chmax" 2>/dev/null \
-      && ok "$PHY: RSS combined channels -> $chmax" \
-      || warn "$PHY: could not set channels"
+  # 2b. RX core-spreading — AUTO: hardware RSS on a multi-queue NIC, software
+  #     RPS on a single-queue NIC. Reserve the top $RESERVE core(s) so the RX
+  #     set is cores 0..usable-1 and the control plane keeps dedicated CPU.
+  if [ "$RXSPREAD" = yes ]; then
+    ncpu="$(nproc)"
+    res=$RESERVE
+    if [ "$res" -ge "$ncpu" ]; then res=$((ncpu - 1)); fi
+    usable=$((ncpu - res)); if [ "$usable" -lt 1 ]; then usable=1; fi
+    mask=$(printf '%x' $(( (1 << usable) - 1 )))   # CPU mask for cores 0..usable-1
+    chmax="$(ethtool -l "$PHY" 2>/dev/null | awk '/^Combined:/{print $2; exit}' || true)"
+    if [ -n "${chmax:-}" ] && [ "$chmax" -gt 1 ] 2>/dev/null; then
+      # ---- multi-queue: HARDWARE RSS ----
+      want=$usable; if [ "$want" -gt "$chmax" ]; then want=$chmax; fi
+      if ethtool -L "$PHY" combined "$want" 2>/dev/null; then
+        ok "$PHY: multi-queue NIC detected -> HARDWARE RSS, $want queues (reserved $res core(s))"
+      else
+        warn "$PHY: multi-queue, but could not set combined channels"
+      fi
+      systemctl stop irqbalance 2>/dev/null || true
+      systemctl disable irqbalance 2>/dev/null || true
+      cpu=0
+      for irq in $(awk -v d="$PHY" '$0 ~ d {gsub(":","",$1); print $1}' /proc/interrupts); do
+        printf '%x' $((1 << (cpu % usable))) > "/proc/irq/$irq/smp_affinity" 2>/dev/null \
+          && info "$PHY irq $irq -> cpu $((cpu % usable))" || true
+        cpu=$((cpu + 1))
+      done
+    else
+      # ---- single-queue: SOFTWARE RSS via RPS ----
+      n=0
+      for q in /sys/class/net/"$PHY"/queues/rx-*/rps_cpus; do
+        [ -e "$q" ] || continue
+        if echo "$mask" > "$q" 2>/dev/null; then n=$((n + 1)); fi
+      done
+      echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+      for q in /sys/class/net/"$PHY"/queues/rx-*/rps_flow_cnt; do echo 4096 > "$q" 2>/dev/null || true; done
+      for irq in $(awk -v d="$PHY" '$0 ~ d {gsub(":","",$1); print $1}' /proc/interrupts); do
+        echo 0 > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
+      done
+      if [ "$n" -gt 0 ]; then
+        ok "$PHY: single-queue NIC detected -> SOFTWARE RSS (RPS) across cores 0-$((usable - 1)) on $n queue(s) (reserved $res core(s))"
+        [ "$usable" -lt "$ncpu" ] || info "$PHY: tip — pass --reserve-cores 1 to keep a core free for the control plane"
+      else
+        info "$PHY: single-queue and RPS unavailable — skipped"
+      fi
+    fi
   else
-    info "$PHY: single-queue / no RSS (common on r8169) — skipped"
+    info "$PHY: RX core-spreading disabled (--no-rxspread)"
   fi
 
   # 2c. Offloads that get in XDP's way: GRO/LRO coalesce frames and hide per-
@@ -157,6 +217,32 @@ if [ "$PIN_IRQS" = yes ]; then
   fi
 fi
 
+# =============================================================================
+# 4. Reserve core(s) for the control plane: pin the running agent onto the top
+#    $RESERVE core(s) (the ones kept off the RX set above), so a flood's RX
+#    softirq can never starve detection / SSH / the dashboard.
+# =============================================================================
+if [ "$PIN_AGENT" = yes ]; then
+  ncpu="$(nproc)"; res=$RESERVE
+  if [ "$res" -ge "$ncpu" ]; then res=$((ncpu - 1)); fi
+  if [ "$res" -lt 1 ]; then
+    warn "--pin-agent: nothing reserved (--reserve-cores 0); skipping agent pin."
+  elif ! command -v taskset >/dev/null; then
+    warn "--pin-agent: taskset not installed (apt install util-linux)."
+  else
+    lo=$((ncpu - res)); hi=$((ncpu - 1))
+    apid="$(pgrep -f 'sentinel-agent --config' | head -1 || true)"
+    if [ -n "${apid:-}" ]; then
+      taskset -pc "$lo-$hi" "$apid" >/dev/null 2>&1 \
+        && ok "pinned agent (pid $apid) -> reserved core(s) $lo-$hi" \
+        || warn "could not pin agent pid $apid"
+      info "to persist, add 'CPUAffinity=$lo-$hi' to the agent's systemd unit [Service] section"
+    else
+      warn "--pin-agent: no running 'sentinel-agent --config ...' process found."
+    fi
+  fi
+fi
+
 echo
-ok "host tuning done. sysctls persist via $SYSCTL_FILE; NIC ring/RSS/IRQ changes reset on reboot."
+ok "host tuning done. sysctls persist via $SYSCTL_FILE; NIC RSS/RPS/IRQ/affinity reset on reboot."
 info "Revert the sysctls with:  sudo bash scripts/tune_host.sh --revert"

@@ -1,0 +1,13 @@
+# Re-runs the host/NIC auto-tune periodically so the RX core-spreading stays
+# asserted and the agent stays pinned to its reserved core across agent
+# restarts (its PID changes on restart). Mirrors xs-baseline.timer.
+[Unit]
+Description=Periodic xdp-sentinel host/NIC auto-tune (re-assert RSS/RPS + agent pin)
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=5min
+Unit=xs-tune.service
+
+[Install]
+WantedBy=timers.target

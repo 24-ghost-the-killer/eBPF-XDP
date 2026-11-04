@@ -381,7 +381,7 @@ say "1/10 Build dependencies"
 if [ "$SKIP_DEPS" = yes ]; then
   info "skipping (--skip-deps)"
 else
-  PKGS=(clang llvm libbpf-dev libelf-dev zlib1g-dev pkg-config make bpftool)
+  PKGS=(clang llvm libbpf-dev libelf-dev zlib1g-dev pkg-config make bpftool ethtool)
   info "installing: ${PKGS[*]} (+ rust, node checked separately)"
   apt-get update -qq
   apt-get install -y -qq "${PKGS[@]}" >/dev/null
@@ -540,6 +540,9 @@ install -m0755 "$REPO_ROOT/target/release/sentinel-agent" "$PREFIX_BIN/sentinel-
 install -m0644 "$REPO_ROOT/ebpf/build/xdp_main.bpf.o"     "$OBJ_DIR/xdp_main.bpf.o"
 install -m0755 "$REPO_ROOT/scripts/xs-protect-apply"      "$PREFIX_BIN/xs-protect-apply"
 install -m0755 "$REPO_ROOT/scripts/xs-lockdown-apply"     "$PREFIX_BIN/xs-lockdown-apply"
+# Host/NIC auto-tuner (run on boot by xs-tune.service): auto-detects multi-queue
+# (hardware RSS) vs single-queue (software RPS), reserves a control-plane core.
+install -m0755 "$REPO_ROOT/scripts/tune_host.sh"          /usr/local/sbin/tune_host.sh
 [ "$WITH_TWINGATE" = yes ] && {
   install -m0755 "$REPO_ROOT/scripts/xs-twingate-attach"   "$PREFIX_BIN/xs-twingate-attach"
   install -m0755 "$REPO_ROOT/scripts/xs-twingate-watchdog" "$PREFIX_BIN/xs-twingate-watchdog"
@@ -773,6 +776,15 @@ for _ in $(seq 20); do [ -e "/sys/fs/bpf/xdp-sentinel/$FIRST_IF/xs_service_v4" ]
 systemctl enable --now xdp-sentinel-protect-apply.path
 systemctl enable --now xdp-sentinel-lockdown.path xdp-sentinel-lockdown.timer
 ok "protection + lockdown automation enabled"
+
+# NIC/host auto-tune: AUTO-DETECTS the NIC (multi-queue -> hardware RSS,
+# single-queue -> software RPS), reserves a control-plane core and pins the
+# agent to it, and applies the packet-absorption sysctls. Runs now + at every
+# boot + every 5 min (xs-tune.timer). Harmless/idempotent; best-effort per step.
+if [ -f "$UNIT_DIR/xs-tune.service" ] && [ -x /usr/local/sbin/tune_host.sh ]; then
+  systemctl enable --now xs-tune.service xs-tune.timer >/dev/null 2>&1 || true
+  ok "NIC/host auto-tune enabled ($(systemctl is-active xs-tune.service 2>/dev/null); auto RSS/RPS + reserved core)"
+fi
 if [ "$WITH_TWINGATE" = yes ] && [ -f "$UNIT_DIR/xdp-sentinel-twingate-attach.path" ]; then
   systemctl enable --now xdp-sentinel-twingate-attach.service xdp-sentinel-twingate-attach.path || true
   [ -f "$UNIT_DIR/xdp-sentinel-twingate-watchdog.timer" ] && systemctl enable --now xdp-sentinel-twingate-watchdog.timer || true
@@ -835,6 +847,9 @@ echo "   prometheus: $(ss -ltn 2>/dev/null | grep -q ':9091' && echo 'up on 127.
 [ "$CH_STARTED" = yes ] && echo "   clickhouse: up (Docker) 127.0.0.1:8123/9000"
 [ "$MON_STARTED" = yes ] && echo "   grafana   : up (Docker) — see deploy/monitoring/.env for the admin password"
 echo "   systemd   : $(systemctl list-unit-files 2>/dev/null | grep -c 'xdp-sentinel\|sentinel-agent') xdp-sentinel units installed"
+if systemctl is-enabled xs-tune.service >/dev/null 2>&1; then
+  echo "   nic tune  : $(journalctl -u xs-tune.service -n 20 --no-pager 2>/dev/null | grep -oE 'HARDWARE RSS|SOFTWARE RSS \(RPS\)' | tail -1 || echo enabled) (auto-detected; reserved 1 core)"
+fi
 echo "   config    : $ETC/config.toml   data: $DATA_DIR"
 [ -x "$PREFIX_BIN/xs-pentest" ] && echo "   pentest   : 'xs-pentest --coverage' (safe), 'sudo xs-pentest --run' (full suite)"
 echo
