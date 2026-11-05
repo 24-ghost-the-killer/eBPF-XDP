@@ -228,12 +228,18 @@ impl ConfigFlags {
     /// that no conforming stack emits. Operator-set via `sentinelctl config
     /// --drop-spoofed`; observe-only until enabled.
     pub const DROP_SPOOFED: ConfigFlags = ConfigFlags(1 << 21);
-    pub const KNOWN: u32 = 0b11_1111_1111_1111_1111_1111;
+    /// Automatic lockdown, owned by the agent's risk engine (NOT the operator).
+    /// Same datapath effect as LOCKDOWN (drop every IPv4 packet to a non-protected
+    /// internal destination) on a separate bit, so the agent can arm it and
+    /// auto-revert it when an attack leaks past all other mitigation, without ever
+    /// clobbering the operator/dashboard LOCKDOWN bit. Agent-managed, not operator.
+    pub const AUTO_LOCKDOWN: ConfigFlags = ConfigFlags(1 << 22);
+    pub const KNOWN: u32 = 0b1_11_1111_1111_1111_1111_1111;
     /// Bits an operator toggles directly (the rest are auto-managed).
     pub const OPERATOR: u32 = 0b11_0000_0000_0000_1000_1111;
 
     /// Names in bit order, used for display and the CLI.
-    pub const NAMES: [(ConfigFlags, &'static str); 22] = [
+    pub const NAMES: [(ConfigFlags, &'static str); 23] = [
         (Self::DROP_MALFORMED, "drop_malformed"),
         (Self::DROP_BAD_TCP_FLAGS, "drop_bad_tcp_flags"),
         (Self::DROP_FRAGMENTS, "drop_fragments"),
@@ -256,6 +262,7 @@ impl ConfigFlags {
         (Self::SERVICE_ALLOW, "service_allow"),
         (Self::LOCKDOWN, "lockdown"),
         (Self::DROP_SPOOFED, "drop_spoofed"),
+        (Self::AUTO_LOCKDOWN, "auto_lockdown"),
     ];
 
     /// Validate bits coming from an operator or API before they reach the
@@ -430,7 +437,7 @@ mod tests {
         let cfg = Config { abi_version: ABI_VERSION, flags, ..Default::default() };
         assert_eq!(Config::from_bytes(&cfg.to_bytes()).unwrap(), cfg);
         assert_eq!(flags.bits(), 0b101);
-        assert_eq!(ConfigFlags::from_bits(1 << 22), Err(AbiError::UnknownFlags(1 << 22)));
+        assert_eq!(ConfigFlags::from_bits(1 << 23), Err(AbiError::UnknownFlags(1 << 23)));
         assert!(Config::from_bytes(&[0u8; 8]).is_err());
         assert_eq!(format!("{:?}", flags), "drop_malformed|drop_fragments");
     }

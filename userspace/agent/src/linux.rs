@@ -178,8 +178,12 @@ fn restore_config(layout: &PinLayout) -> Result<()> {
 
     let managed = ConfigFlags::CHECK_ALLOW.bits() | ConfigFlags::CHECK_POLICY.bits()
             | ConfigFlags::SERVICE_ALLOW.bits() | ConfigFlags::LOCKDOWN.bits();
+    // AUTO_LOCKDOWN is agent-owned, never an operator/saved bit: force it off on
+    // restore so a crash or restart mid-lockdown can never leave default-deny
+    // latched with no agent running to revert it.
     let flags = ConfigFlags::from_bits_retain(
-        (saved.flags.bits() & !managed) | (current.flags.bits() & managed),
+        ((saved.flags.bits() & !managed) | (current.flags.bits() & managed))
+            & !ConfigFlags::AUTO_LOCKDOWN.bits(),
     );
     let new = DpConfig {
         abi_version: xs_common::abi::ABI_VERSION,
@@ -780,6 +784,7 @@ struct Analysis {
     auto_enabled: bool, // false = detect-only (mitigation DISARMED); surfaced loudly
     mit_active: bool,
     mit_pps: f64,      // per-source rate limit currently applied (0 = none)
+    auto_lockdown: bool, // agent-armed AUTO_LOCKDOWN active (default-deny kill-switch)
     auto_actions: u64, // cumulative auto-mitigation changes applied
     // multi-layer detection: state per layer [l2, l3, l4, l7] (0/1/2)
     layer_state: [u8; 4],
@@ -801,6 +806,12 @@ struct Analyzer {
     global_cap: u32,                // aggregate pps cap at full escalation (tunable)
     ct_enforce: bool,               // actually drop untracked TCP (else conntrack is shadow-only)
     steady_drops: u32,              // drop flags kept on at all risk levels (auto-managed)
+    // auto-lockdown (agent-armed default-deny kill-switch; opt-in)
+    auto_lockdown: bool,                      // feature enabled (XS_AUTO_LOCKDOWN)
+    auto_lockdown_leak: f64,                  // drop-ratio below which traffic is "leaking"
+    auto_lockdown_revert: std::time::Duration,// auto-revert window after the last leak
+    auto_lockdown_until: Option<Instant>,     // deadline the agent-armed lockdown lifts at
+    lockdown_on: bool,                        // last computed agent-lockdown state (for metrics)
     // multi-layer detector baseline over the LAYER_DEF rates
     layer_base: RobustBaseline,
 }
@@ -879,6 +890,16 @@ impl Analyzer {
                  DETECTED but NOT blocked until flags are set manually. xs_mitigation_disarmed=1."
             );
         }
+        let auto_lockdown = std::env::var("XS_AUTO_LOCKDOWN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if auto_lockdown {
+            eprintln!(
+                "auto-lockdown ARMED (XS_AUTO_LOCKDOWN=1): the agent will engage \
+                 default-deny (drop ALL non-protected internal IPv4) when an attack \
+                 leaks past all other mitigation, with auto-revert."
+            );
+        }
         let steady_drops = parse_steady_drops();
         let steady_names: Vec<&str> = ConfigFlags::NAMES
             .iter()
@@ -920,6 +941,29 @@ impl Analyzer {
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false),
             steady_drops,
+            // Auto-lockdown is OFF by default (opt-in): a default-deny kill-switch
+            // drops ALL non-protected internal IPv4 traffic, so it must be a
+            // deliberate choice. XS_AUTO_LOCKDOWN=1/true arms the agent to engage
+            // it automatically when an attack leaks past every other mitigation.
+            auto_lockdown,
+            // "Leaking" = at the top rung we are still passing more than this
+            // fraction of packets (i.e. drop_ratio below it). A matched flood sits
+            // near 1.0 dropped; an unmatched/spoofed leak stays low -- that's when
+            // only default-deny can reach 100%. Tunable via XS_AUTO_LOCKDOWN_LEAK.
+            auto_lockdown_leak: std::env::var("XS_AUTO_LOCKDOWN_LEAK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &f64| *v > 0.0 && *v < 1.0)
+                .unwrap_or(0.5),
+            auto_lockdown_revert: std::time::Duration::from_secs(
+                std::env::var("XS_AUTO_LOCKDOWN_REVERT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(120),
+            ),
+            auto_lockdown_until: None,
+            lockdown_on: false,
             layer_base: RobustBaseline::new(LAYER_DEF.len(), 256),
         }
     }
@@ -930,7 +974,7 @@ impl Analyzer {
     /// risk falls. Returns (applied_pps, active). The per-source limiter and
     /// the drop_udp ephemeral exemption keep the operator's own return traffic
     /// alive, so this cannot hard-lock the box.
-    fn enforce(&mut self, layout: &PinLayout, level: u8, dtype: &str) -> (f64, bool) {
+    fn enforce(&mut self, layout: &PinLayout, level: u8, dtype: &str, pps: f64, drop_ratio: f64) -> (f64, bool) {
         let Ok(map) = MapHandle::from_pinned_path(layout.map(MAP_CONFIG)) else { return (0.0, false) };
         let raw = map.lookup(&0u32.to_ne_bytes(), MapFlags::ANY).ok().flatten().unwrap_or_default();
         let cur = DpConfig::from_bytes(&raw).unwrap_or_default();
@@ -957,7 +1001,8 @@ impl Analyzer {
             // de-escalation always returns to a truly clean baseline.
             let auto_only = ConfigFlags::GLOBAL_RL.bits()
                 | ConfigFlags::DROP_UNTRACKED.bits()
-                | ConfigFlags::DROP_UDP_STRICT.bits();
+                | ConfigFlags::DROP_UDP_STRICT.bits()
+                | ConfigFlags::AUTO_LOCKDOWN.bits();
             b.flags = ConfigFlags::from_bits_retain(b.flags.bits() & !auto_only);
             b.global_rl_interval_ns = 0;
             b.global_rl_burst = 0;
@@ -1084,6 +1129,42 @@ impl Analyzer {
                 want.global_rl_burst = (global_pps / 10).max(50);
             }
         }
+        // Auto-lockdown (opt-in): last-resort default-deny when an attack leaks
+        // past everything else. "Leaking" = we are at the top rung AND still
+        // passing most packets (drop_ratio below the leak threshold) at real
+        // volume -- i.e. the categorical drops + rate limiters are NOT containing
+        // it (a novel class, or a fully source-spoofed flood). Only then does
+        // dropping ALL non-protected internal IPv4 buy a true 100%. We refresh an
+        // auto-revert deadline each window the leak persists; once it stops being
+        // refreshed the lockdown lifts on its own, so a misfire self-heals and can
+        // never strand the box. The operator's own LOCKDOWN bit is untouched.
+        let now = Instant::now();
+        let was_on = self.auto_lockdown_until.is_some_and(|t| now < t);
+        let leaking = level >= 5 && pps > 1000.0 && drop_ratio < self.auto_lockdown_leak;
+        if self.auto_lockdown && leaking {
+            self.auto_lockdown_until = Some(now + self.auto_lockdown_revert);
+        }
+        let lockdown_on = self.auto_lockdown_until.is_some_and(|t| now < t);
+        if !lockdown_on {
+            self.auto_lockdown_until = None;
+        }
+        if lockdown_on {
+            want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | ConfigFlags::AUTO_LOCKDOWN.bits());
+        }
+        self.lockdown_on = lockdown_on;
+        if lockdown_on && !was_on {
+            eprintln!(
+                "WARNING: AUTO-LOCKDOWN ARMED on {} -- attack leaking past mitigation \
+                 (level {level}, {dtype}, {pps:.0} pps, only {:.0}% dropped); now dropping ALL \
+                 non-protected internal IPv4 for up to {}s (auto-revert while the leak persists).",
+                layout.iface(), drop_ratio * 100.0, self.auto_lockdown_revert.as_secs(),
+            );
+        } else if !lockdown_on && was_on {
+            eprintln!(
+                "auto-lockdown LIFTED on {} (attack contained / revert window elapsed)",
+                layout.iface(),
+            );
+        }
         if want != cur {
             if map.update(&0u32.to_ne_bytes(), &want.to_bytes(), MapFlags::ANY).is_ok() {
                 self.auto_actions += 1;
@@ -1200,8 +1281,12 @@ impl Analyzer {
         };
 
         let level = decision.level as u8;
-        let (mit_pps, mit_active) =
-            if self.auto { self.enforce(&layout, level, &dtype) } else { (0.0, false) };
+        let (mit_pps, mit_active) = if self.auto {
+            self.enforce(&layout, level, &dtype, pps, drop_ratio)
+        } else {
+            self.lockdown_on = false;
+            (0.0, false)
+        };
 
         // Multi-layer detection: each layer's rates vs its robust baseline,
         // named by attack type. L7 (index 3) stays 0 here -- it needs
@@ -1243,6 +1328,7 @@ impl Analyzer {
             auto_enabled: self.auto,
             mit_active,
             mit_pps,
+            auto_lockdown: self.lockdown_on,
             auto_actions: self.auto_actions,
             layer_state,
             layer_dets,
@@ -1307,6 +1393,9 @@ fn render_analysis(a: &Analysis) -> String {
           if a.auto_enabled { 0.0 } else { 1.0 });
     gauge(&mut s, &il, "xs_mitigation_rate_pps",
           "Per-source rate limit the risk engine currently enforces (0 = none).", a.mit_pps);
+    gauge(&mut s, &il, "xs_auto_lockdown_active",
+          "1 while the agent has auto-armed default-deny lockdown (attack leaking past other mitigation), else 0.",
+          if a.auto_lockdown { 1.0 } else { 0.0 });
     s.push_str("# HELP xs_auto_actions_total Auto-mitigation changes applied since start.\n");
     s.push_str("# TYPE xs_auto_actions_total counter\n");
     s.push_str(&format!("xs_auto_actions_total{{{il}}} {}\n", a.auto_actions));

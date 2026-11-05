@@ -265,7 +265,7 @@ int xs_xdp_main(struct xdp_md *ctx)
 		 */
 		xs_count(st, XS_CNT_SERVICE_DENY, len);
 		verdict = XDP_DROP;
-	} else if (!exempt && (flags & XS_CFG_LOCKDOWN) && rc == XS_PARSE_OK &&
+	} else if (!exempt && (flags & (XS_CFG_LOCKDOWN | XS_CFG_AUTO_LOCKDOWN)) && rc == XS_PARSE_OK &&
 		   pkt.l3 == XS_L3_IPV4 && xs_dst_is_internal(&pkt) && !xs_is_protected(&pkt)) {
 		/*
 		 * Lockdown kill-switch: inside the internal network only protected

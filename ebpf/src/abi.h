@@ -209,6 +209,17 @@ enum xs_config_flags {
 	 * opt-in), so it never affects legitimate RFC1918 / link-local traffic.
 	 */
 	XS_CFG_DROP_SPOOFED       = 1u << 21,
+
+	/*
+	 * Automatic lockdown, owned by the agent's risk engine (NOT the operator).
+	 * Identical datapath effect to XS_CFG_LOCKDOWN -- every IPv4 packet to a
+	 * non-protected internal destination is dropped -- but kept on a separate
+	 * bit so the agent can arm and auto-revert it without ever clobbering the
+	 * operator's / dashboard's own LOCKDOWN bit. The agent arms it only when an
+	 * attack is leaking past all other mitigation (top of the ladder, still
+	 * passing most packets) and lifts it when the flood subsides.
+	 */
+	XS_CFG_AUTO_LOCKDOWN      = 1u << 22,
 };
 #define XS_CFG_KNOWN_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
 			    XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
@@ -216,7 +227,8 @@ enum xs_config_flags {
 			    XS_CFG_SAMPLING | XS_CFG_HLL | XS_CFG_DPORT_HIST | XS_CFG_GLOBAL_RL | \
 			    XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT | \
 			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED | XS_CFG_DROP_IPV6_EXT | \
-			    XS_CFG_SERVICE_ALLOW | XS_CFG_LOCKDOWN | XS_CFG_DROP_SPOOFED)
+			    XS_CFG_SERVICE_ALLOW | XS_CFG_LOCKDOWN | XS_CFG_DROP_SPOOFED | \
+			    XS_CFG_AUTO_LOCKDOWN)
 /* Flags an operator sets directly (sentinelctl config); CHECK_* are managed
  * automatically by the block/allow commands as the maps gain or lose entries. */
 #define XS_CFG_OPERATOR_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
