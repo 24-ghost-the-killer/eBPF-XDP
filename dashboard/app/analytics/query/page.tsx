@@ -7,6 +7,9 @@ import { Panel, Segmented, Empty, Badge, btn } from '@/components/aa/kit'
 import { Play, BookOpen, History, AlertTriangle, LineChart as LineIcon, Table2, TerminalSquare, Loader2 } from 'lucide-react'
 import { TimeChart } from '@/components/nd/charts'
 import { useRange } from '@/components/aa/Shell'
+import { CsvButton } from '@/components/aa/export'
+import { downloadCsv } from '@/lib/csv'
+import { logEvent } from '@/lib/client-audit'
 
 // Query console: raw PromQL against the appliance's Prometheus, read-only
 // (the /api/prom proxy only forwards GETs). Instant results render as a
@@ -45,6 +48,7 @@ export default function QueryPage() {
     setBusy(true)
     setErr(null)
     const t0 = performance.now()
+    logEvent('query', 'query.run', `Ran ${mode} PromQL: ${expr.slice(0, 200)}`, 'query-console', { expr, mode, range: rng.label })
     try {
       const w = rng.resolve()
       if (mode === 'range') setRes({ mode, r: await rangeAbs(expr, w.start, w.end, w.step), span: w.span })
@@ -125,13 +129,21 @@ export default function QueryPage() {
                 <Empty icon={LineIcon} title="Empty result" />
               )}
             </Panel>
-            <Panel icon={Table2} title="Series" sub="Latest value in the window" bodyClass="pb-2">
+            <Panel icon={Table2} title="Series" sub="Latest value in the window" bodyClass="pb-2"
+              actions={<CsvButton disabled={!rows.length} onClick={() => downloadCsv('query-range',
+                rows.flatMap((s) => s.values.map(([t, v]) => ({ series: labelsOf(s.metric) || s.metric.__name__ || 'value', t, v }))), [
+                  { key: 'series', label: 'series' }, { key: 't', label: 'time (UTC)', get: (r) => new Date(r.t * 1000).toISOString() }, { key: 'v', label: 'value' },
+                ], `query console range result (${rows.length} series)`, 'query-console')} />}>
               <SeriesTable items={rows.map((s) => ({ m: s.metric, v: s.values.at(-1)?.[1] }))} />
             </Panel>
           </>
         )}
         {res?.mode === 'instant' && (
-          <Panel icon={Table2} title="Result" sub={`${res.r.length} series`} bodyClass="pb-2">
+          <Panel icon={Table2} title="Result" sub={`${res.r.length} series`} bodyClass="pb-2"
+            actions={<CsvButton disabled={!res.r.length} onClick={() => downloadCsv('query-instant', res.r, [
+              { key: 'series', label: 'series', get: (s) => labelsOf(s.metric) || s.metric.__name__ || 'value' },
+              { key: 't', label: 'time (UTC)', get: (s) => new Date(s.value[0] * 1000).toISOString() }, { key: 'v', label: 'value', get: (s) => s.value[1] },
+            ], `query console instant result (${res.r.length} series)`, 'query-console')} />}>
             <SeriesTable items={res.r.map((s) => ({ m: s.metric, v: s.value[1] }))} />
           </Panel>
         )}

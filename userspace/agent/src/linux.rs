@@ -136,12 +136,24 @@ fn ensure_dataplane(cfg: &Config, iface: &Interface, layout: &PinLayout) -> Resu
     let mut open = ObjectBuilder::default()
         .open_file(&cfg.bpf_obj)
         .with_context(|| format!("open {}", cfg.bpf_obj.display()))?;
+    // Bridge legs listed in `shared_conntrack` pin the conntrack table at one
+    // shared path, so both programs use the SAME map: a flow opened on one leg
+    // is known on the other. libbpf reuses an existing compatible pin.
+    let shared_ct = cfg.shared_conntrack.iter().any(|n| n == &iface.name);
+    let shared_dir = cfg.pin_root.join("shared");
+    if shared_ct {
+        fs::create_dir_all(&shared_dir)?;
+    }
     for mut m in open.maps_mut() {
         let name = m.name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        m.set_pin_path(layout.map(&name))?;
+        if shared_ct && name == "xs_ct" {
+            m.set_pin_path(shared_dir.join(&name))?;
+        } else {
+            m.set_pin_path(layout.map(&name))?;
+        }
     }
     let obj = open.load().context("load BPF object (verifier or incompatible pinned maps)")?;
     let mut prog = obj
@@ -865,6 +877,43 @@ fn auto_mitigate_enabled(var: Option<&str>) -> bool {
     }
 }
 
+/// Minimum ingress pps for a window to count as attack-sized on volume alone.
+const PLAUSIBLE_PPS: f64 = 500.0;
+/// Minimum dropped pps for the drop-ratio arm. Steady policy drops (service
+/// allowlist denies of scanners / stray replies, bogons) run at a few pps;
+/// a flood the dataplane is shedding runs at hundreds or more.
+const PLAUSIBLE_DROPPED_PPS: f64 = 200.0;
+
+/// Whether a window has enough volume to possibly be an attack. Below this the
+/// noisy models are ignored and the window can never escalate the ladder.
+fn plausible_attack_volume(pps: f64, dropped_pps: f64, drop_ratio: f64) -> bool {
+    pps > PLAUSIBLE_PPS || (drop_ratio > 0.05 && dropped_pps >= PLAUSIBLE_DROPPED_PPS)
+}
+
+/// Build the risk-engine evidence for one window.
+///
+/// Only the deterministic rule (`anomalous`) may push the ladder into the
+/// enforcing rungs (rate_limit and up). The CART classifier is trained on
+/// synthetic data and reads ordinary low-rate traffic as ddos=1.00; alone, its
+/// 0.95 weight put risk at exactly 0.95 = temporary_block with NO rule match.
+/// Without a rule, the model scores are capped so the fused risk stays under
+/// 0.5 (pass/monitor -- observe only, no dataplane action).
+fn ladder_evidence(anomalous: bool, anomaly01: f64, ddos: f64) -> Evidence {
+    const UNCONFIRMED_CAP: f64 = 0.3;
+    let (anomaly, ddos) = if anomalous {
+        (anomaly01, ddos)
+    } else {
+        (anomaly01.min(UNCONFIRMED_CAP), ddos.min(UNCONFIRMED_CAP))
+    };
+    Evidence {
+        anomaly,
+        ddos,
+        bot: 0.0,
+        rule: if anomalous { 1.0 } else { 0.0 },
+        confidence: 1.0,
+    }
+}
+
 impl Analyzer {
     fn new() -> Self {
         let dir = model_dir();
@@ -1243,7 +1292,17 @@ impl Analyzer {
         // (synthetic-trained) models say about its shape -- and the noisy
         // z-score at low packet counts is suppressed. This is the guard that
         // stops "UNDER ATTACK at 29 pps, 0 drops".
-        let plausible = drop_ratio > 0.05 || pps > 500.0;
+        //
+        // The drop-ratio arm needs an ABSOLUTE drop rate too. A bare ratio fires
+        // on a handful of packets: at 10-40 pps one service-allowlist deny or
+        // steady-drop in a 1 s window is already >5%, which made idle traffic
+        // "plausible", let the noisy CART score drive the ladder to level 5, and
+        // the mitigation's own drops then kept the ratio up -- a self-sustaining
+        // false positive (vlan10 sat at level 5 for 7.5 h every night while the
+        // only "attack" was the operator's own allowlist denying Twingate relay
+        // replies). See `plausible_attack_volume`.
+        let dropped_pps = wi.dropped as f64 / dt;
+        let plausible = plausible_attack_volume(pps, dropped_pps, drop_ratio);
         // A legitimate bulk transfer (download/backup/replication) spikes pps/bps
         // like a flood but is TCP-dominant, conntrack-tracked, large-packet, and
         // not dropping -- no flood looks like that. Suppress the attack state for
@@ -1259,13 +1318,7 @@ impl Analyzer {
         let anomaly_z = if plausible && det.score.is_finite() { det.score } else { 0.0 };
         let dtype = if anomalous { dtype } else { String::new() };
 
-        let ev = Evidence {
-            anomaly: anomaly01,
-            ddos,
-            bot: 0.0,
-            rule: if anomalous { 1.0 } else { 0.0 },
-            confidence: 1.0,
-        };
+        let ev = ladder_evidence(anomalous, anomaly01, ddos);
         self.risk.begin_window(if anomalous { 1 } else { 0 });
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1595,5 +1648,44 @@ mod f1_tests {
         for v in ["0", "false", "FALSE", "off", "no", " No ", "OFF"] {
             assert!(!auto_mitigate_enabled(Some(v)), "{v} should disarm");
         }
+    }
+}
+
+#[cfg(test)]
+mod ladder_fp_tests {
+    use super::{ladder_evidence, plausible_attack_volume};
+    use xs_common::risk::{fuse, Config, Level, RiskEngine};
+
+    #[test]
+    fn low_rate_policy_drops_are_not_plausible() {
+        // Live repro: ~30 pps with a few service-allowlist denies (27% ratio).
+        assert!(!plausible_attack_volume(30.0, 8.0, 0.27));
+        assert!(!plausible_attack_volume(9.0, 6.5, 0.73));
+    }
+
+    #[test]
+    fn real_floods_stay_plausible() {
+        assert!(plausible_attack_volume(50_000.0, 0.0, 0.0));
+        // Mitigated flood: ingress mostly dropped, still attack-sized.
+        assert!(plausible_attack_volume(400.0, 300.0, 0.75));
+    }
+
+    #[test]
+    fn classifier_alone_cannot_reach_an_enforcing_rung() {
+        // Live repro: ddos=1.00 from CART, no rule match.
+        let ev = ladder_evidence(false, 1.0, 1.0);
+        assert!(fuse(&ev) < 0.5, "risk {}", fuse(&ev));
+        let mut e = RiskEngine::new(Config { escalate_windows: 2, deescalate_windows: 4, ..Default::default() });
+        for w in 0..100u64 {
+            e.begin_window(0);
+            let d = e.decide("service:vlan10", &ev, false, w);
+            assert!(d.level <= Level::Monitor, "escalated to {:?}", d.level);
+        }
+    }
+
+    #[test]
+    fn rule_match_still_escalates_to_the_top() {
+        let ev = ladder_evidence(true, 0.9, 1.0);
+        assert!(fuse(&ev) >= 0.95);
     }
 }

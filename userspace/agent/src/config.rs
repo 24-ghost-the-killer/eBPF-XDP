@@ -12,6 +12,12 @@
 //! name = "wlo1"
 //! mode = "generic"   # "native" | "generic"
 //! attach = true      # false = only read metrics from an already-attached prog
+//!
+//! # Optional: interfaces that are the two legs of ONE inline bridge. They share
+//! # a single connection-tracking table, so a flow's outbound half (seen on one
+//! # leg) and its reply (seen on the other) match instead of the reply reading
+//! # as an untracked ACK/RST flood.
+//! shared_conntrack = ["vlan10", "vlan20"]
 //! ```
 
 use std::net::SocketAddr;
@@ -71,6 +77,10 @@ pub struct Config {
     /// Interfaces to manage. Renamed `interface` in TOML (`[[interface]]`).
     #[serde(default, rename = "interface")]
     pub interfaces: Vec<Interface>,
+    /// Interfaces (bridge legs) that share one conntrack table (see above).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only read by linux.rs
+    #[serde(default)]
+    pub shared_conntrack: Vec<String>,
 }
 
 impl Config {
@@ -81,6 +91,14 @@ impl Config {
         }
         for i in &cfg.interfaces {
             xs_common::pin::validate_ifname(&i.name)?;
+        }
+        for n in &cfg.shared_conntrack {
+            if !cfg.interfaces.iter().any(|i| &i.name == n) {
+                anyhow::bail!("shared_conntrack lists \"{n}\", which is not a configured [[interface]]");
+            }
+        }
+        if cfg.shared_conntrack.len() == 1 {
+            anyhow::bail!("shared_conntrack needs at least two interfaces (the bridge legs)");
         }
         Ok(cfg)
     }
@@ -124,5 +142,14 @@ mod tests {
         assert!(Config::from_toml("[[interface]]\nname = \"a/b\"").is_err());
         assert!(Config::from_toml("metrics_addr = \"127.0.0.1:9464\"").is_err());
         // no interfaces
+    }
+
+    #[test]
+    fn shared_conntrack_must_name_configured_legs() {
+        let ok = Config::from_toml("shared_conntrack = [\"a\", \"b\"]\n[[interface]]\nname=\"a\"\n[[interface]]\nname=\"b\"").unwrap();
+        assert_eq!(ok.shared_conntrack, vec!["a", "b"]);
+        assert!(Config::from_toml("shared_conntrack = [\"a\", \"x\"]\n[[interface]]\nname=\"a\"\n[[interface]]\nname=\"b\"").is_err());
+        assert!(Config::from_toml("shared_conntrack = [\"a\"]\n[[interface]]\nname=\"a\"").is_err());
+        assert!(Config::from_toml("[[interface]]\nname=\"a\"").unwrap().shared_conntrack.is_empty());
     }
 }

@@ -1,0 +1,6 @@
+# /etc/xdp-sentinel/uplink.conf -- upstream routers, for allowlist anti-spoofing.
+# <iface>  <router-mac|auto>  <router-ipv4>
+# The iface is the bridge leg the router is on (where internet traffic enters).
+# Frames from this router may not carry a LOCAL source address; if they do, they
+# get no allowlist trust (counted as xs_anomaly_packets_total{kind="spoofed_lan"}).
+vlan10  auto  192.168.1.1

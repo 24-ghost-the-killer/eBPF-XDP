@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { verifySession, sessionCan } from '@/lib/authz'
+import { requirePerm } from '@/lib/api-auth'
+import { audit } from '@/lib/audit'
 import { loadLockdown, saveLockdown, lockdownIfaces, LOCKDOWN_MAX_MINUTES, PlanError } from '@/lib/protect'
 
 // Read / write the lockdown kill-switch. Requires the `protect` permission. A
@@ -8,21 +9,15 @@ import { loadLockdown, saveLockdown, lockdownIfaces, LOCKDOWN_MAX_MINUTES, PlanE
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-async function canProtect(req: NextRequest): Promise<boolean> {
-  const secret = process.env.DASH_SESSION
-  const authOn = !!secret && (!!process.env.DASH_PASSWORD || !!process.env.DASH_USERS || !!process.env.DASH_USERS_FILE)
-  if (!authOn) return true // fail-open matches middleware
-  const s = await verifySession(secret!, req.cookies.get('dash_auth')?.value)
-  return !!s && sessionCan(s, 'protect')
-}
-
 export async function GET(req: NextRequest) {
-  if (!(await canProtect(req))) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+  const a = await requirePerm(req, 'protect')
+  if (a.error) return a.error
   return NextResponse.json({ ...loadLockdown(), now: Math.floor(Date.now() / 1000), maxMinutes: LOCKDOWN_MAX_MINUTES })
 }
 
 export async function PUT(req: NextRequest) {
-  if (!(await canProtect(req))) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+  const a = await requirePerm(req, 'protect.lockdown') // viewing needs 'protect'; changing the lockdown kill-switch needs 'protect.lockdown'
+  if (a.error) return a.error
   let body: any = {}
   try { body = await req.json() } catch {}
   const now = Math.floor(Date.now() / 1000)
@@ -33,6 +28,8 @@ export async function PUT(req: NextRequest) {
   try {
     const l = { enabled, ifaces: lockdownIfaces(), expires_at: enabled ? now + minutes * 60 : 0 }
     saveLockdown(l)
+    audit(req, { user: a.access.username, kind: a.access.kind, category: 'lockdown', action: enabled ? 'lockdown.arm' : 'lockdown.lift', target: 'lockdown',
+      summary: enabled ? `Armed lockdown on ${l.ifaces.join(', ')} for ${minutes} min` : 'Lifted lockdown', detail: { ifaces: l.ifaces, minutes: enabled ? minutes : 0 } })
     return NextResponse.json({ ...l, now, maxMinutes: LOCKDOWN_MAX_MINUTES })
   } catch (e) {
     if (e instanceof PlanError) return NextResponse.json({ error: e.message }, { status: e.status })

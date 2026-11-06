@@ -12,6 +12,8 @@ import { niceStep, quantile } from '@/lib/stats'
 import { SERIES, BarList } from '@/components/nd/ui'
 import { TimeChart } from '@/components/nd/charts'
 import { Panel, Stat, Badge, Empty, Pagination, btn, type Tone } from '@/components/aa/kit'
+import { CsvButton } from '@/components/aa/export'
+import { downloadCsv } from '@/lib/csv'
 import { useRange } from '@/components/aa/Shell'
 
 // Attacks: every detected episode in Prometheus' 15-day history — filterable,
@@ -180,6 +182,24 @@ export default function AttacksPage() {
         bodyClass=""
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            <CsvButton disabled={!rows.length} onClick={() => downloadCsv('ddos-attacks', rows, [
+              { key: 'id', label: 'episode' },
+              { key: 'start', label: 'start (UTC)', get: (a) => new Date(a.start).toISOString() },
+              { key: 'end', label: 'end (UTC)', get: (a) => new Date(a.end).toISOString() },
+              { key: 'durationSec', label: 'duration (s)' },
+              { key: 'vectors', label: 'attack type', get: (a) => vectorsOf(a).join(' ') },
+              { key: 'peakPps', label: 'peak packets/s', get: (a) => Math.round(a.peakPps) },
+              { key: 'peakBps', label: 'peak bits/s', get: (a) => Math.round(a.peakBps) },
+              { key: 'totalPackets', label: 'total packets' },
+              { key: 'totalBytes', label: 'total bytes' },
+              { key: 'droppedPackets', label: 'dropped packets' },
+              { key: 'dropShare', label: 'blocked %', get: (a) => (a.dropShare * 100).toFixed(1) },
+              { key: 'peakRiskLevel', label: 'peak risk level' },
+              { key: 'uniqueSources', label: 'distinct sources' },
+              { key: 'attackers', label: 'top sources', get: (a) => a.attackers.map((x) => x.ip).join(' ') },
+              { key: 'victims', label: 'targets', get: (a) => a.victims.map((x) => x.ip).join(' ') },
+              { key: 'target', label: 'interface', get: (a) => a.target?.iface ?? '' },
+            ], `${rows.length} DDoS attack episode${rows.length === 1 ? '' : 's'}${vector !== 'all' ? ` (${vector})` : ''}${ipq ? ` matching ${ipq}` : ''}`, 'attacks')} />
             <div className="relative">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-nd-faint" />
               <input value={ipq} onChange={(e) => setIpq(e.target.value)} placeholder="Filter by IP" aria-label="Filter by IP" className={`${btn.input} mono w-40 py-1.5 pl-8 text-[12.5px]`} />

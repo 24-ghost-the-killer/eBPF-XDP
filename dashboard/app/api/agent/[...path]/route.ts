@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePerm } from '@/lib/api-auth'
 
 // Server-side proxy to the sentinel-agent's read-only HTTP API, bound to
 // 127.0.0.1:9464 on the appliance (private by design, like Prometheus). This
@@ -16,6 +17,11 @@ export async function GET(
   req: NextRequest,
   { params }: { params: { path: string[] } }
 ) {
+  const auth = await requirePerm(req, 'protect') // live: disabled accounts lose access at once
+  if (auth.error) return auth.error
+  if (!['api/services.json', 'api/state.json'].includes(params.path.join('/'))) {
+    return NextResponse.json({ status: 'error', error: 'not allowed' }, { status: 404 })
+  }
   const path = params.path.join('/')
   const url = `${AGENT}/${path}${req.nextUrl.search}`
   try {

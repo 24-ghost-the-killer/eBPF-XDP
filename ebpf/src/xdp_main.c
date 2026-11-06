@@ -152,6 +152,24 @@ static __always_inline int xs_service_denied(const struct xs_pkt *p)
 	if (!bpf_map_lookup_elem(&xs_protected_v4, &d))
 		return 0; /* destination not protected -> default allow */
 
+	/*
+	 * Return traffic of the protected host's OWN outbound connections. The
+	 * allowlist guards the services a host offers, not its replies: a reply
+	 * lands on the ephemeral port the host chose, which no allowlist can list.
+	 * Without this the box's Twingate connector died whenever it egressed via
+	 * br0 (nightly, when the WiFi uplink drops): every relay reply to
+	 * 192.168.1.193:<ephemeral> was service-denied. TCP must carry ACK, so a
+	 * new inbound connection (bare SYN) to a high port is still denied; a raw
+	 * ACK flood aimed at ephemeral ports falls through to conntrack and the
+	 * rate limiters, exactly as DROP_UDP's same exemption does for UDP.
+	 */
+	if (p->l4_parsed && xs_ntohs_bounded(p->dport) >= XS_EPHEMERAL_PORT_MIN) {
+		if (p->l4_proto == XS_IPPROTO_UDP)
+			return 0;
+		if (p->l4_proto == XS_IPPROTO_TCP && (p->tcp_flags & XS_TCP_ACK))
+			return 0;
+	}
+
 	struct xs_service_key k = {
 		.daddr = d,
 		.dport = p->l4_parsed ? p->dport : 0,
@@ -159,6 +177,21 @@ static __always_inline int xs_service_denied(const struct xs_pkt *p)
 		._pad  = 0,
 	};
 	return bpf_map_lookup_elem(&xs_service_v4, &k) ? 0 : 1;
+}
+
+/*
+ * The xs_l2_trust entry when this frame's source MAC is a registered upstream
+ * router (anti-spoofing for the allowlist, see policy.h), else NULL. One small
+ * hash lookup, only made while the allowlist is armed.
+ */
+static __always_inline const struct xs_l2_trust *xs_upstream_router(void *data, void *data_end)
+{
+	struct xs_mac_key k = {};
+
+	if (data + 12 > data_end)
+		return NULL;
+	__builtin_memcpy(k.addr, (__u8 *)data + 6, 6);
+	return bpf_map_lookup_elem(&xs_untrusted_l2, &k);
 }
 
 /* True when the destination is under default-deny (listed in xs_protected_v4). */
@@ -244,7 +277,8 @@ int xs_xdp_main(struct xdp_md *ctx)
 	int decision = XS_POL_CONTINUE;
 
 	if (flags & (XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT))
-		decision = xs_policy_stage(st, &pkt, flags, &rl, now, len);
+		decision = xs_policy_stage(st, &pkt, flags, &rl, now, len,
+					   (flags & XS_CFG_CHECK_ALLOW) ? xs_upstream_router(data, data_end) : NULL);
 
 	/* Allowlisted (dynamic-exempt) sources are validity-checked but skip the
 	 * aggregate cap and conntrack drop, so the operator's own box is never cut

@@ -4,8 +4,9 @@
 //
 // The plan is NOT the live state — live comes from the agent's /api/services.json.
 // Source file: $DASH_PROTECT_PLAN (default /home/test_server/xdp-sentinel-data/protect-plan.json).
-import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { cleanReport, type Report } from './reports'
 
 export type Proto = 'tcp' | 'udp' | 'icmp'
 export interface Svc { proto: Proto; port: number }
@@ -176,4 +177,141 @@ export function savePlan(plan: Plan): void {
   } catch (e: any) {
     throw new PlanError(`could not write ${file}: ${e?.code || e?.message || 'error'} (must be writable by the dashboard user)`, 500)
   }
+}
+
+// ---- Host notes (nickname, documentation, log) ---------------------------
+// Operator-written metadata per host, keyed by IP. Kept in its OWN file (not the
+// plan) so editing notes never triggers the box's plan-reconcile job, and notes
+// survive a host being unprotected and re-protected later.
+// Source file: $DASH_PROTECT_META (default next to the plan).
+export interface LogEntry { id: string; ts: number; author: string; text: string }
+// Documentation lives in structured reports (lib/reports.ts). Each report has
+// its own rev; editors send the rev they started from so a concurrent save is
+// merged instead of overwritten.
+export interface HostMeta { nickname: string; log: LogEntry[]; reports: Report[] }
+export type MetaStore = Record<string, HostMeta>
+
+export const META_LIMITS = { nickname: 40, logText: 2_000, logEntries: 500 }
+
+function metaPath(): string {
+  return process.env.DASH_PROTECT_META || `${dirname(planPath())}/protect-meta.json`
+}
+
+export function assertIp(ip: string): void {
+  if (!validIp(ip)) throw new PlanError(`invalid IPv4 address "${ip}"`)
+}
+
+function cleanMeta(raw: any): HostMeta {
+  const log: LogEntry[] = Array.isArray(raw?.log)
+    ? raw.log
+        .filter((e: any) => e && typeof e.text === 'string' && typeof e.id === 'string')
+        .map((e: any) => ({ id: e.id, ts: Number(e.ts) || 0, author: String(e.author || ''), text: e.text }))
+    : []
+  const reports: Report[] = Array.isArray(raw?.reports) ? raw.reports.map(cleanReport).filter(Boolean) as Report[] : []
+  // Migrate the old single free-text documentation into a "Documentation" report
+  // (stable id, so repeated loads don't duplicate it; the doc field is dropped on
+  // the next save).
+  const doc = String(raw?.doc || '')
+  if (doc && !reports.some((r) => r.id === 'legacy-doc')) {
+    const at = Number(raw?.docAt) || Math.floor(Date.now() / 1000)
+    const by = String(raw?.docBy || 'admin')
+    reports.unshift({
+      id: 'legacy-doc', title: 'Documentation', kind: 'note', status: 'draft',
+      sections: [{ id: 'legacy-doc-body', heading: 'Notes', body: doc }],
+      rev: 1, createdBy: by, createdAt: at, updatedBy: by, updatedAt: at,
+    })
+  }
+  return { nickname: String(raw?.nickname || ''), log, reports }
+}
+
+export function loadMeta(): MetaStore {
+  try {
+    const d = JSON.parse(readFileSync(metaPath(), 'utf8'))
+    const hosts = d?.hosts && typeof d.hosts === 'object' ? d.hosts : {}
+    const out: MetaStore = {}
+    for (const [ip, m] of Object.entries(hosts)) if (validIp(ip)) out[ip] = cleanMeta(m)
+    return out
+  } catch {
+    return {}
+  }
+}
+
+export function saveMeta(store: MetaStore): void {
+  const file = metaPath()
+  // Drop empty records so the file only holds hosts someone actually documented.
+  const hosts: MetaStore = {}
+  for (const [ip, m] of Object.entries(store)) if (m.nickname || m.log.length || m.reports.length) hosts[ip] = { nickname: m.nickname, log: m.log, reports: m.reports }
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    const tmp = `${file}.tmp`
+    writeFileSync(tmp, JSON.stringify({ version: 1, hosts }, null, 2) + '\n', { mode: 0o644 })
+    renameSync(tmp, file)
+  } catch (e: any) {
+    throw new PlanError(`could not write ${file}: ${e?.code || e?.message || 'error'} (must be writable by the dashboard user)`, 500)
+  }
+}
+
+export function emptyMeta(): HostMeta {
+  return { nickname: '', log: [], reports: [] }
+}
+
+export { merge3, CONFLICT_START, CONFLICT_MID, CONFLICT_END } from './merge'
+
+// ---- Live updates bus + editing presence ---------------------------------
+// Process-wide (on globalThis so every route bundle shares one instance). The
+// SSE stream route subscribes; the write routes publish after each save.
+export interface Editor { clientId: string; name: string; until: number }
+type BusEvent = { event: 'meta'; data: { ip: string; meta: HostMeta; by: string; clientId?: string } }
+  | { event: 'presence'; data: { ip: string; editors: { clientId: string; name: string }[] } }
+interface Bus { subs: Set<(e: BusEvent) => void>; presence: Map<string, Map<string, Editor>>; sweeper?: ReturnType<typeof setInterval> }
+const g = globalThis as unknown as { __xsProtectBus?: Bus }
+function bus(): Bus {
+  if (!g.__xsProtectBus) g.__xsProtectBus = { subs: new Set(), presence: new Map() }
+  const b = g.__xsProtectBus
+  if (!b.sweeper) {
+    // Expire editors whose tab stopped heartbeating (closed, crashed, offline).
+    b.sweeper = setInterval(() => {
+      const now = Date.now()
+      for (const [ip, eds] of b.presence) {
+        let changed = false
+        for (const [id, e] of eds) if (e.until < now) { eds.delete(id); changed = true }
+        if (changed) publishPresence(ip)
+      }
+    }, 5000)
+    b.sweeper.unref?.()
+  }
+  return b
+}
+export function subscribe(fn: (e: BusEvent) => void): () => void {
+  const b = bus()
+  b.subs.add(fn)
+  return () => { b.subs.delete(fn) }
+}
+function publish(e: BusEvent) {
+  for (const fn of bus().subs) { try { fn(e) } catch {} }
+}
+export function publishMeta(ip: string, meta: HostMeta, by: string, clientId?: string) {
+  publish({ event: 'meta', data: { ip, meta, by, clientId } })
+}
+export function editorsOf(ip: string): { clientId: string; name: string }[] {
+  return [...(bus().presence.get(ip)?.values() ?? [])].map((e) => ({ clientId: e.clientId, name: e.name }))
+}
+function publishPresence(ip: string) {
+  publish({ event: 'presence', data: { ip, editors: editorsOf(ip) } })
+}
+export function allPresence(): Record<string, { clientId: string; name: string }[]> {
+  const out: Record<string, { clientId: string; name: string }[]> = {}
+  for (const ip of bus().presence.keys()) { const e = editorsOf(ip); if (e.length) out[ip] = e }
+  return out
+}
+export const PRESENCE_TTL_MS = 25_000
+export function setEditing(ip: string, clientId: string, name: string, editing: boolean) {
+  const b = bus()
+  let eds = b.presence.get(ip)
+  if (!eds) { eds = new Map(); b.presence.set(ip, eds) }
+  const had = eds.has(clientId)
+  if (editing) eds.set(clientId, { clientId, name, until: Date.now() + PRESENCE_TTL_MS })
+  else eds.delete(clientId)
+  if (eds.size === 0) b.presence.delete(ip)
+  if (had !== editing) publishPresence(ip)
 }

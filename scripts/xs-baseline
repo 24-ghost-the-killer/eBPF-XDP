@@ -8,10 +8,29 @@
 # it later would silently cut the whole LAN off in bridge mode.
 #
 #   /etc/xdp-sentinel/allowlist.conf:   <cidr> [full|dynamic-exempt]
+#   /etc/xdp-sentinel/uplink.conf:      <iface> <router-mac|auto> <router-ipv4>
+#
+# Anti-spoofing (uplink.conf): registers the upstream router on the leg it sits
+# on. A frame the router forwards in from outside can then never inherit the
+# LAN allowlist trust by forging a local source address (the spoofed-LAN
+# bypass) -- see ebpf/src/policy.h. "auto" resolves the router's MAC from its
+# IPv4 (ARP) and checks the bridge learned it on that leg; a failed lookup keeps
+# the previous entry rather than removing protection.
+#
+# Boot-race hardening: the agent is marked "active" by systemd before it has
+# finished attaching to the interfaces (its ExecStartPre waits for vlan10/vlan20
+# to appear, which can take up to a minute). If this script gave up before the
+# pins existed, the management-plane exemption (the LAN /24 dynamic-exempt entry
+# that keeps legitimate Proxmox/SSH/dashboard traffic from ever being rate-
+# limited) never armed and CHECK_ALLOW stayed off -- the exact condition behind
+# the Proxmox self-DoS. So the wait is long and patient, a miss is a hard error
+# (not a silent skip), and xs-baseline.timer re-runs this every few minutes as a
+# self-heal in case boot was unusually slow.
 set -euo pipefail
 CONF=${XS_CONFIG:-/etc/xdp-sentinel/config.toml}
 ALLOW=${XS_ALLOWLIST:-/etc/xdp-sentinel/allowlist.conf}
 PIN_ROOT=/sys/fs/bpf/xdp-sentinel
+WAIT_SECS=${XS_BASELINE_WAIT:-180}
 
 if ip link show br0 >/dev/null 2>&1 && iptables -L DOCKER-USER -n >/dev/null 2>&1; then
 	iptables -C DOCKER-USER -i br0 -o br0 -j ACCEPT 2>/dev/null ||
@@ -20,15 +39,68 @@ fi
 
 [ -r "$ALLOW" ] || { echo "xs-baseline: no $ALLOW, nothing to allowlist"; exit 0; }
 
+missed=0
 for iface in $(awk -F'"' '/^[[:space:]]*name[[:space:]]*=/{print $2}' "$CONF"); do
-	# The agent creates the pins when it attaches; give it a moment on boot.
-	for _ in $(seq 30); do
+	# The agent creates the pins when it attaches; wait patiently on boot.
+	for _ in $(seq "$WAIT_SECS"); do
 		[ -e "$PIN_ROOT/$iface/xs_allow_v4" ] && break
 		sleep 1
 	done
-	[ -e "$PIN_ROOT/$iface/xs_allow_v4" ] || { echo "xs-baseline: $iface not attached, skipped" >&2; continue; }
+	if [ ! -e "$PIN_ROOT/$iface/xs_allow_v4" ]; then
+		echo "xs-baseline: $iface not attached after ${WAIT_SECS}s, NOT armed" >&2
+		missed=1
+		continue
+	fi
+	# Let every map settle before writing (the agent pins them in sequence).
+	sleep 2
 	grep -vE '^[[:space:]]*(#|$)' "$ALLOW" | while read -r cidr trust _; do
 		sentinelctl allow -i "$iface" "$cidr" --trust "${trust:-dynamic-exempt}" >/dev/null
 		echo "xs-baseline: $iface allow $cidr (${trust:-dynamic-exempt})"
 	done
+	# Assert the exemption actually took: CHECK_ALLOW must be set now, or the
+	# management plane is unprotected and this must be treated as a failure.
+	if sentinelctl status -i "$iface" 2>/dev/null | grep -qi check_allow; then
+		echo "xs-baseline: $iface check_allow armed"
+	else
+		echo "xs-baseline: $iface CHECK_ALLOW NOT set after allow -- unprotected" >&2
+		missed=1
+	fi
 done
+
+# ---- anti-spoofing: register upstream routers ------------------------------
+UPLINK=${XS_UPLINK:-/etc/xdp-sentinel/uplink.conf}
+hexmac() { echo "$1" | tr 'A-F' 'a-f' | tr ':' ' '; }
+hexip() { local IFS=.; set -- $1; printf '%02x %02x %02x %02x' "$1" "$2" "$3" "$4"; }
+if [ -r "$UPLINK" ]; then
+	grep -vE '^[[:space:]]*(#|$)' "$UPLINK" | while read -r iface mac rip _; do
+		map="$PIN_ROOT/$iface/xs_untrusted_l2"
+		if [ ! -e "$map" ]; then
+			echo "xs-baseline: $iface has no xs_untrusted_l2 map (older dataplane?) -- anti-spoof NOT armed" >&2
+			continue
+		fi
+		if [ "$mac" = auto ]; then
+			[ -n "$rip" ] || { echo "xs-baseline: uplink $iface auto needs the router IPv4" >&2; continue; }
+			ping -c1 -W1 "$rip" >/dev/null 2>&1 || true
+			mac=$(ip neigh show "$rip" 2>/dev/null | awk '/lladdr/{print $5; exit}')
+			if [ -z "$mac" ]; then
+				echo "xs-baseline: uplink $iface: no ARP entry for $rip, keeping previous entry" >&2
+				continue
+			fi
+			if ! bridge fdb show 2>/dev/null | grep -qi "^$mac dev $iface "; then
+				echo "xs-baseline: uplink $iface: $mac ($rip) not learned on $iface, skipped" >&2
+				continue
+			fi
+		fi
+		if ! echo "$mac" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then
+			echo "xs-baseline: uplink $iface: bad MAC '$mac'" >&2
+			continue
+		fi
+		val='00 00 00 00'
+		[ -n "${rip:-}" ] && val=$(hexip "$rip")
+		# shellcheck disable=SC2046
+		bpftool map update pinned "$map" key hex $(hexmac "$mac") 00 00 value hex $val 00 00 00 00
+		echo "xs-baseline: $iface anti-spoof: upstream router $mac (${rip:-no own IP})"
+	done
+fi
+
+exit "$missed"

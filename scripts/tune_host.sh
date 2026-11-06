@@ -131,7 +131,13 @@ for IF in "${IFACES[@]}"; do
 
   # 2a. Maximize RX/TX ring buffers to the hardware max.
   rxmax="$(ethtool -g "$PHY" 2>/dev/null | awk '/^RX:/{print $2; exit}' || true)"
-  if [ -n "${rxmax:-}" ] && [ "$rxmax" -gt 0 ] 2>/dev/null; then
+  # Current setting = the second "RX:" line (under "Current hardware settings").
+  rxcur="$(ethtool -g "$PHY" 2>/dev/null | awk '/^RX:/{n++; if (n==2) {print $2; exit}}' || true)"
+  if [ -n "${rxmax:-}" ] && [ "${rxcur:-}" = "$rxmax" ]; then
+    # Already at max: don't resize again. On many drivers `ethtool -G` resets the
+    # link, and xs-tune.timer re-runs this every few minutes.
+    info "$PHY: RX/TX rings already at max ($rxmax)"
+  elif [ -n "${rxmax:-}" ] && [ "$rxmax" -gt 0 ] 2>/dev/null; then
     ethtool -G "$PHY" rx "$rxmax" tx "$rxmax" 2>/dev/null \
       && ok "$PHY: RX/TX rings -> $rxmax" \
       || warn "$PHY: could not set rings (driver may be fixed-size)"

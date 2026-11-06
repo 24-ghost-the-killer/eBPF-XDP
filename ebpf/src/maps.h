@@ -246,4 +246,15 @@ struct {
 	__type(value, struct xs_victim);
 } xs_attacker_v4 SEC(".maps");
 
+/*
+ * Upstream routers on this leg, by source MAC (see struct xs_l2_trust). Filled
+ * by xs-baseline from /etc/xdp-sentinel/uplink.conf; empty = feature off.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16);
+	__type(key, struct xs_mac_key);
+	__type(value, struct xs_l2_trust);
+} xs_untrusted_l2 SEC(".maps");
+
 #endif /* XS_MAPS_H */

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePerm } from '@/lib/api-auth'
 
 // Server-side proxy to Prometheus. The appliance's Prometheus is bound to
 // 127.0.0.1:9091 (private by design); this route forwards the browser's
@@ -14,6 +15,13 @@ export async function GET(
   req: NextRequest,
   { params }: { params: { path: string[] } }
 ) {
+  const auth = await requirePerm(req, null) // live: disabled accounts lose access at once
+  if (auth.error) return auth.error
+  // Only the read-only query endpoints the dashboard uses (no admin/TSDB, no
+  // config, targets or federate dumps).
+  if (!/^api\/v1\/(query|query_range|labels|label\/[A-Za-z_][A-Za-z0-9_]*\/values|series|metadata|status\/buildinfo)$/.test(params.path.join('/'))) {
+    return NextResponse.json({ status: 'error', error: 'not allowed' }, { status: 404 })
+  }
   const path = params.path.join('/')
   const url = `${PROM}/${path}${req.nextUrl.search}`
   try {

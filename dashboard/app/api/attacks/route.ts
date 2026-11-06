@@ -1,4 +1,5 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
+import { requirePerm } from '@/lib/api-auth'
 import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -404,7 +405,9 @@ function rebuild(key: number): Promise<Payload> {
   return INFLIGHT
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = await requirePerm(req, null) // live: disabled accounts lose access at once
+  if (auth.error) return auth.error
   const key = Math.floor(Date.now() / 1000 / STEP) * STEP
   try {
     await loadDisk()

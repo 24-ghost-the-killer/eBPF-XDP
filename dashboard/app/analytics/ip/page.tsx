@@ -10,6 +10,8 @@ import { Panel, Stat, Badge, Empty, btn, type Tone } from '@/components/aa/kit'
 import { Fingerprint, Search, Upload, Download, Ban, Crosshair, ShieldAlert, Users, Target, Send, ChevronRight, Activity } from 'lucide-react'
 import { TimeChart } from '@/components/nd/charts'
 import { useRange } from '@/components/aa/Shell'
+import { CsvButton } from '@/components/aa/export'
+import { downloadCsv } from '@/lib/csv'
 
 // IP lookup: everything the appliance knows about one address over the shared
 // window — bytes it sent/received (talker tap), packets dropped with it as the
@@ -108,6 +110,29 @@ function Report({ ip }: { ip: string }) {
             {d?.scope && <Badge>{d.scope}</Badge>}
             {episodes.length > 0 && <Badge tone="warn">{episodes.length} episode{episodes.length === 1 ? '' : 's'}</Badge>}
           </div>
+        </div>
+        <div className="ml-auto flex flex-wrap gap-2">
+          <CsvButton label="Export traffic CSV" disabled={!d} onClick={() => {
+            if (!d) return
+            const byT = new Map<number, Record<string, number>>()
+            for (const r of [...d.bw, ...d.drops]) byT.set(r.t, { ...(byT.get(r.t) ?? { t: r.t }), ...r })
+            const rows = [...byT.values()].sort((x, y) => x.t - y.t)
+            downloadCsv(`ip-${ip}-traffic`, rows, [
+              { key: 't', label: 'time (UTC)', get: (r) => new Date(r.t).toISOString() },
+              { key: 'sent', label: 'sent bits/s' }, { key: 'received', label: 'received bits/s' },
+              { key: 'as_source', label: 'dropped as source pkts/s' }, { key: 'as_target', label: 'dropped as target pkts/s' },
+            ], `IP lookup traffic for ${ip} (${rng.label})`, `ip:${ip}`)
+          }} />
+          <CsvButton label="Export episodes CSV" disabled={!episodes.length} onClick={() => downloadCsv(`ip-${ip}-episodes`, episodes, [
+            { key: 'id', label: 'episode' },
+            { key: 'role', label: 'role', get: (a) => (a.attackers.some((x) => x.ip === ip) ? 'source' : 'target') },
+            { key: 'start', label: 'start (UTC)', get: (a) => new Date(a.start).toISOString() },
+            { key: 'durationSec', label: 'duration (s)' },
+            { key: 'vectors', label: 'attack type', get: (a) => vectorsOf(a).join(' ') },
+            { key: 'peakBps', label: 'peak bits/s', get: (a) => Math.round(a.peakBps) },
+            { key: 'peakPps', label: 'peak packets/s', get: (a) => Math.round(a.peakPps) },
+            { key: 'dropShare', label: 'blocked %', get: (a) => (a.dropShare * 100).toFixed(1) },
+          ], `${episodes.length} attack episode${episodes.length === 1 ? '' : 's'} involving ${ip}`, `ip:${ip}`)} />
         </div>
       </div>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">

@@ -12,7 +12,8 @@ Wants=sentinel-agent.service network-online.target
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
+# No RemainAfterExit: the unit must go inactive after each run, otherwise
+# xs-tune.timer's periodic start is a no-op and the agent re-pin never repeats.
 # tune_host.sh decides HARDWARE RSS vs RPS by probing the NIC; nothing to choose.
 ExecStart=/usr/local/sbin/tune_host.sh --reserve-cores 1 --pin-agent
 

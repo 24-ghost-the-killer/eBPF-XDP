@@ -112,9 +112,49 @@ static __always_inline int xs_autorl_v6(struct xs_stats *st, __u64 prefix,
 	return XS_POL_DROP;
 }
 
+/*
+ * Anti-spoofing (closes the spoofed-LAN allowlist bypass). `gw` is non-NULL when
+ * the frame's source MAC is a registered upstream router. Such a frame was routed
+ * in from outside, so a LOCAL source address on it is forged: an attacker on the
+ * internet spoofing 192.168.1.x would otherwise inherit the LAN's allowlist trust
+ * and skip the per-source limiter, blocks, conntrack drop and aggregate cap. Its
+ * trust is withheld (counted as anom_spoofed_lan) and it is treated like any
+ * other untrusted packet. Nothing is dropped for this alone, so router features
+ * like hairpin NAT keep working.
+ *   IPv4: private sources (10/8, 172.16/12, 192.168/16, 169.254/16), except the
+ *         router's own address.
+ *   IPv6: ULA (fc00::/7), or a source in the destination's own /64 (same-subnet
+ *         traffic never goes via the router). Link-local (the router's own
+ *         RA/ND) stays trusted.
+ */
+static __always_inline int xs_v4_spoofed_local(const struct xs_l2_trust *gw, __be32 sa)
+{
+	if (!gw || (gw->own_v4 && sa == gw->own_v4))
+		return 0;
+	__u32 a = bpf_ntohl(sa);
+	return (a & 0xff000000u) == 0x0a000000u ||  /* 10/8       */
+	       (a & 0xfff00000u) == 0xac100000u ||  /* 172.16/12  */
+	       (a & 0xffff0000u) == 0xc0a80000u ||  /* 192.168/16 */
+	       (a & 0xffff0000u) == 0xa9fe0000u;    /* 169.254/16 */
+}
+
+static __always_inline int xs_v6_spoofed_local(const struct xs_l2_trust *gw, const struct xs_pkt *p)
+{
+	if (!gw)
+		return 0;
+	__u32 w0 = bpf_ntohl(p->saddr.v6[0]);
+	if ((w0 & 0xffc00000u) == 0xfe800000u)
+		return 0;                                /* link-local: router's own ND/RA */
+	if ((w0 & 0xfe000000u) == 0xfc000000u)
+		return 1;                                /* ULA */
+	return p->saddr.v6[0] == p->daddr.v6[0] &&   /* same /64 as the destination */
+	       p->saddr.v6[1] == p->daddr.v6[1];
+}
+
 /* IPv4 path. */
 static __always_inline int xs_policy_lookup_v4(struct xs_stats *st, const struct xs_pkt *p,
-					__u32 flags, const struct xs_rl_params *rl, __u64 now, __u64 len)
+					__u32 flags, const struct xs_rl_params *rl, __u64 now, __u64 len,
+					const struct xs_l2_trust *gw)
 {
 	int exempt = 0;
 
@@ -124,7 +164,9 @@ static __always_inline int xs_policy_lookup_v4(struct xs_stats *st, const struct
 
 		__builtin_memcpy(k.addr, &p->saddr.v4, 4);
 		a = bpf_map_lookup_elem(&xs_allow_v4, &k);
-		if (a && xs_allow_active(a, now)) {
+		if (a && xs_allow_active(a, now) && xs_v4_spoofed_local(gw, p->saddr.v4)) {
+			xs_count(st, XS_CNT_ANOM_SPOOFED_LAN, len); /* forged local source: no trust */
+		} else if (a && xs_allow_active(a, now)) {
 			if (a->trust == XS_TRUST_FULL) {
 				xs_count(st, XS_CNT_ALLOW_PASS, len);
 				return XS_POL_PASS;
@@ -149,7 +191,8 @@ static __always_inline int xs_policy_lookup_v4(struct xs_stats *st, const struct
 
 /* IPv6 path: key the policy/rate tables on the /64 prefix (first 8 address bytes). */
 static __always_inline int xs_policy_lookup_v6(struct xs_stats *st, const struct xs_pkt *p,
-					__u32 flags, const struct xs_rl_params *rl, __u64 now, __u64 len)
+					__u32 flags, const struct xs_rl_params *rl, __u64 now, __u64 len,
+					const struct xs_l2_trust *gw)
 {
 	int exempt = 0;
 	__u64 prefix;
@@ -162,7 +205,9 @@ static __always_inline int xs_policy_lookup_v6(struct xs_stats *st, const struct
 
 		__builtin_memcpy(k.addr, p->saddr.v6, 16);
 		a = bpf_map_lookup_elem(&xs_allow_v6, &k);
-		if (a && xs_allow_active(a, now)) {
+		if (a && xs_allow_active(a, now) && xs_v6_spoofed_local(gw, p)) {
+			xs_count(st, XS_CNT_ANOM_SPOOFED_LAN, len); /* forged local source: no trust */
+		} else if (a && xs_allow_active(a, now)) {
 			if (a->trust == XS_TRUST_FULL) {
 				xs_count(st, XS_CNT_ALLOW_PASS, len);
 				return XS_POL_PASS;
@@ -192,12 +237,12 @@ static __always_inline int xs_policy_lookup_v6(struct xs_stats *st, const struct
  */
 static __always_inline int xs_policy_stage(struct xs_stats *st, const struct xs_pkt *p,
 					   __u32 flags, const struct xs_rl_params *rl,
-					   __u64 now, __u64 len)
+					   __u64 now, __u64 len, const struct xs_l2_trust *gw)
 {
 	if (p->l3 == XS_L3_IPV4)
-		return xs_policy_lookup_v4(st, p, flags, rl, now, len);
+		return xs_policy_lookup_v4(st, p, flags, rl, now, len, gw);
 	if (p->l3 == XS_L3_IPV6)
-		return xs_policy_lookup_v6(st, p, flags, rl, now, len);
+		return xs_policy_lookup_v6(st, p, flags, rl, now, len, gw);
 	return XS_POL_CONTINUE; /* non-IP: no per-source policy applies */
 }
 

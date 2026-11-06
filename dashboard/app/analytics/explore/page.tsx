@@ -4,6 +4,8 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
 import { rangeAbs, toSeries, type RangeResult, type Row } from '@/lib/prom'
 import { usePoll } from '@/hooks/usePoll'
+import { CsvButton } from '@/components/aa/export'
+import { downloadCsv, seriesColumns } from '@/lib/csv'
 import { METRICS, metricById, fmtUnit, fmtTotal } from '@/lib/catalog'
 import { summarize, histogram, type Summary } from '@/lib/stats'
 import { SERIES } from '@/components/nd/ui'
@@ -213,7 +215,9 @@ function ExplorerInner() {
           </div>
         </div>
 
-        <Panel icon={LineIcon} title={`${m.label}${split ? ` by ${split}` : ''}`} sub={`${rng.label} · ${view ? `${view.w.step}s resolution · ${view.defs.length} series` : 'loading…'}`}>
+        <Panel icon={LineIcon} title={`${m.label}${split ? ` by ${split}` : ''}`} sub={`${rng.label} · ${view ? `${view.w.step}s resolution · ${view.defs.length} series` : 'loading…'}`}
+          actions={<CsvButton disabled={!view || view.empty} onClick={() => view && downloadCsv(`explorer-${m.id}${split ? `-by-${split}` : ''}`, view.table, seriesColumns(view.defs.map((d) => d.key)),
+            `Explorer “${m.label}${split ? ` by ${split}` : ''}” (${rng.label})`, `metric:${m.id}`)} />}>
           {data.error && !view ? (
             <Empty icon={SearchX} title="Query failed" hint={data.error} />
           ) : view?.empty ? (

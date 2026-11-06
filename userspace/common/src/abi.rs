@@ -110,6 +110,7 @@ pub const COUNTERS: &[CounterDef] = &[
     c!(52, "anom_bogon_src", "source address that can't exist on the wire"),
     c!(53, "anom_ttl_zero", "IPv4 TTL / IPv6 hop limit of zero"),
     c!(54, "anom_port_zero", "TCP/UDP source or destination port zero"),
+    c!(55, "anom_spoofed_lan", "Local source address routed in by an upstream router (spoofed LAN): allowlist trust withheld"),
     c!(64, "parse_ok", "parse outcome: well formed IP"),
     c!(65, "parse_not_ip", "parse outcome: non-IP ethertype"),
     c!(66, "parse_unsup_vlan_depth", "parse outcome: more than two VLAN tags"),

@@ -88,6 +88,7 @@ enum xs_counter_id {
 	XS_CNT_ANOM_BOGON_SRC         = 52,
 	XS_CNT_ANOM_TTL_ZERO          = 53,
 	XS_CNT_ANOM_PORT_ZERO         = 54,
+	XS_CNT_ANOM_SPOOFED_LAN       = 55, /* local source routed in by an upstream router: allowlist trust withheld */
 
 	/* Parse outcome histogram: slot XS_CNT_PARSE_BASE + enum xs_parse_rc.
 	 * Exactly one outcome per frame, so the sum over these slots == RX. */
@@ -412,6 +413,21 @@ struct xs_lpm_v6 {
 	__u8  addr[16];
 };
 
+/*
+ * Anti-spoofing for the allowlist (xs_untrusted_l2). Key = source MAC of an
+ * upstream router on this leg; value = the router's own IPv4 (0 = none), which
+ * stays trusted. A frame from that MAC was routed in from outside, so it can
+ * never legitimately carry a local source address.
+ */
+struct xs_mac_key {
+	__u8  addr[6];
+	__u16 _pad;
+};
+struct xs_l2_trust {
+	__be32 own_v4;
+	__u32  _pad;
+};
+
 #if !defined(__bpf__)
 _Static_assert(sizeof(struct xs_counter) == 16, "xs_counter ABI");
 _Static_assert(sizeof(struct xs_stats) == 2048, "xs_stats ABI");
@@ -423,6 +439,7 @@ _Static_assert(sizeof(struct xs_policy) == 32, "xs_policy ABI");
 _Static_assert(sizeof(struct xs_allow) == 16, "xs_allow ABI");
 _Static_assert(sizeof(struct xs_lpm_v4) == 8, "xs_lpm_v4 ABI");
 _Static_assert(sizeof(struct xs_lpm_v6) == 20, "xs_lpm_v6 ABI");
+
 _Static_assert(XS_CNT_PARSE_BASE + XS_PARSE_RC_MAX <= XS_CNT_SLOTS, "counter slots");
 #endif
 

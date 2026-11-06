@@ -1,62 +1,31 @@
 'use client'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { instantAt, scalar, rangeAbs, toSeries } from '@/lib/prom'
+import Link from 'next/link'
+import { instantAt, scalar } from '@/lib/prom'
 import { usePoll } from '@/hooks/usePoll'
-import { si, pps } from '@/lib/format'
-import { niceStep } from '@/lib/stats'
-import { Stat, Panel, Badge, type Tone } from '@/components/aa/kit'
-import { TimeChart } from '@/components/nd/charts'
-import { SERIES } from '@/components/nd/ui'
-import { useRange } from '@/components/aa/Shell'
+import { si } from '@/lib/format'
+import { Stat } from '@/components/aa/kit'
+import { useRange, useMe } from '@/components/aa/Shell'
 import {
-  Lock, ShieldCheck, Ban, AlertTriangle, Server, Network, Info, Plus, Trash2, X, Loader2, Check, ShieldOff,
-  ChevronRight, Activity,
+  type Proto, type Svc, type Host, type HostMeta, svcKey, hostKey, fmtSvc, validIp, hostHref, statusOf, isApplied,
+  fetchLive, notifyProtectChanged, subscribeLive, ServiceEditor, NeedsPerm,
+} from '@/components/aa/protect'
+import {
+  Lock, ShieldCheck, Ban, AlertTriangle, Server, Network, Info, Plus, X, Loader2, Check, ShieldOff,
+  ChevronRight, Crosshair,
 } from 'lucide-react'
 
-// Protection — EDIT the service-allowlist (default-deny), and inspect each
-// protected host in a slide-over. You edit a desired-state "plan"; a root job on
+// Protection — EDIT the service-allowlist (default-deny). Each protected host
+// has its own page (/analytics/protect/<ip>) with notes, ports and statistics. You edit a desired-state "plan"; a root job on
 // the box (xs-protect-apply) reconciles the eBPF maps with sentinelctl. Live
 // state comes from the agent; a host shows "pending" until the dataplane matches
 // the plan. Management IPs always keep a lifeline so the dashboard can't lock
 // itself out. Denial counters are PER INTERFACE (the dataplane counts denials by
 // interface, not by destination), so the drawer scopes them to the host's iface.
 
-type Proto = 'tcp' | 'udp' | 'icmp'
-interface Svc { proto: Proto; port: number }
-interface Host { iface: string; ip: string; services: Svc[] }
-interface LiveProt { ip: string; services: { proto: string; port: number }[] }
-interface LiveIface { iface: string; protected: LiveProt[] }
-interface LiveResp { interfaces: LiveIface[]; unavailable?: boolean }
-
-const PROTO_TONE: Record<string, string> = { tcp: 'var(--s1)', udp: 'var(--s4)', icmp: 'var(--s2)' }
-const svcKey = (s: { proto: string; port: number }) => `${s.proto}/${s.port}`
-const hostKey = (iface: string, ip: string) => `${iface}|${ip}`
-const fmtSvc = (s: { proto: string; port: number }) => `${s.proto}/${s.port === 0 ? '*' : s.port}`
-const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-const validIp = (ip: string) => { const m = IPV4.exec(ip); return !!m && m.slice(1).every((o) => +o >= 0 && +o <= 255) }
-
-// Friendly names for common ports, and one-click presets for the editor.
-const WELL_KNOWN: Record<string, string> = {
-  'tcp/22': 'SSH', 'tcp/80': 'HTTP', 'tcp/443': 'HTTPS', 'tcp/3000': 'Dashboard', 'tcp/8006': 'Proxmox',
-  'tcp/3389': 'RDP', 'tcp/8080': 'HTTP-alt', 'tcp/5432': 'Postgres', 'tcp/6443': 'Kubernetes',
-  'tcp/53': 'DNS', 'udp/53': 'DNS', 'udp/123': 'NTP', 'udp/51820': 'WireGuard', 'icmp/0': 'ping',
-}
-const svcName = (s: { proto: string; port: number }) => WELL_KNOWN[svcKey(s)]
-
-function statusOf(applied: boolean, hasLive: boolean): { label: string; tone: Tone } {
-  if (applied) return { label: 'live', tone: 'good' }
-  if (hasLive) return { label: 'pending', tone: 'warn' }
-  return { label: 'not applied', tone: 'neutral' }
-}
-
-async function fetchLive(): Promise<LiveResp> {
-  const r = await fetch('/api/agent/api/services.json', { cache: 'no-store' })
-  if (!r.ok) return { interfaces: [], unavailable: true }
-  try { return await r.json() } catch { return { interfaces: [], unavailable: true } }
-}
-
 export default function Protection() {
   const rng = useRange()
+  const canPlan = useMe().can('protect.plan')
   const live = usePoll(fetchLive, 10_000)
   const deny = usePoll(async () => {
     const w = rng.resolve()
@@ -66,6 +35,7 @@ export default function Protection() {
     ])
     return { win: scalar(win, 0) ?? 0, life: scalar(life, 0) ?? 0 }
   }, 15_000, [rng.key])
+  const [meta, setMeta] = useState<Record<string, HostMeta>>({})
 
   const [hosts, setHosts] = useState<Host[]>([])
   const [saved, setSaved] = useState<string>('[]') // JSON of last-saved hosts, for dirty check
@@ -76,14 +46,25 @@ export default function Protection() {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
   const [ok, setOk] = useState('')
-  const [open, setOpen] = useState<number | null>(null) // selected host index for the drawer
-
   // live index: "iface|ip" -> Set of "proto/port"
   const liveIndex = useMemo(() => {
     const m = new Map<string, Set<string>>()
     for (const i of live.data?.interfaces ?? []) for (const p of i.protected) m.set(hostKey(i.iface, p.ip), new Set(p.services.map(svcKey)))
     return m
   }, [live.data])
+
+  // Nicknames for the host list.
+  useEffect(() => {
+    const load = () => fetch('/api/protect-meta', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setMeta(d.hosts || {})).catch(() => {})
+    load()
+    window.addEventListener('xs:protect-changed', load)
+    // Live: nicknames edited by someone else appear without a refresh.
+    const off = subscribeLive((ev, data) => {
+      if (ev === 'meta' && data?.ip) setMeta((m) => ({ ...m, [data.ip]: data.meta }))
+      else if (ev === 'hello') load()
+    })
+    return () => { window.removeEventListener('xs:protect-changed', load); off() }
+  }, [])
 
   // Load the plan once; if empty, seed from whatever is live so editing starts from reality.
   useEffect(() => {
@@ -124,8 +105,19 @@ export default function Protection() {
     return out
   }, [hosts, live.data])
 
-  const setHost = (idx: number, fn: (h: Host) => Host) => setHosts((hs) => hs.map((h, i) => (i === idx ? fn(h) : h)))
-  const removeHost = (idx: number) => setHosts((hs) => hs.filter((_, i) => i !== idx))
+  // Drops aimed at each protected host (victim map, sampled 1 in 16 drops).
+  const ipList = hosts.map((h) => h.ip).filter(validIp)
+  const ipRe = ipList.map((ip) => ip.replace(/\./g, '\\\\.')).join('|')
+  const targeted = usePoll(async () => {
+    if (!ipRe) return { total: 0, top: null as null | { ip: string; v: number } }
+    const w = rng.resolve()
+    const R = `${w.span}s`
+    const sel = `xs_target_packets_total{dst=~"${ipRe}"}`
+    const r = await instantAt(`clamp_min((sum by(dst)(${sel}) - sum by(dst)(${sel} offset ${R})) or sum by(dst)(${sel}), 0)`, w.end)
+    const rows = r.map((x) => ({ ip: x.metric.dst, v: parseFloat(x.value[1]) * 16 })).sort((a, b) => b.v - a.v)
+    return { total: rows.reduce((n, x) => n + x.v, 0), top: rows[0] && rows[0].v > 0 ? rows[0] : null }
+  }, 30_000, [rng.key, ipRe])
+  const nameOf = (ip: string) => meta[ip]?.nickname || ip
 
   async function save() {
     setBusy(true); setErr(''); setOk('')
@@ -135,14 +127,11 @@ export default function Protection() {
       if (!r.ok) { setErr(d?.error || `error ${r.status}`); setBusy(false); return }
       const h = (d.plan?.hosts || hosts) as Host[]
       setHosts(h); setSaved(JSON.stringify(h))
+      notifyProtectChanged()
       setOk('Saved — the box is applying it; live state refreshes in a few seconds.')
     } catch { setErr('could not reach the server') }
     setBusy(false)
   }
-
-  const sel = open != null && open < hosts.length ? hosts[open] : null
-  const selLive = sel ? liveIndex.get(hostKey(sel.iface, sel.ip)) : undefined
-  const selApplied = !!sel && !!selLive && selLive.size === sel.services.length && sel.services.every((s) => selLive.has(svcKey(s)))
 
   return (
     <div className="space-y-6">
@@ -157,6 +146,12 @@ export default function Protection() {
         <Stat label="Allowed services" icon={Lock} value={totals.svcs} sub="{proto, port} entries" color="var(--s4)" />
         <Stat label="Denied (lifetime)" icon={Ban} loading={!deny.data} value={si(deny.data?.life)} sub={deny.data ? `${si(deny.data.win)} in this window` : undefined} color="var(--s2)" />
         <Stat label="Blackholed" icon={AlertTriangle} value={totals.blackholed} sub="protected, zero services" color={totals.blackholed > 0 ? 'var(--st-crit)' : 'var(--s3)'} />
+      </div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Stat label="Attack drops at protected hosts" icon={Crosshair} loading={!targeted.data} value={si(targeted.data?.total)} sub="this window · estimated (sampled 1 in 16)" color="var(--s2)" />
+        <Stat label="Most targeted" icon={Server} loading={!targeted.data} value={targeted.data?.top ? nameOf(targeted.data.top.ip) : '—'} sub={targeted.data?.top ? `${si(targeted.data.top.v)} drops · ${targeted.data.top.ip}` : 'no drops in this window'} color="var(--s1)" />
+        <Stat label="Live on the dataplane" icon={ShieldCheck} loading={!live.data} value={`${hosts.filter((h) => isApplied(h, liveIndex.get(hostKey(h.iface, h.ip)))).length} / ${hosts.length}`} sub="hosts where plan = dataplane" color="var(--s3)" />
+        <Stat label="Documented" icon={Info} value={`${hosts.filter((h) => meta[h.ip]?.nickname || meta[h.ip]?.reports?.length || meta[h.ip]?.log?.length).length} / ${hosts.length}`} sub="hosts with a nickname, report or log" color="var(--s4)" />
       </div>
 
       {totals.blackholed > 0 && (
@@ -173,12 +168,14 @@ export default function Protection() {
         <div className="flex flex-wrap items-center gap-2 border-b border-nd-line bg-nd-panel px-5 py-3.5">
           <ShieldCheck className="h-4 w-4 text-nd-brand" />
           <span className="text-[13.5px] font-semibold text-nd-fg">Protected hosts</span>
-          <span className="text-[12px] text-nd-dim">default-deny — click a host for stats &amp; to edit its allowed services</span>
+          <span className="text-[12px] text-nd-dim">default-deny — open a host for its notes, ports &amp; statistics</span>
           <div className="ml-auto flex items-center gap-2">
             {dirty && <span className="text-[12px] text-st-warn-fg">unsaved</span>}
-            <button onClick={save} disabled={busy || !dirty} className="inline-flex items-center gap-1.5 rounded-lg bg-nd-brand px-3.5 py-2 text-[13px] font-semibold text-black shadow-nd transition-opacity hover:opacity-90 disabled:opacity-40">
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} Save &amp; apply
-            </button>
+            {canPlan ? (
+              <button onClick={save} disabled={busy || !dirty} className="inline-flex items-center gap-1.5 rounded-lg bg-nd-brand px-3.5 py-2 text-[13px] font-semibold text-black shadow-nd transition-opacity hover:opacity-90 disabled:opacity-40">
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} Save &amp; apply
+              </button>
+            ) : <NeedsPerm label="Edit protected hosts & ports" />}
           </div>
         </div>
 
@@ -190,15 +187,14 @@ export default function Protection() {
           ) : (
             hosts.map((h, idx) => {
               const liveSvcs = liveIndex.get(hostKey(h.iface, h.ip))
-              const applied = !!liveSvcs && liveSvcs.size === h.services.length && h.services.every((s) => liveSvcs.has(svcKey(s)))
               return (
-                <HostRow key={`${h.iface}|${h.ip}|${idx}`} host={h} applied={applied} hasLive={!!liveSvcs} selected={open === idx} onOpen={() => setOpen(idx)} />
+                <HostRow key={`${h.iface}|${h.ip}|${idx}`} host={h} nickname={meta[h.ip]?.nickname} applied={isApplied(h, liveSvcs)} hasLive={!!liveSvcs} />
               )
             })
           )}
         </div>
 
-        <AddHost management={management} lifeline={lifeline} ingress={ingress} existing={hosts} onAdd={(iface, ip, services) => setHosts((hs) => [...hs, { iface, ip, services }])} />
+        {canPlan && <AddHost management={management} lifeline={lifeline} ingress={ingress} existing={hosts} onAdd={(iface, ip, services) => setHosts((hs) => [...hs, { iface, ip, services }])} />}
 
         {(err || ok) && (
           <div className="border-t border-nd-line px-5 py-3">
@@ -226,34 +222,27 @@ export default function Protection() {
         <ShieldOff className="h-3.5 w-3.5" /> Management IPs ({management.join(', ') || '—'}) can be protected, but their lifeline ({lifeline.map(fmtSvc).join(', ') || '—'}) is always kept open so the dashboard can’t blackhole SSH or itself.
       </p>
 
-      {sel && (
-        <HostDrawer
-          host={sel}
-          applied={selApplied}
-          hasLive={!!selLive}
-          liveSvcs={selLive}
-          isMgmt={management.includes(sel.ip)}
-          lifeline={lifeline}
-          onClose={() => setOpen(null)}
-          onAddSvc={(s) => setHost(open!, (x) => (x.services.some((e) => svcKey(e) === svcKey(s)) ? x : { ...x, services: [...x.services, s] }))}
-          onRemoveSvc={(k) => setHost(open!, (x) => ({ ...x, services: x.services.filter((e) => svcKey(e) !== k) }))}
-          onRemove={() => { removeHost(open!); setOpen(null) }}
-        />
-      )}
     </div>
   )
 }
 
-function HostRow({ host, applied, hasLive, selected, onOpen }: {
-  host: Host; applied: boolean; hasLive: boolean; selected: boolean; onOpen: () => void
+function HostRow({ host, nickname, applied, hasLive }: {
+  host: Host; nickname?: string; applied: boolean; hasLive: boolean
 }) {
   const st = statusOf(applied, hasLive)
   const dotCls = st.tone === 'good' ? 'bg-st-good' : st.tone === 'warn' ? 'bg-st-warn' : 'bg-nd-faint'
   const txtCls = st.tone === 'good' ? 'text-st-good-fg' : st.tone === 'warn' ? 'text-st-warn-fg' : 'text-nd-dim'
   return (
-    <button onClick={onOpen} className={`flex w-full items-center gap-3 px-5 py-3.5 text-left transition-colors hover:bg-nd-fill ${selected ? 'bg-nd-fill' : ''}`}>
+    <Link href={hostHref(host.ip)} className="flex w-full items-center gap-3 px-5 py-3.5 text-left transition-colors hover:bg-nd-fill">
       <Server className="h-4 w-4 shrink-0 text-nd-dim" />
-      <span className="font-mono text-[13.5px] font-semibold text-nd-fg">{host.ip}</span>
+      {nickname ? (
+        <span className="flex min-w-0 flex-col leading-tight">
+          <span className="truncate text-[13.5px] font-semibold text-nd-fg">{nickname}</span>
+          <span className="font-mono text-[11.5px] text-nd-dim">{host.ip}</span>
+        </span>
+      ) : (
+        <span className="font-mono text-[13.5px] font-semibold text-nd-fg">{host.ip}</span>
+      )}
       <span className="rounded-md border border-nd-line bg-nd-fill px-1.5 py-0.5 text-[11px] text-nd-dim">{host.iface}</span>
       {host.services.length === 0 ? (
         <span className="inline-flex items-center gap-1 rounded-full bg-st-crit/10 px-2 py-0.5 text-[11px] font-medium text-st-crit-fg ring-1 ring-inset ring-st-crit/20"><AlertTriangle className="h-3 w-3" /> blackholed</span>
@@ -269,190 +258,7 @@ function HostRow({ host, applied, hasLive, selected, onOpen }: {
         <span className={`h-1.5 w-1.5 rounded-full ${dotCls}`} />{st.label}
       </span>
       <ChevronRight className="h-4 w-4 text-nd-faint" />
-    </button>
-  )
-}
-
-function HostDrawer({ host, applied, hasLive, liveSvcs, isMgmt, lifeline, onClose, onAddSvc, onRemoveSvc, onRemove }: {
-  host: Host; applied: boolean; hasLive: boolean; liveSvcs?: Set<string>; isMgmt: boolean; lifeline: Svc[]
-  onClose: () => void; onAddSvc: (s: Svc) => void; onRemoveSvc: (key: string) => void; onRemove: () => void
-}) {
-  const rng = useRange()
-  const iface = host.iface
-  const [confirmDel, setConfirmDel] = useState(false)
-  const st = statusOf(applied, hasLive)
-
-  const stats = usePoll(async () => {
-    const w = rng.resolve()
-    const [win, life] = await Promise.all([
-      instantAt(`sum(increase(xs_service_packets_total{iface="${iface}",event="deny"}[${w.span}s]))`, w.end),
-      instantAt(`sum(increase(xs_service_packets_total{iface="${iface}",event="deny"}[1y]))`, w.end),
-    ])
-    return { win: scalar(win, 0) ?? 0, life: scalar(life, 0) ?? 0 }
-  }, 15_000, [iface, rng.key])
-
-  const chart = usePoll(async () => {
-    const w = rng.resolve()
-    const step = niceStep(w.span, 160)
-    const rw = `${Math.max(60, step)}s`
-    const [dn, vd] = await Promise.all([
-      rangeAbs(`sum(rate(xs_service_packets_total{iface="${iface}",event="deny"}[${rw}]))`, w.end - w.span, w.end, step),
-      rangeAbs(`sum by(verdict)(rate(xs_verdict_packets_total{iface="${iface}",verdict=~"pass|drop"}[${rw}]))`, w.end - w.span, w.end, step),
-    ])
-    return {
-      deny: toSeries(dn, () => 'deny'),
-      verdict: toSeries(vd, (m) => m.verdict ?? 'drop'),
-      spanMs: w.span * 1000,
-    }
-  }, 30_000, [iface, rng.key])
-
-  useEffect(() => {
-    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    document.addEventListener('keydown', esc)
-    document.body.style.overflow = 'hidden'
-    return () => { document.removeEventListener('keydown', esc); document.body.style.overflow = '' }
-  }, [onClose])
-
-  const spanMs = chart.data?.spanMs ?? 3_600_000
-
-  return (
-    <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label={`Protected host ${host.ip}`}>
-      <button aria-label="Close" onClick={onClose} className="absolute inset-0 bg-black/30 backdrop-blur-[2px]" />
-      <div className="aa-in absolute inset-y-0 right-0 flex w-full max-w-[760px] flex-col border-l border-nd-line bg-nd-bg shadow-nd-lg">
-        <header className="flex items-start justify-between gap-4 border-b border-nd-line bg-nd-card px-6 py-5">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge tone="brand" icon={Server}>{host.iface}</Badge>
-              <Badge tone={st.tone}>{st.label}</Badge>
-              {host.services.length === 0 && <Badge tone="bad" icon={AlertTriangle}>blackholed</Badge>}
-              {isMgmt && <Badge tone="warn" icon={ShieldOff}>management</Badge>}
-            </div>
-            <h2 className="mt-2 font-mono text-[20px] font-semibold tracking-[-0.02em] text-nd-fg">{host.ip}</h2>
-            <p className="mt-1 text-[13px] text-nd-dim">Default-deny on {host.iface} — only the services below reach this host; everything else is dropped.</p>
-          </div>
-          <button onClick={onClose} aria-label="Close" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-nd-dim hover:bg-nd-fill hover:text-nd-fg"><X className="h-4 w-4" /></button>
-        </header>
-
-        <div className="flex-1 space-y-5 overflow-y-auto px-6 py-6">
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-            <Stat label="Allowed services" icon={Lock} value={host.services.length} sub="reach this host" color="var(--s4)" />
-            <Stat label="Denied (window)" icon={Ban} loading={!stats.data} value={si(stats.data?.win)} sub={`drops on ${iface}`} color="var(--s2)" />
-            <Stat label="Denied (lifetime)" icon={ShieldCheck} loading={!stats.data} value={si(stats.data?.life)} sub={`drops on ${iface}`} color="var(--s1)" />
-            <Stat label="State" icon={Activity} value={st.label} sub={applied ? 'plan = dataplane' : hasLive ? 'applying…' : 'not yet applied'} color={st.tone === 'good' ? 'var(--s3)' : 'var(--st-warn)'} />
-          </div>
-
-          <div className="flex items-start gap-2 rounded-xl border border-nd-line bg-nd-panel px-4 py-2.5 text-[11.5px] text-nd-dim">
-            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>The dataplane counts service-allowlist denials <strong className="font-medium text-nd-fg-2">per interface</strong>, not per destination — these figures are all protected-host drops on <span className="font-mono">{iface}</span>. Traffic that enters via another interface is counted there.</span>
-          </div>
-
-          <Panel icon={Ban} title="Denied packets" sub={`Service-allowlist drops on ${iface}, per second`}>
-            <TimeChart loading={!chart.data} data={chart.data?.deny ?? []} series={[{ key: 'deny', label: 'Denied', color: SERIES[1] }]} yfmt={pps} spanMs={spanMs} height={190} />
-          </Panel>
-
-          <Panel icon={ShieldCheck} title="Passed vs dropped" sub={`All verdicts on ${iface}, per second`}>
-            <TimeChart loading={!chart.data} data={chart.data?.verdict ?? []} series={[{ key: 'pass', label: 'Passed', color: SERIES[2] }, { key: 'drop', label: 'Dropped', color: SERIES[1] }]} yfmt={pps} spanMs={spanMs} height={190} />
-          </Panel>
-
-          {/* editor */}
-          <Panel
-            icon={Lock}
-            title="Allowed services"
-            sub="everything else to this host is dropped"
-            actions={
-              confirmDel ? (
-                <span className="inline-flex items-center gap-1.5">
-                  <button onClick={onRemove} className="inline-flex items-center gap-1 rounded-lg bg-st-crit px-2.5 py-1.5 text-[12px] font-medium text-white hover:opacity-90">unprotect host</button>
-                  <button onClick={() => setConfirmDel(false)} className="grid h-7 w-7 place-items-center rounded-lg border border-nd-line text-nd-muted hover:text-nd-fg"><X className="h-3.5 w-3.5" /></button>
-                </span>
-              ) : (
-                <button onClick={() => setConfirmDel(true)} className="inline-flex items-center gap-1 rounded-lg border border-nd-line px-2.5 py-1.5 text-[12px] font-medium text-st-crit-fg hover:border-st-crit/40"><Trash2 className="h-3.5 w-3.5" /> Unprotect</button>
-              )
-            }
-          >
-            <ServiceEditor
-              services={host.services}
-              onAdd={onAddSvc}
-              onRemove={onRemoveSvc}
-              toneFor={(s) => (liveSvcs ? (liveSvcs.has(svcKey(s)) ? 'good' : 'warn') : null)}
-              lockedKey={(k) => isMgmt && lifeline.some((l) => svcKey(l) === k)}
-            />
-            {host.services.length === 0 && <p className="mt-2 flex items-center gap-1 text-[11.5px] text-st-crit-fg"><AlertTriangle className="h-3 w-3" /> No services — this host is fully blackholed until you add one.</p>}
-            {isMgmt && <p className="mt-2 flex items-start gap-1 text-[11.5px] text-st-warn-fg"><ShieldOff className="mt-0.5 h-3 w-3 shrink-0" /> Management IP — its lifeline ({lifeline.map(fmtSvc).join(', ') || '—'}) is kept open automatically and can’t be removed.</p>}
-            <p className="mt-2 text-[11px] text-nd-faint">Changes here are staged — hit <strong className="font-medium">Save &amp; apply</strong> on the list to push them to the box.</p>
-          </Panel>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// Shared allowed-services editor: a table of rows (proto · port · name · status
-// · remove) with an add row at the bottom (segmented proto control + port).
-// Used in the host drawer (with live/pending status) and the add-host modal.
-function ServiceEditor({ services, onAdd, onRemove, toneFor, lockedKey }: {
-  services: Svc[]
-  onAdd: (s: Svc) => void
-  onRemove: (key: string) => void
-  toneFor?: (s: Svc) => 'good' | 'warn' | null
-  lockedKey?: (key: string) => boolean
-}) {
-  const [proto, setProto] = useState<Proto>('tcp')
-  const [port, setPort] = useState('')
-  function add() {
-    const svc: Svc = { proto, port: proto === 'icmp' ? 0 : Number(port) }
-    if (svc.proto !== 'icmp' && (!Number.isInteger(svc.port) || svc.port < 1 || svc.port > 65535)) return
-    if (!services.some((e) => svcKey(e) === svcKey(svc))) onAdd(svc)
-    setPort('')
-  }
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-nd-line">
-      {services.length > 0 && (
-        <div className="divide-y divide-nd-line">
-          {services.map((s) => {
-            const key = svcKey(s)
-            const tone = toneFor?.(s) ?? null
-            const locked = lockedKey?.(key) ?? false
-            const name = svcName(s)
-            return (
-              <div key={key} className="flex items-center gap-3 px-3 py-2 text-[12.5px]">
-                <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: PROTO_TONE[s.proto] ?? 'var(--s3)' }} />
-                <span className="w-9 font-mono uppercase tracking-wide text-nd-dim">{s.proto}</span>
-                <span className="w-12 font-mono font-semibold text-nd-fg">{s.port === 0 ? '*' : s.port}</span>
-                <span className="flex-1 truncate text-nd-fg-3">{name ?? <span className="text-nd-faint">—</span>}</span>
-                {tone && (
-                  <span className={`inline-flex items-center gap-1 text-[11px] ${tone === 'good' ? 'text-st-good-fg' : 'text-st-warn-fg'}`} title={tone === 'good' ? 'live on the dataplane' : 'pending — not applied yet'}>
-                    <span className={`h-1.5 w-1.5 rounded-full ${tone === 'good' ? 'bg-st-good' : 'bg-st-warn'}`} />
-                    {tone === 'good' ? 'live' : 'pending'}
-                  </span>
-                )}
-                {locked ? (
-                  <Lock className="h-3.5 w-3.5 shrink-0 text-nd-faint" aria-label="lifeline — can’t be removed" />
-                ) : (
-                  <button onClick={() => onRemove(key)} title="Remove service" className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-nd-faint transition-colors hover:bg-nd-fill hover:text-st-crit-fg"><X className="h-3.5 w-3.5" /></button>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      )}
-
-      <div className={`flex items-center gap-2 bg-nd-panel px-3 py-2 ${services.length > 0 ? 'border-t border-nd-line' : ''}`}>
-        <div className="inline-flex rounded-lg border border-nd-line bg-nd-card p-0.5">
-          {(['tcp', 'udp', 'icmp'] as Proto[]).map((p) => (
-            <button key={p} onClick={() => setProto(p)}
-              className={`rounded-md px-2.5 py-1 text-[12px] font-medium uppercase tracking-wide transition-colors ${proto === p ? 'bg-nd-fill text-nd-fg' : 'text-nd-dim hover:text-nd-fg'}`}>{p}</button>
-          ))}
-        </div>
-        {proto !== 'icmp' && (
-          <input value={port} onChange={(e) => setPort(e.target.value.replace(/\D/g, ''))} onKeyDown={(e) => e.key === 'Enter' && add()} placeholder="port"
-            className="w-24 rounded-lg border border-nd-line bg-nd-card px-2.5 py-1.5 text-[12.5px] text-nd-fg outline-none focus:border-nd-brand" />
-        )}
-        <button onClick={add} disabled={proto !== 'icmp' && !port}
-          className="ml-auto inline-flex items-center gap-1 rounded-lg bg-nd-brand px-3 py-1.5 text-[12px] font-semibold text-black transition-opacity hover:opacity-90 disabled:opacity-40"><Plus className="h-3.5 w-3.5" /> allow</button>
-      </div>
-    </div>
+    </Link>
   )
 }
 
@@ -460,6 +266,7 @@ function ServiceEditor({ services, onAdd, onRemove, toneFor, lockedKey }: {
 // the protected hosts. Always armed with an auto-revert timer (enforced on the
 // box) so it can never strand a remote operator.
 function LockdownCard() {
+  const canLock = useMe().can('protect.lockdown')
   const [s, setS] = useState<{ enabled: boolean; expires_at: number; now: number; ifaces: string[]; maxMinutes: number } | null>(null)
   const [minutes, setMinutes] = useState('15')
   const [busy, setBusy] = useState(false)
@@ -499,7 +306,9 @@ function LockdownCard() {
           <p className="text-[12px] text-nd-dim">Block every connection to your internal network — across the XDP dataplane (<span className="font-mono">{ifaceList}</span>) <strong>and over Twingate</strong> — except the protected hosts. {active ? `Auto-reverts in ${mmss(remaining)}.` : 'Your Twingate tunnel stays up, so you keep access and can lift it anytime. Arms with an auto-revert timer.'}</p>
         </div>
         <div className="ml-auto flex items-center gap-2">
-          {active ? (
+          {!canLock ? (
+            <NeedsPerm label="Arm & lift lockdown" />
+          ) : active ? (
             <button onClick={() => apply(false)} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg bg-st-crit px-3.5 py-2 text-[13px] font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldOff className="h-4 w-4" />} Lift now
             </button>

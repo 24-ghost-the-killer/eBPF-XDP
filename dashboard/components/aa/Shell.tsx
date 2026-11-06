@@ -4,7 +4,8 @@ import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import {
   LayoutDashboard, LineChart, ShieldAlert, Fingerprint, TerminalSquare, Search, Moon, Sun, RefreshCw,
-  CalendarRange, Shield, Lock, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, type LucideIcon,
+  CalendarRange, Shield, Lock, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, ArrowLeft, History,
+  Server, FileText, type LucideIcon,
 } from 'lucide-react'
 import { PAGES } from '@/lib/authz'
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from '@/components/ui/command'
@@ -13,6 +14,8 @@ import { usePoll } from '@/hooks/usePoll'
 import { niceStep } from '@/lib/stats'
 import { METRICS } from '@/lib/catalog'
 import { Segmented, IconButton, btn } from './kit'
+import { useProtect, fetchLive, hostHref, hostKey, svcKey, isApplied } from './protect'
+import { logEvent } from '@/lib/client-audit'
 
 // Frame for the analytics site (/analytics/*): grouped sidebar, header with
 // breadcrumbs, live state, a shared time range (presets or a custom window),
@@ -57,6 +60,14 @@ export const useRange = () => {
 const ThemeCtx = createContext<'light' | 'dark'>('light')
 export const useAATheme = () => useContext(ThemeCtx)
 
+// Who is signed in and what they may do, from /api/me (live permissions, not the
+// cookie's). `can()` is optimistic until loaded so controls don't flash disabled;
+// the server enforces every action regardless.
+export interface Me { username?: string; group?: string; perms?: string[]; isAdmin?: boolean; authDisabled?: boolean; kind?: string }
+interface MeCtxT { me: Me | null; loaded: boolean; can: (perm: string) => boolean }
+const MeCtx = createContext<MeCtxT>({ me: null, loaded: false, can: () => true })
+export const useMe = () => useContext(MeCtx)
+
 function windowOf(start: number, end: number): Window {
   const span = Math.max(60, end - start)
   const step = niceStep(span)
@@ -88,8 +99,9 @@ const NAV: { group: string; items: NavItem[] }[] = [
   {
     group: 'Administration',
     items: [
-      { href: '/analytics/users', label: 'Users', icon: Users, hint: 'Accounts and their group' },
-      { href: '/analytics/groups', label: 'Groups', icon: UsersRound, hint: 'Groups and per-page permissions' },
+      { href: '/analytics/users', label: 'Users', icon: Users, hint: 'Accounts, their group, status and last sign-in' },
+      { href: '/analytics/groups', label: 'Groups', icon: UsersRound, hint: 'Groups and their permissions — pages and what users may change there' },
+      { href: '/analytics/audit', label: 'Audit log', icon: History, hint: 'Every action on the dashboard — who did what, and when' },
     ],
   },
 ]
@@ -167,16 +179,33 @@ export default function Shell({ children }: { children: ReactNode }) {
   const [showCustom, setShowCustom] = useState(false)
   const [cmdOpen, setCmdOpen] = useState(false)
   const [cmdText, setCmdText] = useState('')
-  const [me, setMe] = useState<{ username?: string; group?: string; pages?: string[]; isAdmin?: boolean; authDisabled?: boolean } | null>(null)
+  const [me, setMe] = useState<Me | null>(null)
 
+  // Live identity + permissions; re-checked every minute and on navigation, so a
+  // changed group shows up without re-login and a disabled account is signed out.
   useEffect(() => {
     let alive = true
-    fetch('/api/me')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (alive && d) setMe(d) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
+    const load = () =>
+      fetch('/api/me', { cache: 'no-store' })
+        .then((r) => {
+          if (r.status === 401) { window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`; return null }
+          return r.ok ? r.json() : null
+        })
+        .then((d) => { if (alive && d) setMe(d) })
+        .catch(() => {})
+    load()
+    const t = setInterval(load, 60_000)
+    return () => { alive = false; clearInterval(t) }
+  }, [path])
+  // Audit: one "opened page" event per navigation (not per poll).
+  useEffect(() => {
+    const t = setTimeout(() => logEvent('view', 'view.page', `Opened ${path}${window.location.search}`, path), 400)
+    return () => clearTimeout(t)
+  }, [path])
+  const meCtx = useMemo<MeCtxT>(() => ({
+    me, loaded: !!me,
+    can: (perm: string) => !me || !!me.authDisabled || !!me.perms?.includes(perm),
+  }), [me])
 
   useEffect(() => {
     try {
@@ -240,23 +269,35 @@ export default function Shell({ children }: { children: ReactNode }) {
   // Nav filtered to the pages this user's group grants. While /api/me is still
   // loading (pages == null), show everything to avoid a flash of a shrinking
   // menu; auth-disabled servers report all pages, so nothing is hidden there.
-  const pages = me?.pages ?? null
+  const pages = me?.perms ?? null
   const can = useCallback((href: string) => {
     const id = PATH_PAGE[href]
     return !id || pages == null || pages.includes(id)
   }, [pages])
   const nav = useMemo(() => NAV.map((g) => ({ ...g, items: g.items.filter((n) => can(n.href)) })).filter((g) => g.items.length), [can])
   const allNav = useMemo(() => nav.flatMap((g) => g.items), [nav])
-  const page = ALL.find((n) => n.href === path) ?? ALL[0]
+  // Longest-prefix match, so /analytics/protect/<ip> still belongs to Protection.
+  const page = [...ALL].sort((a, b) => b.href.length - a.href.length).find((n) => path === n.href || (n.href !== '/analytics' && path.startsWith(n.href + '/'))) ?? ALL[0]
+  // Protection section: the sidebar switches to a list of the protected hosts.
+  const inProtect = path === '/analytics/protect' || path.startsWith('/analytics/protect/')
+  const hostIp = path.startsWith('/analytics/protect/') ? decodeURIComponent(path.slice('/analytics/protect/'.length).split('/')[0]) : null
+  const prot = useProtect(inProtect)
+  const protLive = usePoll(async () => (inProtect ? fetchLive() : null), 15_000, [inProtect])
+  const hostTitle = hostIp ? prot.meta[hostIp]?.nickname || hostIp : null
+  // /analytics/protect/<ip>/reports/<id>
+  const seg = path.split('/')
+  const reportId = hostIp && seg[4] === 'reports' && seg[5] ? decodeURIComponent(seg[5]) : null
+  const reportTitle = reportId && hostIp ? prot.meta[hostIp]?.reports?.find((r) => r.id === reportId)?.title || 'Report' : null
   const go = (href: string) => { setCmdOpen(false); setCmdText(''); router.push(href) }
   const ipCandidate = cmdText.trim()
 
   return (
     <ThemeCtx.Provider value={theme}>
+      <MeCtx.Provider value={meCtx}>
       <Ctx.Provider value={value}>
         <div className={`nd-${theme} aa-root min-h-screen bg-nd-bg text-nd-fg-2 antialiased`}>
           {/* sidebar */}
-          <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-nd-line bg-nd-panel lg:flex">
+          <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-nd-line bg-nd-panel lg:flex print:!hidden">
             <div className="flex items-center gap-3 px-5 pb-4 pt-5">
               <span className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-emerald-400 to-teal-600 text-white shadow-nd">
                 <Shield className="h-[18px] w-[18px]" strokeWidth={2.2} />
@@ -273,6 +314,9 @@ export default function Shell({ children }: { children: ReactNode }) {
                 <kbd className="rounded-md border border-nd-line bg-nd-fill px-1.5 py-0.5 text-[10.5px] font-medium">⌘K</kbd>
               </button>
             </div>
+            {inProtect ? (
+              <ProtectNav path={path} prot={prot} live={protLive.data ?? null} />
+            ) : (
             <nav className="mt-5 flex-1 space-y-5 overflow-y-auto px-3">
               {nav.map((g) => (
                 <div key={g.group}>
@@ -300,6 +344,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                 </div>
               ))}
             </nav>
+            )}
             <div className="m-3 rounded-xl border border-nd-line bg-nd-card p-3 shadow-nd">
               <div className="flex items-center gap-2 text-[12.5px] font-medium text-nd-fg-2">
                 <span className="relative flex h-2 w-2">
@@ -328,17 +373,33 @@ export default function Shell({ children }: { children: ReactNode }) {
             )}
           </aside>
 
-          <div className="lg:pl-64">
+          <div className="lg:pl-64 print:!pl-0">
             {/* header */}
-            <header className="sticky top-0 z-20 border-b border-nd-line bg-nd-bg/80 backdrop-blur-xl">
+            <header className="sticky top-0 z-20 border-b border-nd-line bg-nd-bg/80 backdrop-blur-xl print:hidden">
               <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 lg:px-8">
                 <div className="min-w-0">
                   <div className="flex items-center gap-1 text-[12px] text-nd-dim">
                     <span>Analytics</span>
                     <ChevronRight className="h-3 w-3" />
-                    <span className="text-nd-fg-3">{page.label}</span>
+                    {hostTitle ? (
+                      <>
+                        <Link href={page.href} className="hover:text-nd-fg">{page.label}</Link>
+                        <ChevronRight className="h-3 w-3" />
+                        {reportTitle ? (
+                          <>
+                            <Link href={hostHref(hostIp!)} className="hover:text-nd-fg">{hostTitle}</Link>
+                            <ChevronRight className="h-3 w-3" />
+                            <span className="truncate text-nd-fg-3">{reportTitle}</span>
+                          </>
+                        ) : (
+                          <span className="text-nd-fg-3">{hostTitle}</span>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-nd-fg-3">{page.label}</span>
+                    )}
                   </div>
-                  <h1 className="mt-0.5 text-[20px] font-semibold tracking-[-0.02em] text-nd-fg">{page.label}</h1>
+                  <h1 className="mt-0.5 text-[20px] font-semibold tracking-[-0.02em] text-nd-fg">{reportTitle ? `${hostTitle} · report` : hostTitle ?? page.label}</h1>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <span className={`hidden items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-medium sm:inline-flex ${live ? 'bg-st-good/10 text-st-good-fg' : 'bg-nd-fill text-nd-muted'}`}>
@@ -370,7 +431,7 @@ export default function Shell({ children }: { children: ReactNode }) {
               </nav>
             </header>
             <main className="mx-auto max-w-[1480px] px-4 py-6 lg:px-8 lg:py-8">
-              <p className="mb-6 text-[13.5px] text-nd-dim">{page.hint} · <span className="text-nd-muted">{value.label}</span></p>
+              <p className="mb-6 text-[13.5px] text-nd-dim print:hidden">{reportTitle ? 'Report — click Edit to change it; other editors’ saves are merged, never overwritten' : hostIp ? 'Protected host — reports, log, allowed ports and statistics' : page.hint} · <span className="text-nd-muted">{value.label}</span></p>
               {children}
             </main>
           </div>
@@ -430,6 +491,93 @@ export default function Shell({ children }: { children: ReactNode }) {
           </CommandDialog>
         </div>
       </Ctx.Provider>
+      </MeCtx.Provider>
     </ThemeCtx.Provider>
+  )
+}
+
+// Sidebar shown inside the Protection section: a way back to the full menu, the
+// overview, and one entry per protected host (nickname first, IP underneath).
+// Hosts that only have notes (e.g. unprotected for now) are listed separately so
+// their documentation stays reachable.
+function ProtectNav({ path, prot, live }: {
+  path: string
+  prot: ReturnType<typeof useProtect>
+  live: Awaited<ReturnType<typeof fetchLive>> | null
+}) {
+  const liveIndex = useMemo(() => {
+    const m = new Map<string, Set<string>>()
+    for (const i of live?.interfaces ?? []) for (const p of i.protected) m.set(hostKey(i.iface, p.ip), new Set(p.services.map(svcKey)))
+    return m
+  }, [live])
+  const planIps = new Set(prot.hosts.map((h) => h.ip))
+  const documented = Object.keys(prot.meta).filter((ip) => !planIps.has(ip)).sort()
+  const item = (href: string, on: boolean, icon: LucideIcon, title: string, sub?: string, dot?: string) => {
+    const I = icon
+    return (
+      <li key={href}>
+        <Link
+          href={href}
+          aria-current={on ? 'page' : undefined}
+          className={`relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] transition-colors ${
+            on ? 'bg-nd-card font-medium text-nd-fg shadow-nd ring-1 ring-nd-line' : 'text-nd-muted hover:bg-nd-fill hover:text-nd-fg'
+          }`}
+        >
+          {on && <span className="absolute -left-3 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-nd-brand" />}
+          <I className={`h-4 w-4 shrink-0 ${on ? 'text-nd-brand' : 'text-nd-dim'}`} />
+          <span className="min-w-0 flex-1 leading-tight">
+            <span className="block truncate">{title}</span>
+            {sub && <span className="block truncate font-mono text-[11px] text-nd-faint">{sub}</span>}
+          </span>
+          {dot && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} />}
+        </Link>
+      </li>
+    )
+  }
+  return (
+    <nav className="mt-5 flex-1 space-y-5 overflow-y-auto px-3">
+      <div>
+        <Link href="/analytics" className="flex items-center gap-2 rounded-lg px-2.5 py-2 text-[13px] text-nd-dim transition-colors hover:bg-nd-fill hover:text-nd-fg">
+          <ArrowLeft className="h-4 w-4" /> All pages
+        </Link>
+      </div>
+      <div>
+        <div className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-nd-faint">Protection</div>
+        <ul className="space-y-0.5">{item('/analytics/protect', path === '/analytics/protect', Lock, 'Overview')}</ul>
+      </div>
+      <div>
+        <div className="flex items-center justify-between px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-nd-faint">
+          <span>Protected hosts</span>
+          {prot.loaded && <span className="font-medium normal-case tracking-normal">{prot.hosts.length}</span>}
+        </div>
+        {!prot.loaded ? (
+          <div className="space-y-1.5 px-1">{[0, 1, 2].map((i) => <div key={i} className="aa-skeleton h-9 rounded-lg" />)}</div>
+        ) : prot.hosts.length === 0 ? (
+          <p className="px-2.5 text-[12px] text-nd-faint">No protected hosts yet.</p>
+        ) : (
+          <ul className="space-y-0.5">
+            {prot.hosts.map((h) => {
+              const nick = prot.meta[h.ip]?.nickname
+              const lv = liveIndex.get(hostKey(h.iface, h.ip))
+              const dot = h.services.length === 0 ? 'bg-st-crit' : isApplied(h, lv) ? 'bg-st-good' : lv ? 'bg-st-warn' : 'bg-nd-faint'
+              const href = hostHref(h.ip)
+              return item(href, path === href || path.startsWith(href + '/'), Server, nick || h.ip, nick ? h.ip : undefined, dot)
+            })}
+          </ul>
+        )}
+      </div>
+      {documented.length > 0 && (
+        <div>
+          <div className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-nd-faint">Documented · not protected</div>
+          <ul className="space-y-0.5">
+            {documented.map((ip) => {
+              const nick = prot.meta[ip]?.nickname
+              const href = hostHref(ip)
+              return item(href, path === href || path.startsWith(href + '/'), FileText, nick || ip, nick ? ip : undefined)
+            })}
+          </ul>
+        </div>
+      )}
+    </nav>
   )
 }
