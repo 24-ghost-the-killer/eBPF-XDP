@@ -17,14 +17,17 @@ export async function PATCH(req: NextRequest, { params }: { params: { name: stri
   const a = await requireAdmin(req)
   if (a.error) return a.error
   const name = decodeURIComponent(params.name)
-  let body: { perms?: unknown; pages?: unknown; name?: unknown } = {}
+  let body: { perms?: unknown; pages?: unknown; name?: unknown; requireMfa?: unknown } = {}
   try { body = await req.json() } catch {}
   const perms = Array.isArray(body.perms) ? body.perms : Array.isArray(body.pages) ? body.pages : undefined
   const newName = typeof body.name === 'string' ? body.name.trim() : undefined
-  if (perms === undefined && newName === undefined) return NextResponse.json({ error: 'nothing to change' }, { status: 400 })
+  const requireMfa = typeof body.requireMfa === 'boolean' ? body.requireMfa : undefined
+  if (perms === undefined && newName === undefined && requireMfa === undefined) return NextResponse.json({ error: 'nothing to change' }, { status: 400 })
   try {
     const before = listGroups().find((g) => g.name === name)
-    const group = updateGroup(name, { perms: perms as string[] | undefined, newName })
+    const group = updateGroup(name, { perms: perms as string[] | undefined, newName, requireMfa })
+    if (before && requireMfa !== undefined && !!before.requireMfa !== requireMfa) audit(req, { user: a.caller.username ?? '', category: 'groups', action: 'groups.require_mfa', target: `group:${group.name}`,
+      summary: requireMfa ? `Group ${group.name} now REQUIRES two-factor for its members` : `Group ${group.name} no longer requires two-factor` })
     const by = a.caller.username ?? ''
     if (newName && newName !== name) audit(req, { user: by, category: 'groups', action: 'groups.rename', target: `group:${group.name}`, summary: `Renamed group ${name} to ${group.name}`, detail: { from: name, to: group.name } })
     if (before && perms) {

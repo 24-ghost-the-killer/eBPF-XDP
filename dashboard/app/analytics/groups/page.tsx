@@ -8,7 +8,7 @@ import {
 } from '@/components/aa/admin'
 import {
   UsersRound, Plus, Trash2, Loader2, AlertTriangle, Check, ShieldCheck, ChevronRight, Layers, Copy, Pencil,
-  RotateCcw, Sparkles, X, ShieldAlert, Lock,
+  RotateCcw, Sparkles, X, ShieldAlert, Lock, Smartphone,
 } from 'lucide-react'
 
 // Groups & permissions — master/detail: groups on the left, the selected
@@ -114,6 +114,7 @@ function GroupEditor({ mode, group, cat, groups, onSaved, onDeleted, onDuplicate
   const [name, setName] = useState(group?.name ?? '')
   const [renaming, setRenaming] = useState(false)
   const [perms, setPerms] = useState<Set<string>>(() => new Set(group?.perms ?? []))
+  const [requireMfa, setRequireMfa] = useState(!!group?.requireMfa)
   const [copyFrom, setCopyFrom] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
@@ -122,7 +123,8 @@ function GroupEditor({ mode, group, cat, groups, onSaved, onDeleted, onDuplicate
   const members = group?.members ?? []
   const permsDirty = mode === 'new' || !sameSet(perms, group!.perms)
   const nameDirty = mode === 'edit' && name.trim() !== group!.name
-  const dirty = permsDirty || nameDirty
+  const mfaDirty = mode === 'new' ? requireMfa : requireMfa !== !!group!.requireMfa
+  const dirty = permsDirty || nameDirty || mfaDirty
   const sum = summarize([...perms], cat)
   const removingAdmin = mode === 'edit' && group!.perms.includes(cat.adminPage) && !perms.has(cat.adminPage) && members.length > 0
 
@@ -143,10 +145,10 @@ function GroupEditor({ mode, group, cat, groups, onSaved, onDeleted, onDuplicate
     setBusy(true); setErr('')
     try {
       const r = mode === 'new'
-        ? await fetch('/api/groups', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name.trim(), perms: [...perms] }) })
+        ? await fetch('/api/groups', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name.trim(), perms: [...perms], requireMfa }) })
         : await fetch(`/api/groups/${encodeURIComponent(group!.name)}`, {
             method: 'PATCH', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...(permsDirty ? { perms: [...perms] } : {}), ...(nameDirty ? { name: name.trim() } : {}) }),
+            body: JSON.stringify({ ...(permsDirty ? { perms: [...perms] } : {}), ...(nameDirty ? { name: name.trim() } : {}), ...(mfaDirty ? { requireMfa } : {}) }),
           })
       if (!r.ok) { setErr(await readError(r)); setBusy(false); return }
       setBusy(false); setRenaming(false); onSaved(name.trim())
@@ -265,6 +267,18 @@ function GroupEditor({ mode, group, cat, groups, onSaved, onDeleted, onDuplicate
             </div>
           ))}
         </div>
+
+        {/* two-factor policy */}
+        <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-nd-line p-4">
+          <Toggle on={requireMfa} onChange={setRequireMfa} />
+          <span className="min-w-0">
+            <span className="flex items-center gap-1.5 text-[13.5px] font-medium text-nd-fg"><Smartphone className="h-4 w-4 text-nd-dim" /> Require two-factor authentication</span>
+            <span className="block text-[12px] text-nd-dim">
+              Members must sign in with a code from an authenticator app. Anyone without it is sent to their profile to set it up and can’t use anything else until they do.
+              {mode === 'edit' && requireMfa && <> {members.length} member{members.length === 1 ? '' : 's'} — check the Users tab to see who still needs to set it up.</>}
+            </span>
+          </span>
+        </label>
 
         {/* members */}
         {mode === 'edit' && (

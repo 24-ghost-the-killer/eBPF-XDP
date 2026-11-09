@@ -41,6 +41,11 @@ export async function requirePerm(
     if (req.method !== 'GET') audit(req, { user: '', category: 'access', action: 'access.unauthorized', target: path, summary: `Not signed in: ${req.method} ${path}`, result: 'denied' })
     return { error: NextResponse.json({ error: 'unauthorized' }, { status: 401 }) }
   }
+  if (access.mfaSetupRequired) {
+    // The group requires two-factor and this user hasn't set it up: nothing but
+    // their own profile (which doesn't go through here) works until they do.
+    return { error: NextResponse.json({ error: 'mfa_setup_required', hint: 'set up two-factor on your profile page' }, { status: 403 }) }
+  }
   if (perm && !access.perms.includes(perm)) {
     audit(req, { user: access.username, kind: access.kind, category: 'access', action: 'access.denied', target: path, summary: `Lacks “${perm}”: ${req.method} ${path}`, detail: { need: perm, method: req.method }, result: 'denied' })
     return { error: NextResponse.json({ error: 'forbidden', need: perm }, { status: 403 }) }

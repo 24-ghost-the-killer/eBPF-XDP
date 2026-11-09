@@ -25,10 +25,19 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, statSync
 import { dirname } from 'node:path'
 import { scryptSync, timingSafeEqual as nodeTimingSafeEqual, randomBytes } from 'node:crypto'
 import { PERM_IDS, ADMIN_PAGE, ACTIONS, effectivePerms, PRESETS, type Session, type SessionKind } from './authz'
+import { newSecret, verifyTotp, newRecoveryCodes, hashRecovery, looksLikeRecovery } from './totp'
 
-export interface Group { name: string; perms: string[] }
-export interface StoredUser { username: string; group: string; password: string; disabled?: boolean; createdAt?: number; lastLogin?: number; epoch?: number }
-export interface SafeUser { username: string; group: string; disabled: boolean; createdAt: number; lastLogin: number }
+// requireMfa: members must turn on two-factor before they can use anything else.
+export interface Group { name: string; perms: string[]; requireMfa?: boolean }
+// Two-factor (TOTP). `secret` is the base32 key (the file is 0600, dashboard-only);
+// `lastStep` blocks code replay; `recovery` holds SHA-256 hashes of unused
+// one-time recovery codes. `mfaPending` is a key being set up, not yet confirmed.
+export interface Mfa { secret: string; enabledAt: number; lastStep: number; recovery: string[] }
+export interface StoredUser {
+  username: string; group: string; password: string; disabled?: boolean; createdAt?: number; lastLogin?: number; epoch?: number
+  mfa?: Mfa; mfaPending?: { secret: string; createdAt: number }
+}
+export interface SafeUser { username: string; group: string; disabled: boolean; createdAt: number; lastLogin: number; mfa: boolean }
 export interface Store { groups: Group[]; users: StoredUser[] }
 
 const DEFAULT_FILE = '/etc/xdp-sentinel/dash-users.json'
@@ -65,7 +74,7 @@ function parseStore(raw: string): Store {
           if (ver < 2) for (const a of ACTIONS) if (perms.includes(a.page)) perms = [...perms, a.id]
           // v3 added the Audit log page: existing admin groups get it.
           if (ver < 3 && perms.includes(ADMIN_PAGE) && !perms.includes('audit')) perms = [...perms, 'audit']
-          return { name: g.name, perms: effectivePerms(perms) }
+          return { name: g.name, perms: effectivePerms(perms), ...(g.requireMfa === true ? { requireMfa: true } : {}) }
         })
     : []
   const users: StoredUser[] = Array.isArray(data?.users)
@@ -77,6 +86,10 @@ function parseStore(raw: string): Store {
           createdAt: Number(u.createdAt) || undefined,
           lastLogin: Number(u.lastLogin) || undefined,
           epoch: Number(u.epoch) || undefined,
+          mfa: u.mfa && typeof u.mfa.secret === 'string'
+            ? { secret: u.mfa.secret, enabledAt: Number(u.mfa.enabledAt) || 0, lastStep: Number(u.mfa.lastStep) || 0, recovery: Array.isArray(u.mfa.recovery) ? u.mfa.recovery.filter((x: unknown) => typeof x === 'string') : [] }
+            : undefined,
+          mfaPending: u.mfaPending && typeof u.mfaPending.secret === 'string' ? { secret: u.mfaPending.secret, createdAt: Number(u.mfaPending.createdAt) || 0 } : undefined,
         }))
     : []
   return { groups: groups.length ? groups : DEFAULT_GROUPS(), users }
@@ -104,10 +117,10 @@ export function loadStore(): Store {
   return cache
 }
 
-const safe = (u: StoredUser): SafeUser => ({ username: u.username, group: u.group, disabled: !!u.disabled, createdAt: u.createdAt || 0, lastLogin: u.lastLogin || 0 })
+const safe = (u: StoredUser): SafeUser => ({ username: u.username, group: u.group, disabled: !!u.disabled, createdAt: u.createdAt || 0, lastLogin: u.lastLogin || 0, mfa: !!u.mfa })
 
 export function listGroups(): Group[] {
-  return loadStore().groups.map((g) => ({ name: g.name, perms: [...g.perms] })).sort((a, b) => a.name.localeCompare(b.name))
+  return loadStore().groups.map((g) => ({ name: g.name, perms: [...g.perms], requireMfa: !!g.requireMfa })).sort((a, b) => a.name.localeCompare(b.name))
 }
 export function listUsers(): SafeUser[] {
   return loadStore().users.map(safe).sort((a, b) => a.username.localeCompare(b.username))
@@ -158,7 +171,9 @@ export function verifyPassword(password: string, stored: string): boolean {
   }
 }
 
-export interface AuthResult { username: string; group: string; perms: string[]; kind: SessionKind; epoch: number }
+// needsMfa: the password was right, but the user has two-factor on, so the
+// session is only issued after a valid code (see /api/login + verifySecondFactor).
+export interface AuthResult { username: string; group: string; perms: string[]; kind: SessionKind; epoch: number; needsMfa?: boolean }
 
 // A hash to verify against when the username doesn't exist, so a wrong username
 // costs the same scrypt time as a wrong password (no user enumeration by timing).
@@ -172,10 +187,8 @@ export function authenticate(username: string, password: string): AuthResult | n
     ?? store.users.find((x) => x.username.toLowerCase() === username.toLowerCase())
   if (!u) verifyPassword(password, (dummyHash ??= hashPassword(randomBytes(12).toString('hex'))))
   if (u && !u.disabled && verifyPassword(password, u.password)) {
-    // Record the login (best effort — never block sign-in on a write error).
-    if (!inlineMode()) {
-      try { persist({ groups: store.groups, users: store.users.map((x) => (x === u ? { ...x, lastLogin: Math.floor(Date.now() / 1000) } : x)) }) } catch {}
-    }
+    if (u.mfa) return { username: u.username, group: u.group, perms: [], kind: 'user', epoch: u.epoch || 0, needsMfa: true }
+    recordLogin(u.username)
     return { username: u.username, group: u.group, perms: permsForGroup(u.group), kind: 'user', epoch: u.epoch || 0 }
   }
   const legacy = process.env.DASH_PASSWORD
@@ -188,11 +201,115 @@ export function authenticate(username: string, password: string): AuthResult | n
   return null
 }
 
+// Record a successful sign-in (best effort — never block sign-in on a write error).
+function recordLogin(username: string) {
+  if (inlineMode()) return
+  const store = loadStore()
+  try { persist({ groups: store.groups, users: store.users.map((x) => (x.username === username ? { ...x, lastLogin: Math.floor(Date.now() / 1000) } : x)) }) } catch {}
+}
+
+// ---- two-factor ------------------------------------------------------------
+
+function mutateUser(username: string, fn: (u: StoredUser) => StoredUser): StoredUser {
+  assertWritable()
+  const store = loadStore()
+  const idx = store.users.findIndex((u) => u.username === username)
+  if (idx === -1) throw new UserError(`no such user "${username}"`, 404)
+  const next = fn({ ...store.users[idx] })
+  persist({ groups: store.groups, users: store.users.map((u, i) => (i === idx ? next : u)) })
+  return next
+}
+const findUser = (username: string) => loadStore().users.find((u) => u.username === username)
+
+// Second step of sign-in: a 6-digit TOTP code or a one-time recovery code.
+// On success records the login and returns the session data; null otherwise.
+export function verifySecondFactor(username: string, code: string): (AuthResult & { usedRecovery?: boolean; recoveryLeft?: number }) | null {
+  const u = findUser(username)
+  if (!u || u.disabled || !u.mfa) return null
+  const mfa = u.mfa
+  const step = verifyTotp(mfa.secret, code, mfa.lastStep)
+  let usedRecovery = false
+  if (step !== null) {
+    mutateUser(username, (x) => ({ ...x, mfa: { ...mfa, lastStep: step } }))
+  } else if (looksLikeRecovery(code) && mfa.recovery.includes(hashRecovery(code))) {
+    const h = hashRecovery(code)
+    mutateUser(username, (x) => ({ ...x, mfa: { ...mfa, recovery: mfa.recovery.filter((r) => r !== h) } }))
+    usedRecovery = true
+  } else {
+    return null
+  }
+  recordLogin(username)
+  const after = findUser(username)!
+  return { username, group: after.group, perms: permsForGroup(after.group), kind: 'user', epoch: after.epoch || 0, usedRecovery, recoveryLeft: after.mfa?.recovery.length ?? 0 }
+}
+
+export interface MfaStatus { enabled: boolean; enabledAt: number; recoveryLeft: number; required: boolean; pending: boolean }
+export function mfaStatus(username: string): MfaStatus {
+  const u = findUser(username)
+  const g = u && loadStore().groups.find((x) => x.name === u.group)
+  return { enabled: !!u?.mfa, enabledAt: u?.mfa?.enabledAt || 0, recoveryLeft: u?.mfa?.recovery.length ?? 0, required: !!g?.requireMfa, pending: !!u?.mfaPending }
+}
+
+// Start (or restart) setup: a fresh secret, kept pending until confirmed.
+export function beginMfaSetup(username: string): string {
+  const u = findUser(username)
+  if (u?.mfa) throw new UserError('two-factor is already on — turn it off first to change authenticator', 409)
+  const secret = newSecret()
+  mutateUser(username, (x) => ({ ...x, mfaPending: { secret, createdAt: Math.floor(Date.now() / 1000) } }))
+  return secret
+}
+
+// Confirm setup with a code from the app; returns the recovery codes (shown once).
+export function confirmMfaSetup(username: string, code: string): string[] {
+  const u = findUser(username)
+  if (!u?.mfaPending) throw new UserError('start the setup again — no pending authenticator', 409)
+  if (Date.now() / 1000 - u.mfaPending.createdAt > 15 * 60) throw new UserError('the setup expired — start again', 409)
+  const step = verifyTotp(u.mfaPending.secret, code, 0)
+  if (step === null) throw new UserError('that code is not right — check the time on your phone and try the next code', 400)
+  const codes = newRecoveryCodes()
+  mutateUser(username, (x) => {
+    const { mfaPending, ...rest } = x
+    return { ...rest, mfa: { secret: mfaPending!.secret, enabledAt: Math.floor(Date.now() / 1000), lastStep: step, recovery: codes.map(hashRecovery) } }
+  })
+  return codes
+}
+
+// Check a current TOTP code for a sensitive self-service action (no recovery codes).
+export function checkTotp(username: string, code: string): boolean {
+  const u = findUser(username)
+  if (!u?.mfa) return false
+  const step = verifyTotp(u.mfa.secret, code, u.mfa.lastStep)
+  if (step === null) return false
+  mutateUser(username, (x) => ({ ...x, mfa: { ...x.mfa!, lastStep: step } }))
+  return true
+}
+
+export function regenerateRecovery(username: string): string[] {
+  const codes = newRecoveryCodes()
+  mutateUser(username, (x) => {
+    if (!x.mfa) throw new UserError('two-factor is not on', 409)
+    return { ...x, mfa: { ...x.mfa, recovery: codes.map(hashRecovery) } }
+  })
+  return codes
+}
+
+// Turn two-factor off (self-service after re-authentication, or an admin reset).
+export function disableMfa(username: string): void {
+  mutateUser(username, (x) => { const { mfa, mfaPending, ...rest } = x; return rest })
+}
+
+export function checkPassword(username: string, password: string): boolean {
+  const u = findUser(username)
+  return !!u && !u.disabled && verifyPassword(password, u.password)
+}
+
 // ---- live access -----------------------------------------------------------
 // Resolve a verified session against the CURRENT store, so a permission change,
 // group change, disabled account or deleted user takes effect on the very next
 // request instead of when the year-long cookie expires.
-export interface Access { username: string; group: string; perms: string[]; kind: SessionKind; epoch: number }
+// mfaSetupRequired: the user's group requires two-factor and they haven't set it
+// up — every API except their own profile refuses until they do.
+export interface Access { username: string; group: string; perms: string[]; kind: SessionKind; epoch: number; mfaSetupRequired?: boolean }
 
 export function liveAccess(s: Session): Access | null {
   const kind: SessionKind = s.k ?? 'user'
@@ -205,7 +322,8 @@ export function liveAccess(s: Session): Access | null {
   const u = loadStore().users.find((x) => x.username === s.u)
   if (u) {
     if (u.disabled || (s.e ?? 0) < (u.epoch || 0)) return null // disabled, or this cookie was revoked
-    return { username: u.username, group: u.group, perms: permsForGroup(u.group), kind, epoch: u.epoch || 0 }
+    const g = loadStore().groups.find((x) => x.name === u.group)
+    return { username: u.username, group: u.group, perms: permsForGroup(u.group), kind, epoch: u.epoch || 0, mfaSetupRequired: !!g?.requireMfa && !u.mfa }
   }
   // Tokens issued before sessions carried a kind: a DASH_PASSWORD sign-in under
   // an arbitrary name. (The old year-long default-admin cookies are not honoured.)
@@ -230,13 +348,15 @@ function persist(store: Store) {
   const file = filePath()
   const out = {
     version: STORE_VERSION,
-    groups: store.groups.map((g) => ({ name: g.name, pages: g.perms })),
+    groups: store.groups.map((g) => ({ name: g.name, pages: g.perms, ...(g.requireMfa ? { requireMfa: true } : {}) })),
     users: store.users.map((u) => ({
       username: u.username, group: u.group, password: u.password,
       ...(u.disabled ? { disabled: true } : {}),
       ...(u.createdAt ? { createdAt: u.createdAt } : {}),
       ...(u.lastLogin ? { lastLogin: u.lastLogin } : {}),
       ...(u.epoch ? { epoch: u.epoch } : {}),
+      ...(u.mfa ? { mfa: u.mfa } : {}),
+      ...(u.mfaPending ? { mfaPending: u.mfaPending } : {}),
     })),
   }
   try {
@@ -256,12 +376,12 @@ function guardAdmins(before: Store, after: Store, msg: string) {
 }
 
 // --- groups ---
-export function addGroup(name: string, perms: string[]): Group {
+export function addGroup(name: string, perms: string[], requireMfa = false): Group {
   assertWritable()
   if (!NAME_RE.test(name)) throw new UserError('group name must be 1–32 chars: letters, digits, dot, dash, underscore')
   const store = loadStore()
   if (store.groups.some((g) => g.name === name)) throw new UserError(`group "${name}" already exists`, 409)
-  const g: Group = { name, perms: effectivePerms(perms) }
+  const g: Group = { name, perms: effectivePerms(perms), ...(requireMfa ? { requireMfa: true } : {}) }
   persist({ ...store, groups: [...store.groups, g] })
   return g
 }
@@ -269,12 +389,14 @@ export function userEpoch(username: string): number {
   return loadStore().users.find((u) => u.username === username)?.epoch || 0
 }
 
-export function updateGroup(name: string, changes: { perms?: string[]; newName?: string }): Group {
+export function updateGroup(name: string, changes: { perms?: string[]; newName?: string; requireMfa?: boolean }): Group {
   assertWritable()
   const store = loadStore()
   const cur = store.groups.find((g) => g.name === name)
   if (!cur) throw new UserError(`no such group "${name}"`, 404)
   const next: Group = { name: cur.name, perms: changes.perms ? effectivePerms(changes.perms) : [...cur.perms] }
+  const req = changes.requireMfa ?? cur.requireMfa
+  if (req) next.requireMfa = true
   let users = store.users
   if (changes.newName !== undefined && changes.newName !== name) {
     if (!NAME_RE.test(changes.newName)) throw new UserError('group name must be 1–32 chars: letters, digits, dot, dash, underscore')

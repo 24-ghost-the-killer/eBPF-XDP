@@ -12,8 +12,8 @@ export interface ActionDef { id: string; page: string; label: string; hint: stri
 export interface AreaDef { id: string; label: string; pages: string[] }
 export interface PresetDef { id: string; label: string; hint: string; perms: string[] }
 export interface Catalog { pages: PageDef[]; actions: ActionDef[]; areas: AreaDef[]; presets: PresetDef[]; adminPage: string }
-export interface Group { name: string; perms: string[]; members?: string[] }
-export interface SafeUser { username: string; group: string; disabled: boolean; createdAt: number; lastLogin: number }
+export interface Group { name: string; perms: string[]; members?: string[]; requireMfa?: boolean }
+export interface SafeUser { username: string; group: string; disabled: boolean; createdAt: number; lastLogin: number; mfa: boolean }
 
 export async function readError(r: Response): Promise<string> {
   try { const j = await r.json(); return j?.error || `error ${r.status}` } catch { return `error ${r.status}` }

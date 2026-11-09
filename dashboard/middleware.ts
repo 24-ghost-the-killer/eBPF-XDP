@@ -14,7 +14,9 @@ function auditFromEdge(req: NextRequest, ev: NextFetchEvent, secret: string, e: 
   const body = JSON.stringify({ ...e, category: 'access', result: 'denied', ip: req.headers.get('x-forwarded-for')?.split(',')[0].trim() || req.headers.get('x-real-ip') || null, ua: req.headers.get('user-agent')?.slice(0, 160) || null })
   ev.waitUntil(
     signInternal(secret, body)
-      .then((sig) => fetch(new URL('/api/audit', req.nextUrl.origin), { method: 'POST', headers: { 'content-type': 'application/json', 'x-xs-audit-sig': sig }, body }))
+      // Straight to the app (DASH_INTERNAL_URL, e.g. http://127.0.0.1:3001 behind the
+      // TLS proxy) — not back out through the public HTTPS origin.
+      .then((sig) => fetch(new URL('/api/audit', process.env.DASH_INTERNAL_URL || req.nextUrl.origin), { method: 'POST', headers: { 'content-type': 'application/json', 'x-xs-audit-sig': sig }, body }))
       .catch(() => {}),
   )
 }

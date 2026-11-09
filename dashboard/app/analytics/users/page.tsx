@@ -7,7 +7,7 @@ import {
 } from '@/components/aa/admin'
 import {
   Users, UserPlus, Trash2, KeyRound, Loader2, AlertTriangle, Check, ShieldAlert, ShieldCheck, X, Search,
-  Power, ChevronDown, ChevronRight, Eye, EyeOff, Wand2, UserCheck, UserX, Layers, Lock, LogOut,
+  Power, ChevronDown, ChevronRight, Eye, EyeOff, Wand2, UserCheck, UserX, Layers, Lock, LogOut, Smartphone, SmartphoneNfc,
 } from 'lucide-react'
 
 // Users admin — who can sign in, which group they belong to, and what that lets
@@ -101,7 +101,7 @@ export default function UsersPage() {
         </div>
 
         {/* header */}
-        <div className="hidden grid-cols-[minmax(180px,1.2fr)_150px_minmax(200px,1.6fr)_110px_96px_150px] items-center gap-3 border-b border-nd-line px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-nd-faint lg:grid">
+        <div className="hidden grid-cols-[minmax(180px,1.2fr)_150px_minmax(200px,1.6fr)_110px_96px_184px] items-center gap-3 border-b border-nd-line px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-nd-faint lg:grid">
           <span>User</span><span>Group</span><span>Can do</span><span>Last sign-in</span><span>Status</span><span className="text-right">Actions</span>
         </div>
 
@@ -174,7 +174,7 @@ function UserRow({ user, data, isMe, open, onToggle, onChanged }: {
   const iconBtn = 'grid h-8 w-8 place-items-center rounded-lg border border-nd-line bg-nd-card text-nd-muted transition-colors hover:text-nd-fg disabled:opacity-40'
   return (
     <li className={user.disabled ? 'bg-nd-panel/60' : ''}>
-      <div className="grid grid-cols-1 items-center gap-3 px-4 py-3 lg:grid-cols-[minmax(180px,1.2fr)_150px_minmax(200px,1.6fr)_110px_96px_150px]">
+      <div className="grid grid-cols-1 items-center gap-3 px-4 py-3 lg:grid-cols-[minmax(180px,1.2fr)_150px_minmax(200px,1.6fr)_110px_96px_184px]">
         <button onClick={onToggle} className="flex min-w-0 items-center gap-3 text-left">
           {open ? <ChevronDown className="h-4 w-4 shrink-0 text-nd-dim" /> : <ChevronRight className="h-4 w-4 shrink-0 text-nd-faint" />}
           <Avatar name={user.username} color={accentFor(user.group)} dim={user.disabled} />
@@ -196,15 +196,22 @@ function UserRow({ user, data, isMe, open, onToggle, onChanged }: {
         </span>
         <AccessChips perms={perms} cat={data.catalog} />
         <span className="text-[12.5px] text-nd-fg-3" title={user.lastLogin ? new Date(user.lastLogin * 1000).toLocaleString() : undefined}>{relTime(user.lastLogin)}</span>
-        <span>
+        <span className="flex flex-col items-start gap-1">
           {user.disabled
             ? <span className="inline-flex items-center gap-1 rounded-full bg-st-warn/10 px-2 py-0.5 text-[11px] font-medium text-st-warn-fg ring-1 ring-inset ring-st-warn/20"><Lock className="h-3 w-3" /> disabled</span>
             : <span className="inline-flex items-center gap-1 rounded-full bg-st-good/10 px-2 py-0.5 text-[11px] font-medium text-st-good-fg ring-1 ring-inset ring-st-good/20"><span className="h-1.5 w-1.5 rounded-full bg-st-good" /> active</span>}
+          {user.mfa
+            ? <span className="inline-flex items-center gap-1 text-[11px] text-st-good-fg" title="Two-factor authentication is on"><Smartphone className="h-3 w-3" /> 2FA</span>
+            : <span className="inline-flex items-center gap-1 text-[11px] text-nd-faint" title="Password only"><Smartphone className="h-3 w-3" /> no 2FA</span>}
         </span>
         <span className="flex items-center justify-end gap-1.5">
           <button onClick={() => { setMode((m) => (m === 'pw' ? null : 'pw')); setErr('') }} disabled={busy} title="Reset password (also signs them out everywhere)" className={iconBtn}><KeyRound className="h-4 w-4" /></button>
           <button onClick={async () => { if (await patch({ signOut: true })) setNote(isMe ? 'Signed out of your other sessions — this browser stays signed in until it reloads.' : `${user.username} is signed out on every device.`) }}
             disabled={busy} title="Sign out everywhere (revokes all their sessions)" className={iconBtn}><LogOut className="h-4 w-4" /></button>
+          {user.mfa && (
+            <button onClick={async () => { if (await patch({ resetMfa: true })) setNote(`${user.username}'s two-factor was reset — they set it up again on their profile.`) }}
+              disabled={busy} title="Reset two-factor (lost phone): turns it off so they can set it up again" className={iconBtn}><SmartphoneNfc className="h-4 w-4" /></button>
+          )}
           <button onClick={() => patch({ disabled: !user.disabled })} disabled={busy || isMe} title={isMe ? 'You can’t disable yourself' : user.disabled ? 'Enable account' : 'Disable account (signs them out at once)'}
             className={`${iconBtn} ${user.disabled ? '!text-st-good-fg' : ''}`}><Power className="h-4 w-4" /></button>
           <button onClick={() => { setMode((m) => (m === 'del' ? null : 'del')); setErr('') }} disabled={busy || isMe} title={isMe ? 'You can’t delete yourself' : 'Delete user'} className={`${iconBtn} !text-st-crit-fg hover:border-st-crit/40`}><Trash2 className="h-4 w-4" /></button>

@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import {
   LayoutDashboard, LineChart, ShieldAlert, Fingerprint, TerminalSquare, Search, Moon, Sun, RefreshCw,
-  CalendarRange, Shield, Lock, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, ArrowLeft, History,
+  CalendarRange, Shield, Lock, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, ArrowLeft, History, UserRound,
   Server, FileText, type LucideIcon,
 } from 'lucide-react'
 import { PAGES } from '@/lib/authz'
@@ -63,7 +63,7 @@ export const useAATheme = () => useContext(ThemeCtx)
 // Who is signed in and what they may do, from /api/me (live permissions, not the
 // cookie's). `can()` is optimistic until loaded so controls don't flash disabled;
 // the server enforces every action regardless.
-export interface Me { username?: string; group?: string; perms?: string[]; isAdmin?: boolean; authDisabled?: boolean; kind?: string }
+export interface Me { username?: string; group?: string; perms?: string[]; isAdmin?: boolean; authDisabled?: boolean; kind?: string; mfaSetupRequired?: boolean }
 interface MeCtxT { me: Me | null; loaded: boolean; can: (perm: string) => boolean }
 const MeCtx = createContext<MeCtxT>({ me: null, loaded: false, can: () => true })
 export const useMe = () => useContext(MeCtx)
@@ -84,7 +84,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
     items: [
       { href: '/analytics', label: 'Overview', icon: LayoutDashboard, hint: 'Key numbers and automatic insights' },
       { href: '/analytics/explore', label: 'Explorer', icon: LineChart, hint: 'Any metric, any range, with statistics' },
-      { href: '/analytics/attacks', label: 'Attacks', icon: ShieldAlert, hint: 'Every episode, with drill-down' },
+      { href: '/analytics/attacks', label: 'Attacks', icon: ShieldAlert, hint: 'Every attack ever recorded, with drill-down' },
       { href: '/analytics/ai', label: 'AI security', icon: BrainCircuit, hint: 'Risk engine, detectors and automated defenses' },
       { href: '/analytics/protect', label: 'Protection', icon: Lock, hint: 'Protected hosts and allowed services (default-deny)' },
       { href: '/analytics/ip', label: 'IP lookup', icon: Fingerprint, hint: 'Investigate one address' },
@@ -277,7 +277,13 @@ export default function Shell({ children }: { children: ReactNode }) {
   const nav = useMemo(() => NAV.map((g) => ({ ...g, items: g.items.filter((n) => can(n.href)) })).filter((g) => g.items.length), [can])
   const allNav = useMemo(() => nav.flatMap((g) => g.items), [nav])
   // Longest-prefix match, so /analytics/protect/<ip> still belongs to Protection.
-  const page = [...ALL].sort((a, b) => b.href.length - a.href.length).find((n) => path === n.href || (n.href !== '/analytics' && path.startsWith(n.href + '/'))) ?? ALL[0]
+  const PROFILE: NavItem = { href: '/analytics/profile', label: 'Your profile', icon: UserRound, hint: 'Your account, password, two-factor authentication and sessions' }
+  const page = path === PROFILE.href ? PROFILE
+    : [...ALL].sort((a, b) => b.href.length - a.href.length).find((n) => path === n.href || (n.href !== '/analytics' && path.startsWith(n.href + '/'))) ?? ALL[0]
+  // A group that requires two-factor sends members without it to their profile.
+  useEffect(() => {
+    if (me?.mfaSetupRequired && path !== PROFILE.href) router.replace(`${PROFILE.href}?setup=required`)
+  }, [me?.mfaSetupRequired, path]) // eslint-disable-line react-hooks/exhaustive-deps
   // Protection section: the sidebar switches to a list of the protected hosts.
   const inProtect = path === '/analytics/protect' || path.startsWith('/analytics/protect/')
   const hostIp = path.startsWith('/analytics/protect/') ? decodeURIComponent(path.slice('/analytics/protect/'.length).split('/')[0]) : null
@@ -357,10 +363,10 @@ export default function Shell({ children }: { children: ReactNode }) {
             </div>
             {me && !me.authDisabled && me.username && (
               <div className="mx-3 mb-3 flex items-center justify-between gap-2 rounded-xl border border-nd-line bg-nd-card px-3 py-2 shadow-nd">
-                <div className="min-w-0">
-                  <div className="truncate text-[12.5px] font-medium text-nd-fg">{me.username}</div>
-                  <div className="text-[11px] text-nd-dim">{me.group}</div>
-                </div>
+                <Link href="/analytics/profile" title="Your profile, password and two-factor" className={`min-w-0 flex-1 rounded-lg px-1 py-0.5 transition-colors hover:bg-nd-fill ${path === '/analytics/profile' ? 'bg-nd-fill' : ''}`}>
+                  <div className="flex items-center gap-1.5 truncate text-[12.5px] font-medium text-nd-fg"><UserRound className="h-3.5 w-3.5 text-nd-dim" />{me.username}</div>
+                  <div className="text-[11px] text-nd-dim">{me.group} · profile &amp; security</div>
+                </Link>
                 <a
                   href="/api/logout"
                   title="Log out"

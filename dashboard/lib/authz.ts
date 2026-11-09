@@ -172,6 +172,29 @@ function stringFromB64url(b64: string): string {
   return new TextDecoder().decode(bytes)
 }
 
+// Two-factor sign-in challenge: proves "this browser just gave the right
+// password for <u>" for 5 minutes, so the second step can't be skipped or
+// started for someone else. Separate HMAC key prefix from sessions.
+export const MFA_CHALLENGE_TTL = 300
+export async function signChallenge(secret: string, username: string, epoch: number): Promise<string> {
+  const p = b64urlFromString(JSON.stringify({ u: username, e: epoch, exp: Math.floor(Date.now() / 1000) + MFA_CHALLENGE_TTL, t: 'mfa' }))
+  return `${p}.${await hmac(`mfa:${secret}`, p)}`
+}
+export async function verifyChallenge(secret: string, token: string | undefined): Promise<{ u: string; e: number } | null> {
+  if (!secret || !token) return null
+  const dot = token.indexOf('.')
+  if (dot <= 0) return null
+  const p = token.slice(0, dot)
+  if (!timingSafeEqual(token.slice(dot + 1), await hmac(`mfa:${secret}`, p))) return null
+  try {
+    const d = JSON.parse(stringFromB64url(p))
+    if (d?.t !== 'mfa' || typeof d.u !== 'string' || d.exp < Math.floor(Date.now() / 1000)) return null
+    return { u: d.u, e: Number(d.e) || 0 }
+  } catch {
+    return null
+  }
+}
+
 // HMAC for server-internal messages (middleware -> /api/audit). Edge-safe.
 export async function signInternal(secret: string, data: string): Promise<string> {
   return hmac(`audit:${secret}`, data)

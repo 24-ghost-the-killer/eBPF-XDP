@@ -4,7 +4,7 @@ import { updateUser, removeUser, permsForGroup, userEpoch, UserError } from '@/l
 import { signSession, SESSION_TTL } from '@/lib/authz'
 import { clearLoginLock } from '@/lib/login-guard'
 import { audit } from '@/lib/audit'
-import { listUsers } from '@/lib/users'
+import { listUsers, disableMfa } from '@/lib/users'
 
 // PATCH { group?, password?, disabled?, signOut? } / DELETE one user (requires
 // Users & groups). Changes take effect on the user's next request. A new password
@@ -21,8 +21,18 @@ export async function PATCH(req: NextRequest, { params }: { params: { username: 
   const a = await requireAdmin(req)
   if (a.error) return a.error
   const username = decodeURIComponent(params.username)
-  let body: { group?: unknown; password?: unknown; disabled?: unknown; signOut?: unknown } = {}
+  let body: { group?: unknown; password?: unknown; disabled?: unknown; signOut?: unknown; resetMfa?: unknown } = {}
   try { body = await req.json() } catch {}
+  if (body.resetMfa === true) {
+    // Lost phone: turn the user's two-factor off so they can set it up again.
+    try {
+      disableMfa(username)
+      audit(req, { user: a.caller.username ?? '', category: 'users', action: 'users.mfa_reset', target: `user:${username}`, summary: `Reset ${username}'s two-factor (they must set it up again)` })
+      return NextResponse.json({ ok: true })
+    } catch (e) {
+      return fail(e, 'reset two-factor')
+    }
+  }
   const changes: { group?: string; password?: string; disabled?: boolean; revoke?: boolean } = {}
   if (typeof body.group === 'string') changes.group = body.group
   if (typeof body.password === 'string') changes.password = body.password

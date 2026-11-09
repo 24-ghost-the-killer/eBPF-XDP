@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { authenticate } from '@/lib/users'
-import { signSession, SESSION_TTL } from '@/lib/authz'
+import { signSession, signChallenge, SESSION_TTL } from '@/lib/authz'
 import { cookieOpts } from '@/lib/api-auth'
 import { loginBlocked, loginFailed, loginSucceeded, FAIL_DELAY_MS } from '@/lib/login-guard'
 import { audit } from '@/lib/audit'
@@ -39,6 +39,12 @@ export async function POST(req: NextRequest) {
     loginFailed(username, addr)
     await new Promise((r) => setTimeout(r, FAIL_DELAY_MS))
     return NextResponse.json({ error: 'wrong username or password' }, { status: 401 })
+  }
+  if (result.needsMfa) {
+    // Right password, two-factor on: no session yet — hand back a short-lived
+    // challenge for /api/login/mfa. (The lock is not cleared until the code is right.)
+    audit(req, { user: result.username, category: 'auth', action: 'auth.password_ok', target: `user:${result.username}`, summary: `${result.username} entered the right password — waiting for the two-factor code` })
+    return NextResponse.json({ mfa: true, challenge: await signChallenge(secret, result.username, result.epoch) })
   }
   loginSucceeded(username)
   audit(req, { user: result.username, kind: result.kind, category: 'auth', action: 'auth.login', target: `user:${result.username}`, summary: `${result.username} signed in (group ${result.group}${result.kind !== 'user' ? `, ${result.kind}` : ''})` })

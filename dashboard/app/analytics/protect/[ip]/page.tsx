@@ -10,7 +10,8 @@ import { Stat, Panel, Badge, Empty } from '@/components/aa/kit'
 import { TimeChart } from '@/components/nd/charts'
 import { SERIES } from '@/components/nd/ui'
 import { useRange, useMe } from '@/components/aa/Shell'
-import { CsvButton } from '@/components/aa/export'
+import { CsvButton, PdfButton } from '@/components/aa/export'
+import { exportReportsPdf } from '@/lib/report-pdf'
 import { downloadCsv } from '@/lib/csv'
 import {
   type Svc, type HostMeta, type EditorRef, svcKey, hostKey, fmtSvc, validIp, statusOf, isApplied, fetchLive, notifyProtectChanged,
@@ -64,7 +65,7 @@ function HostView({ ip }: { ip: string }) {
       <HeadlineStats ip={ip} iface={iface} services={host?.services.length ?? 0} protectedNow={!!host} />
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
-        <ReportsPanel ip={ip} reports={meta.reports} presence={prot.presence} />
+        <ReportsPanel ip={ip} nickname={meta.nickname} reports={meta.reports} presence={prot.presence} />
         <HostLog ip={ip} log={meta.log} />
       </div>
 
@@ -184,8 +185,9 @@ function HeadlineStats({ ip, iface, services, protectedNow }: { ip: string; ifac
 // The host's reports: a list (newest activity first) with type, status, who
 // edited last and who is editing right now; "New report" creates one from a
 // template and opens it on its own page.
-function ReportsPanel({ ip, reports, presence }: { ip: string; reports: Report[]; presence: Record<string, EditorRef[]> }) {
-  const canWrite = useMe().can('protect.reports')
+function ReportsPanel({ ip, nickname, reports, presence }: { ip: string; nickname: string; reports: Report[]; presence: Record<string, EditorRef[]> }) {
+  const me = useMe()
+  const canWrite = me.can('protect.reports')
   const router = useRouter()
   const [menu, setMenu] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -208,7 +210,9 @@ function ReportsPanel({ ip, reports, presence }: { ip: string; reports: Report[]
       // its own stacking context, which would otherwise paint over the menu).
       className={menu ? 'relative z-20' : ''}
       actions={<span className="inline-flex items-center gap-1.5">
-        <CsvButton label="Export" disabled={!reports.length} onClick={() => downloadCsv(`reports-${ip}`,
+        <PdfButton label="PDF" disabled={!reports.length} title="All reports for this host in one PDF"
+          onClick={() => exportReportsPdf([...reports].sort((a, b) => b.updatedAt - a.updatedAt), { ip, nickname }, me.me?.username ?? '')} />
+        <CsvButton label="CSV" disabled={!reports.length} onClick={() => downloadCsv(`reports-${ip}`,
           reports.flatMap((r) => r.sections.map((s, i) => ({ r, s, n: i + 1 }))), [
             { key: 'host', label: 'host', get: () => ip },
             { key: 'report', label: 'report', get: (x) => x.r.title }, { key: 'kind', label: 'type', get: (x) => kindOf(x.r.kind).label },

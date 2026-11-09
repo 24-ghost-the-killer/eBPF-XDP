@@ -1,35 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requirePerm } from '@/lib/api-auth'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
-// Reconstructs a DDoS attack history from Prometheus (15d retention). An attack
-// is a contiguous period where the risk engine had detection_active > 0. For
-// each episode we derive duration, peak/total traffic, drops, the dominant
-// vectors, the classifier's verdict, and attacker IPs (when the per-source tap
-// captured them — injected/on-box floods bypass it, so that list can be empty).
+// Every DDoS attack the appliance has ever seen, paged.
+//
+// * The LIST of attacks (start/end of each episode) is rebuilt from Prometheus
+//   over its whole retention: cheap, two passes over xs_detection_active.
+// * The BREAKDOWN of an attack (traffic, drops, vectors, sources, targets) costs
+//   ~30 queries, so it is computed only for the page being viewed, plus a few
+//   per minute in the background (oldest first, so nothing ages out of
+//   Prometheus unanalysed).
+// * Every finished breakdown goes into a PERMANENT archive next to the users
+//   file. Prometheus forgets after its retention (15 d); the archive never does,
+//   so attacks older than the retention stay listed with all their numbers.
+//
+// GET /api/attacks?offset=0&limit=20[&vector=x][&ip=y][&from=s&to=s][&sort=k&desc=1][&analysedOnly=1]
+//   -> { status, total, offset, limit, attacks, pending, summary, retentionDays }
+// GET /api/attacks          (no offset) -> every analysed attack, newest first
+//   (the shape older callers — overview, IP lookup, host pages — expect).
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 const PROM = process.env.PROM_URL || 'http://localhost:9091'
-const STEP = 300 // coarse scan step; also the cache-key bucket size
+const STEP = 300 // coarse scan step
+const SETTLED_S = 600 // an episode that ended this long ago is final
+// Bump whenever the per-episode breakdown logic changes, so archived results
+// from an older build are recomputed (while Prometheus still has the data).
+// v2: per-source/victim counts read as peak-over-window (flush-safe) not instant.
+const CACHE_SCHEMA = 2
 
-type Payload = { status: string; retentionDays: number; attacks: unknown[]; incomplete?: number }
-
-// Reconstructing 15 days of history runs hundreds of Prometheus queries (~5-7s).
-// The result only changes when a new 300s bucket starts, and the client re-polls
-// every 30s, so we cache it per bucket and serve the last-good result instantly
-// while refreshing in the background (stale-while-revalidate). Module state is
-// shared across requests in the same server process.
-let CACHE: { key: number; data: Payload; builtAt: number } | null = null
-let INFLIGHT: Promise<Payload> | null = null
-const FRESH_MS = 60_000 // after this age, refresh in the background on next hit
-
-// Prometheus evaluates ~20 queries at a time. Firing every episode's ~30
-// queries at once (60 regions ≈ 1,500 requests) left most of them queued past
-// their timeout, and one timeout failed the whole history. Cap what we keep in
-// flight so each query is answered promptly.
+// Prometheus evaluates ~20 queries at a time; keep a bounded number in flight.
 const MAX_INFLIGHT = 8
 let inflight = 0
 const waiters: (() => void)[] = []
@@ -44,40 +46,53 @@ async function limited<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// A finished episode never changes, so its (expensive) breakdown is computed
-// once and reused; only new or still-running episodes are queried again. The
-// cache is mirrored to disk so a dashboard restart doesn't start cold.
-type Ep = { start: number; end: number }
-type Built = Record<string, unknown> & { start: number; end: number }
-const SETTLED_S = 600 // an episode that ended this long ago is final
-// Bump whenever the per-episode breakdown logic changes, so a cache written by
-// an older build is discarded instead of served with stale/wrong numbers.
-// v2: per-source/victim counts read as peak-over-window (flush-safe) not instant.
-const CACHE_SCHEMA = 2
-const EPISODES = new Map<string, Built>()
+type Ep = { start: number; end: number } // seconds
+type Built = Record<string, unknown> & { start: number; end: number; durationSec: number; vectors: string[]; attackers: { ip: string }[]; victims: { ip: string }[] }
 const epKey = (ep: Ep) => `${ep.start}-${ep.end}`
-const DISK = join(tmpdir(), 'xs-attacks-cache.json')
-let loaded = false
-async function loadDisk() {
-  if (loaded) return
-  loaded = true
-  try {
-    const j = JSON.parse(await readFile(DISK, 'utf8')) as { schema?: number; cache: typeof CACHE; episodes: [string, Built][] }
-    // A cache from an older breakdown-logic version is discarded, not trusted.
-    if (j.schema === CACHE_SCHEMA) {
-      if (j.cache) CACHE = j.cache
-      for (const [k, v] of j.episodes ?? []) EPISODES.set(k, v)
-    }
-  } catch {
-    // no cache yet, or unreadable: rebuild from Prometheus
-  }
+
+// ---- permanent archive ------------------------------------------------------
+function archivePath(): string {
+  if (process.env.DASH_ATTACKS_ARCHIVE) return process.env.DASH_ATTACKS_ARCHIVE
+  const users = process.env.DASH_USERS_FILE || '/home/test_server/xdp-sentinel-data/dash-users.json'
+  return join(dirname(users), 'attacks-archive.json')
 }
-async function saveDisk() {
-  try {
-    await writeFile(DISK, JSON.stringify({ schema: CACHE_SCHEMA, cache: CACHE, episodes: [...EPISODES.entries()] }))
-  } catch {
-    // best effort: the in-memory cache still works
+const ARCHIVE = new Map<string, Built>() // settled episodes, forever
+const LIVE = new Map<string, { b: Built; at: number }>() // still-running episodes, short-lived
+let loaded: Promise<void> | null = null
+function loadArchive(): Promise<void> {
+  if (!loaded) {
+    loaded = (async () => {
+      try {
+        const j = JSON.parse(await readFile(archivePath(), 'utf8'))
+        if (j.schema === CACHE_SCHEMA) for (const [k, v] of Object.entries(j.episodes ?? {})) ARCHIVE.set(k, v as Built)
+      } catch {}
+      // One-time import of the old per-process cache (same breakdown schema).
+      try {
+        const old = JSON.parse(await readFile(join(tmpdir(), 'xs-attacks-cache.json'), 'utf8'))
+        if (old.schema === CACHE_SCHEMA) for (const [k, v] of old.episodes ?? []) if (!ARCHIVE.has(k)) ARCHIVE.set(k, v)
+      } catch {}
+    })()
   }
+  return loaded
+}
+let saving: Promise<void> | null = null
+let dirty = false
+function saveArchive() {
+  dirty = true
+  if (saving) return
+  saving = (async () => {
+    while (dirty) {
+      dirty = false
+      const file = archivePath()
+      try {
+        await mkdir(dirname(file), { recursive: true })
+        await writeFile(`${file}.tmp`, JSON.stringify({ schema: CACHE_SCHEMA, episodes: Object.fromEntries(ARCHIVE) }), { mode: 0o640 })
+        await rename(`${file}.tmp`, file)
+      } catch (e) {
+        console.error('[attacks] could not write archive', e)
+      }
+    }
+  })().finally(() => { saving = null })
 }
 
 async function instant(expr: string, time?: number) {
@@ -157,271 +172,354 @@ const VECTORS: [string, string][] = [
   ['Malformed', 'xs_parse_outcome_packets_total{class="malformed"}'],
 ]
 
-async function build(): Promise<Payload> {
 
-    // --- Pass 1 (coarse): find attack REGIONS over 15d. 300s step + max_over_time
-    // keeps us under Prometheus's 11k-point limit and catches short spikes. This
-    // only bounds *where* to look; it over-merges, which pass 2 fixes. ---
-    const end = Math.floor(Date.now() / 1000 / STEP) * STEP // bucket-aligned = stable across refreshes
-    const start = end - 15 * 86400
-    const coarse = await range(`max_over_time((max(xs_detection_active))[${STEP}s:15s])`, start, end, STEP)
-    const cvals = coarse[0]?.values ?? []
-    const regions: Ep[] = []
-    for (const [t, v] of cvals) {
+// ---- the list of episodes (cheap, whole retention) -----------------------
+let retentionDays = 15
+async function readRetention() {
+  try {
+    const j = await (await fetch(`${PROM}/api/v1/status/flags`, { cache: 'no-store', signal: AbortSignal.timeout(5000) })).json()
+    const m = /^(\d+)([dhwy])$/.exec(j?.data?.['storage.tsdb.retention.time'] ?? '')
+    if (m) retentionDays = Math.max(1, Math.round(Number(m[1]) * ({ h: 1 / 24, d: 1, w: 7, y: 365 } as Record<string, number>)[m[2]]))
+  } catch {}
+}
+
+async function scanEpisodes(): Promise<Ep[]> {
+  await readRetention()
+  // Pass 1 (coarse): attack REGIONS. 300 s steps + max_over_time catch short
+  // spikes; chunked by 30 days to stay under Prometheus's 11k-point limit.
+  const end = Math.floor(Date.now() / 1000 / STEP) * STEP
+  const start = end - retentionDays * 86400
+  const regions: Ep[] = []
+  for (let a = start; a < end; a += 30 * 86400) {
+    const b = Math.min(end, a + 30 * 86400)
+    const coarse = await range(`max_over_time((max(xs_detection_active))[${STEP}s:15s])`, a, b, STEP)
+    for (const [t, v] of coarse[0]?.values ?? []) {
       if (parseFloat(v) > 0) {
         const ts = +t
         const last = regions[regions.length - 1]
-        if (last && ts - last.end <= STEP) last.end = ts // only join consecutive buckets
+        if (last && ts - last.end <= STEP) last.end = ts
         else regions.push({ start: ts - STEP, end: ts })
       }
     }
-
-    // --- Pass 2 (fine): within each region, scan at 30s and split into distinct
-    // episodes wherever there's >= GAP_SPLIT of calm. This separates attacks that
-    // fell in adjacent 5-min buckets but are really two different attacks. ---
-    const FINE = 30
-    const GAP_SPLIT = 150 // >= 2.5 min of calm between detections = separate attack
-    // Scan every region in parallel (they're independent), then flatten in
-    // chronological order so the newest-first reverse below still holds.
-    const perRegion = await Promise.all(
-      regions.map(async (r) => {
-        const fine = await range('max(xs_detection_active)', r.start - STEP, r.end + STEP, FINE)
-        const fv = fine[0]?.values ?? []
-        const local: Ep[] = []
-        let cur: Ep | null = null
-        for (const [t, v] of fv) {
-          if (parseFloat(v) > 0) {
-            const ts = +t
-            if (cur && ts - cur.end <= GAP_SPLIT) cur.end = ts
-            else {
-              cur = { start: ts, end: ts }
-              local.push(cur)
-            }
-          }
-        }
-        return local
-      })
-    )
-    const eps: Ep[] = perRegion.flat()
-    // newest first, cap to 50
-    eps.reverse()
-    const picked = eps.slice(0, 50)
-
-    const now = Math.floor(Date.now() / 1000)
-    const settled = await Promise.allSettled(
-      picked.map(async (ep): Promise<Built> => {
-        const cached = EPISODES.get(epKey(ep))
-        if (cached) return cached
-        // pad the window by one step on each side so the counters fully cover the spike
-        // stats window: the detection span padded ±PAD so increase()/max_over_time
-        // capture the flood's counter rise without pulling in a neighbouring attack.
-        const PAD = 90
-        const dur = ep.end - ep.start + 2 * PAD
-        const at = ep.end + PAD
-        const atStart = ep.start - PAD // evaluation instant just before the attack
-        const sub = `[${dur}s:30s]`
-        const win = `[${dur}s]`
-
-        const [
-          peakPps, peakBps, totPkts, totBytes, dropped, peakRisk, peakThreat, uniq, cls,
-          atkPEnd, atkPStart, atkBEnd, atkBStart, atkResets, durActive,
-          detIface, rxIface, vicPEnd, vicPStart, vicBEnd, vicBStart, vicResets,
-          ...vecRes
-        ] = await Promise.all([
-          instant(`max_over_time((sum(rate(xs_rx_packets_total[30s])))${sub})`, at),
-          instant(`max_over_time((sum(rate(xs_rx_bytes_total[30s]))*8)${sub})`, at),
-          instant(`sum(increase(xs_rx_packets_total${win}))`, at),
-          instant(`sum(increase(xs_rx_bytes_total${win}))`, at),
-          instant(`sum(increase(xs_verdict_packets_total{verdict="drop"}${win}))`, at),
-          instant(`max_over_time((max(xs_risk_level))${sub})`, at),
-          instant(`max_over_time((max(xs_threat_state))${sub})`, at),
-          // attacker sources = sources of DROPPED packets (tracked in XDP), not the talker tap.
-          // uniqueSources = peak distinct sources in the attacker map (thousands = spoofed).
-          instant(`max_over_time((max(xs_attacker_sources))${sub}) or vector(0)`, at),
-          // Attack type from the deterministic rule (xs_detection_info), NOT the
-          // CART classifier (xs_ddos_class_probability): the CART model is trained
-          // on synthetic data and mislabels real floods (e.g. a SYN flood as
-          // "connection_flood", an ACK/ICMP/UDP flood as "benign"), whereas the
-          // rule-based detection is what actually drives mitigation and is correct.
-          // count_over_time gives how many windows each type was active -> dominant.
-          instant(`sum by(type)(count_over_time(xs_detection_info${win}))`, at),
-          // Per-source attacker drops. The "end" value is the per-source counter's
-          // PEAK over the episode window (max_over_time), NOT its value at `at`:
-          // the attacker map is flushed to 0 within ~seconds of the attack ending,
-          // and `at` = ep.end + PAD lands AFTER that flush, so an instant read there
-          // returns 0 for every flood source and the whole attack vanishes from the
-          // breakdown (only leftover local traffic survives). The peak is the value
-          // the counter reached just before the flush = this source's episode total.
-          // deltaByKey then isolates the episode: subtract the pre-attack value for a
-          // monotonic series, or take the full peak for one born in-window / reset.
-          // (increase() is still WRONG here -- it drops the first scrape's packets for
-          // every young series, which every freshly-seen attacker IP is.)
-          instant(`sum by(src)(max_over_time(xs_attacker_packets_total${win}))`, at),
-          instant(`sum by(src)(xs_attacker_packets_total)`, atStart),
-          instant(`sum by(src)(max_over_time(xs_attacker_bytes_total${win}))`, at),
-          instant(`sum by(src)(xs_attacker_bytes_total)`, atStart),
-          instant(`sum by(src)(resets(xs_attacker_packets_total${win}))`, at),
-          // True attack length in seconds (count of 1s windows detection was active),
-          // used as the denominator for average rates. The episode's coarse 30s-step
-          // span over/under-estimates; this is accurate to the second.
-          instant(`sum_over_time((max(xs_detection_active) or vector(0))[${dur}s:1s])`, at),
-          // target: which interface(s) were under attack + which absorbed the ingress
-          instant(`max_over_time((xs_detection_active)${sub})`, at),
-          instant(`sum by(iface)(increase(xs_rx_packets_total${win}))`, at),
-          // victim destinations: same flush-safe peak-over-window as attackers.
-          instant(`sum by(dst)(max_over_time(xs_target_packets_total${win}))`, at),
-          instant(`sum by(dst)(xs_target_packets_total)`, atStart),
-          instant(`sum by(dst)(max_over_time(xs_target_bytes_total${win}))`, at),
-          instant(`sum by(dst)(xs_target_bytes_total)`, atStart),
-          instant(`sum by(dst)(resets(xs_target_packets_total${win}))`, at),
-          ...VECTORS.map(([, m]) => instant(`sum(increase(${m}${win}))`, at)),
-        ])
-
-        // True attack duration in seconds (count of active 1s windows), the
-        // denominator for all average rates, with a sane fallback.
-        const durSec = Math.max(1, Math.round(num(durActive)) || ep.end - ep.start + FINE)
-
-        // victim destination hosts (exact IPs the flood was aimed at), top 5
-        const vicPkt = deltaByKey(vicPEnd, vicPStart, vicResets, 'dst')
-        const vicByte = deltaByKey(vicBEnd, vicBStart, vicResets, 'dst')
-        const victims = [...vicPkt.entries()]
-          .map(([ip, packets]) => ({ ip, packets: Math.round(packets), bytes: Math.round(vicByte.get(ip) ?? 0) }))
-          .filter((v) => v.packets > 0)
-          .sort((a, b) => b.packets - a.packets)
-          .slice(0, 5)
-
-        // vectors above 5% of the strongest signal
-        const vecVals = vecRes.map((r, k) => ({ name: VECTORS[k][0], v: num(r) }))
-        const vmax = Math.max(1, ...vecVals.map((x) => x.v))
-        const vectors = vecVals.filter((x) => x.v > vmax * 0.05 && x.v > 100).sort((a, b) => b.v - a.v).map((x) => x.name)
-
-        // attacker sources: per-source dropped packets/bytes (accurate end-start
-        // delta), averaged over the true attack duration. Summed over all sources
-        // these now equal the episode's total drops.
-        const atkPkt = deltaByKey(atkPEnd, atkPStart, atkResets, 'src')
-        const atkByte = deltaByKey(atkBEnd, atkBStart, atkResets, 'src')
-        const attackers = [...atkPkt.entries()]
-          .map(([ip, pkts]) => {
-            const bytes = atkByte.get(ip) ?? 0
-            return {
-              ip,
-              scope: scopeOf(ip),
-              bytes,
-              packets: Math.round(pkts),
-              pps: Math.round(pkts / durSec),
-              bps: (bytes * 8) / durSec,
-            }
-          })
-          .filter((a) => a.packets > 0)
-          .sort((a, b) => b.packets - a.packets)
-          // keep the payload small: a spoofed flood has thousands of sources, the
-          // UI shows the top few, and uniqueSources still carries the full count
-          .slice(0, 25)
-
-        // ---- target: where the attack was aimed ----
-        const rxByIface = new Map<string, number>()
-        for (const s of rxIface) rxByIface.set(s.metric.iface, parseFloat(s.value[1]))
-        const detectedIfaces = new Set(detIface.filter((s) => parseFloat(s.value[1]) > 0).map((s) => s.metric.iface))
-        const ifacesRanked = [...rxByIface.entries()].sort((a, b) => b[1] - a[1])
-        const primaryIface = ifacesRanked.find(([i]) => detectedIfaces.has(i))?.[0] ?? ifacesRanked[0]?.[0] ?? null
-        const totRxIface = [...rxByIface.values()].reduce((s, v) => s + v, 0) || 1
-        const target = primaryIface
-          ? {
-              iface: primaryIface,
-              label: vlanName(primaryIface),
-              rxPackets: Math.round(rxByIface.get(primaryIface) ?? 0),
-              rxShare: (rxByIface.get(primaryIface) ?? 0) / totRxIface,
-            }
-          : null
-
-        // Dominant accurate attack type over the episode, with how much of the
-        // detected time it was the active type as a confidence.
-        const detCounts = cls
-          .map((s) => ({ type: s.metric.type, n: parseFloat(s.value[1]) }))
-          .filter((x) => x.type && x.n > 0)
-          .sort((a, b) => b.n - a.n)
-        const detTotal = detCounts.reduce((a, b) => a + b.n, 0)
-        const classifier = detCounts[0]
-          ? { label: detCounts[0].type, conf: detTotal > 0 ? detCounts[0].n / detTotal : 1 }
-          : null
-
-        const dropPkts = num(dropped)
-        const totP = num(totPkts)
-
-        const built: Built = {
-          start: ep.start * 1000,
-          end: ep.end * 1000,
-          durationSec: durSec,
-          peakPps: num(peakPps),
-          peakBps: num(peakBps),
-          totalPackets: Math.round(totP),
-          totalBytes: num(totBytes),
-          droppedPackets: Math.round(dropPkts),
-          dropShare: totP > 0 ? Math.min(1, dropPkts / totP) : 0,
-          peakRiskLevel: Math.round(num(peakRisk)),
-          peakThreatState: Math.round(num(peakThreat)),
-          classifier,
-          vectors,
-          uniqueSources: Math.round(num(uniq)),
-          attackers,
-          target,
-          victims,
-        }
-        if (now - ep.end >= SETTLED_S) EPISODES.set(epKey(ep), built)
-        return built
-      })
-    )
-
-    // An episode whose queries failed is left out this round (and retried on
-    // the next refresh) instead of failing the whole history.
-    const attacks = settled
-      .map((r) => (r.status === 'fulfilled' ? r.value : null))
-      .filter((a): a is Built => a !== null)
-      .map((a, i) => ({ ...a, id: i + 1 }))
-    const incomplete = settled.length - attacks.length
-    if (incomplete === settled.length && settled.length > 0) {
-      throw (settled[0] as PromiseRejectedResult).reason
-    }
-    // forget episodes that have aged out of the retention window
-    const live = new Set(picked.map(epKey))
-    for (const k of EPISODES.keys()) if (!live.has(k)) EPISODES.delete(k)
-
-    return { status: 'success', retentionDays: 15, attacks, ...(incomplete ? { incomplete } : {}) }
-}
-
-// Build once per bucket, deduped across concurrent callers.
-function rebuild(key: number): Promise<Payload> {
-  if (!INFLIGHT) {
-    INFLIGHT = build()
-      .then((data) => {
-        CACHE = { key, data, builtAt: Date.now() }
-        void saveDisk()
-        return data
-      })
-      .finally(() => {
-        INFLIGHT = null
-      })
   }
-  return INFLIGHT
+  // Pass 2 (fine): split each region at >= 2.5 min of calm into separate attacks.
+  const FINE = 30
+  const GAP_SPLIT = 150
+  const perRegion = await Promise.all(regions.map(async (r) => {
+    const fine = await range('max(xs_detection_active)', r.start - STEP, r.end + STEP, FINE)
+    const local: Ep[] = []
+    let cur: Ep | null = null
+    for (const [t, v] of fine[0]?.values ?? []) {
+      if (parseFloat(v) > 0) {
+        const ts = +t
+        if (cur && ts - cur.end <= GAP_SPLIT) cur.end = ts
+        else { cur = { start: ts, end: ts }; local.push(cur) }
+      }
+    }
+    return local
+  }))
+  return perRegion.flat()
 }
+
+// The full list = what Prometheus still has + archived attacks older than that.
+// Cached for a minute, refreshed in the background (stale-while-revalidate).
+let INDEX: { eps: Ep[]; at: number } | null = null
+let INDEXING: Promise<Ep[]> | null = null
+const INDEX_FRESH_MS = 60_000
+async function refreshIndex(): Promise<Ep[]> {
+  if (!INDEXING) {
+    INDEXING = (async () => {
+      const prom = await scanEpisodes()
+      const overlaps = (x: Ep) => prom.some((p) => p.start <= x.end && x.start <= p.end)
+      const old: Ep[] = []
+      for (const k of ARCHIVE.keys()) {
+        const [s0, e0] = k.split('-').map(Number)
+        const ep = { start: s0, end: e0 }
+        if (!overlaps(ep)) old.push(ep)
+      }
+      const eps = [...prom, ...old].sort((x, y) => y.start - x.start) // newest first
+      INDEX = { eps, at: Date.now() }
+      void backfill(eps)
+      return eps
+    })().finally(() => { INDEXING = null })
+  }
+  return INDEXING
+}
+async function index(): Promise<Ep[]> {
+  if (INDEX) {
+    if (Date.now() - INDEX.at > INDEX_FRESH_MS) void refreshIndex().catch(() => {})
+    return INDEX.eps
+  }
+  return refreshIndex()
+}
+
+// ---- the breakdown of one episode (expensive, cached forever once settled) --
+async function analyse(ep: Ep): Promise<Built> {
+  // pad the window by one step on each side so the counters fully cover the spike
+  // stats window: the detection span padded ±PAD so increase()/max_over_time
+  // capture the flood's counter rise without pulling in a neighbouring attack.
+  const PAD = 90
+  const dur = ep.end - ep.start + 2 * PAD
+  const at = ep.end + PAD
+  const atStart = ep.start - PAD // evaluation instant just before the attack
+  const sub = `[${dur}s:30s]`
+  const win = `[${dur}s]`
+
+  const [
+    peakPps, peakBps, totPkts, totBytes, dropped, peakRisk, peakThreat, uniq, cls,
+    atkPEnd, atkPStart, atkBEnd, atkBStart, atkResets, durActive,
+    detIface, rxIface, vicPEnd, vicPStart, vicBEnd, vicBStart, vicResets,
+    ...vecRes
+  ] = await Promise.all([
+    instant(`max_over_time((sum(rate(xs_rx_packets_total[30s])))${sub})`, at),
+    instant(`max_over_time((sum(rate(xs_rx_bytes_total[30s]))*8)${sub})`, at),
+    instant(`sum(increase(xs_rx_packets_total${win}))`, at),
+    instant(`sum(increase(xs_rx_bytes_total${win}))`, at),
+    instant(`sum(increase(xs_verdict_packets_total{verdict="drop"}${win}))`, at),
+    instant(`max_over_time((max(xs_risk_level))${sub})`, at),
+    instant(`max_over_time((max(xs_threat_state))${sub})`, at),
+    // attacker sources = sources of DROPPED packets (tracked in XDP), not the talker tap.
+    // uniqueSources = peak distinct sources in the attacker map (thousands = spoofed).
+    instant(`max_over_time((max(xs_attacker_sources))${sub}) or vector(0)`, at),
+    // Attack type from the deterministic rule (xs_detection_info), NOT the
+    // CART classifier (xs_ddos_class_probability): the CART model is trained
+    // on synthetic data and mislabels real floods (e.g. a SYN flood as
+    // "connection_flood", an ACK/ICMP/UDP flood as "benign"), whereas the
+    // rule-based detection is what actually drives mitigation and is correct.
+    // count_over_time gives how many windows each type was active -> dominant.
+    instant(`sum by(type)(count_over_time(xs_detection_info${win}))`, at),
+    // Per-source attacker drops. The "end" value is the per-source counter's
+    // PEAK over the episode window (max_over_time), NOT its value at `at`:
+    // the attacker map is flushed to 0 within ~seconds of the attack ending,
+    // and `at` = ep.end + PAD lands AFTER that flush, so an instant read there
+    // returns 0 for every flood source and the whole attack vanishes from the
+    // breakdown (only leftover local traffic survives). The peak is the value
+    // the counter reached just before the flush = this source's episode total.
+    // deltaByKey then isolates the episode: subtract the pre-attack value for a
+    // monotonic series, or take the full peak for one born in-window / reset.
+    // (increase() is still WRONG here -- it drops the first scrape's packets for
+    // every young series, which every freshly-seen attacker IP is.)
+    instant(`sum by(src)(max_over_time(xs_attacker_packets_total${win}))`, at),
+    instant(`sum by(src)(xs_attacker_packets_total)`, atStart),
+    instant(`sum by(src)(max_over_time(xs_attacker_bytes_total${win}))`, at),
+    instant(`sum by(src)(xs_attacker_bytes_total)`, atStart),
+    instant(`sum by(src)(resets(xs_attacker_packets_total${win}))`, at),
+    // True attack length in seconds (count of 1s windows detection was active),
+    // used as the denominator for average rates. The episode's coarse 30s-step
+    // span over/under-estimates; this is accurate to the second.
+    instant(`sum_over_time((max(xs_detection_active) or vector(0))[${dur}s:1s])`, at),
+    // target: which interface(s) were under attack + which absorbed the ingress
+    instant(`max_over_time((xs_detection_active)${sub})`, at),
+    instant(`sum by(iface)(increase(xs_rx_packets_total${win}))`, at),
+    // victim destinations: same flush-safe peak-over-window as attackers.
+    instant(`sum by(dst)(max_over_time(xs_target_packets_total${win}))`, at),
+    instant(`sum by(dst)(xs_target_packets_total)`, atStart),
+    instant(`sum by(dst)(max_over_time(xs_target_bytes_total${win}))`, at),
+    instant(`sum by(dst)(xs_target_bytes_total)`, atStart),
+    instant(`sum by(dst)(resets(xs_target_packets_total${win}))`, at),
+    ...VECTORS.map(([, m]) => instant(`sum(increase(${m}${win}))`, at)),
+  ])
+
+  // True attack duration in seconds (count of active 1s windows), the
+  // denominator for all average rates, with a sane fallback.
+  const durSec = Math.max(1, Math.round(num(durActive)) || ep.end - ep.start + 30) // +30: one fine-scan step
+
+  // victim destination hosts (exact IPs the flood was aimed at), top 5
+  const vicPkt = deltaByKey(vicPEnd, vicPStart, vicResets, 'dst')
+  const vicByte = deltaByKey(vicBEnd, vicBStart, vicResets, 'dst')
+  const victims = [...vicPkt.entries()]
+    .map(([ip, packets]) => ({ ip, packets: Math.round(packets), bytes: Math.round(vicByte.get(ip) ?? 0) }))
+    .filter((v) => v.packets > 0)
+    .sort((a, b) => b.packets - a.packets)
+    .slice(0, 5)
+
+  // vectors above 5% of the strongest signal
+  const vecVals = vecRes.map((r, k) => ({ name: VECTORS[k][0], v: num(r) }))
+  const vmax = Math.max(1, ...vecVals.map((x) => x.v))
+  const vectors = vecVals.filter((x) => x.v > vmax * 0.05 && x.v > 100).sort((a, b) => b.v - a.v).map((x) => x.name)
+
+  // attacker sources: per-source dropped packets/bytes (accurate end-start
+  // delta), averaged over the true attack duration. Summed over all sources
+  // these now equal the episode's total drops.
+  const atkPkt = deltaByKey(atkPEnd, atkPStart, atkResets, 'src')
+  const atkByte = deltaByKey(atkBEnd, atkBStart, atkResets, 'src')
+  const attackers = [...atkPkt.entries()]
+    .map(([ip, pkts]) => {
+      const bytes = atkByte.get(ip) ?? 0
+      return {
+        ip,
+        scope: scopeOf(ip),
+        bytes,
+        packets: Math.round(pkts),
+        pps: Math.round(pkts / durSec),
+        bps: (bytes * 8) / durSec,
+      }
+    })
+    .filter((a) => a.packets > 0)
+    .sort((a, b) => b.packets - a.packets)
+    // keep the payload small: a spoofed flood has thousands of sources, the
+    // UI shows the top few, and uniqueSources still carries the full count
+    .slice(0, 25)
+
+  // ---- target: where the attack was aimed ----
+  const rxByIface = new Map<string, number>()
+  for (const s of rxIface) rxByIface.set(s.metric.iface, parseFloat(s.value[1]))
+  const detectedIfaces = new Set(detIface.filter((s) => parseFloat(s.value[1]) > 0).map((s) => s.metric.iface))
+  const ifacesRanked = [...rxByIface.entries()].sort((a, b) => b[1] - a[1])
+  const primaryIface = ifacesRanked.find(([i]) => detectedIfaces.has(i))?.[0] ?? ifacesRanked[0]?.[0] ?? null
+  const totRxIface = [...rxByIface.values()].reduce((s, v) => s + v, 0) || 1
+  const target = primaryIface
+    ? {
+        iface: primaryIface,
+        label: vlanName(primaryIface),
+        rxPackets: Math.round(rxByIface.get(primaryIface) ?? 0),
+        rxShare: (rxByIface.get(primaryIface) ?? 0) / totRxIface,
+      }
+    : null
+
+  // Dominant accurate attack type over the episode, with how much of the
+  // detected time it was the active type as a confidence.
+  const detCounts = cls
+    .map((s) => ({ type: s.metric.type, n: parseFloat(s.value[1]) }))
+    .filter((x) => x.type && x.n > 0)
+    .sort((a, b) => b.n - a.n)
+  const detTotal = detCounts.reduce((a, b) => a + b.n, 0)
+  const classifier = detCounts[0]
+    ? { label: detCounts[0].type, conf: detTotal > 0 ? detCounts[0].n / detTotal : 1 }
+    : null
+
+  const dropPkts = num(dropped)
+  const totP = num(totPkts)
+
+  const built: Built = {
+    start: ep.start * 1000,
+    end: ep.end * 1000,
+    durationSec: durSec,
+    peakPps: num(peakPps),
+    peakBps: num(peakBps),
+    totalPackets: Math.round(totP),
+    totalBytes: num(totBytes),
+    droppedPackets: Math.round(dropPkts),
+    dropShare: totP > 0 ? Math.min(1, dropPkts / totP) : 0,
+    peakRiskLevel: Math.round(num(peakRisk)),
+    peakThreatState: Math.round(num(peakThreat)),
+    classifier,
+    vectors,
+    uniqueSources: Math.round(num(uniq)),
+    attackers,
+    target,
+    victims,
+  }
+  return built
+}
+
+async function getBuilt(ep: Ep): Promise<Built> {
+  const k = epKey(ep)
+  const a = ARCHIVE.get(k)
+  if (a) return a
+  const l = LIVE.get(k)
+  if (l && Date.now() - l.at < 60_000) return l.b
+  const b = await analyse(ep)
+  if (Date.now() / 1000 - ep.end >= SETTLED_S) {
+    ARCHIVE.set(k, b)
+    saveArchive()
+  } else {
+    LIVE.set(k, { b, at: Date.now() })
+    if (LIVE.size > 50) for (const key of [...LIVE.keys()].slice(0, LIVE.size - 50)) LIVE.delete(key)
+  }
+  return b
+}
+const known = (ep: Ep): Built | null => ARCHIVE.get(epKey(ep)) ?? LIVE.get(epKey(ep))?.b ?? null
+
+// Background catch-up: analyse a few unanalysed settled episodes per refresh,
+// OLDEST first, so every attack is archived before Prometheus forgets it.
+let backfilling = false
+async function backfill(eps: Ep[]) {
+  if (backfilling) return
+  backfilling = true
+  try {
+    const now = Date.now() / 1000
+    const todo = eps.filter((e) => now - e.end >= SETTLED_S && !ARCHIVE.has(epKey(e))).reverse().slice(0, 6)
+    for (const e of todo) { try { await getBuilt(e) } catch {} }
+  } finally {
+    backfilling = false
+  }
+}
+
+const withId = (b: Built) => ({ ...b, id: Math.floor(b.start / 1000) }) // stable: start time in seconds
+const vectorsOf = (b: Built) => (b.vectors.length ? b.vectors : [((b.classifier as { label?: string } | null)?.label) ?? 'unknown'])
+const SORTS = new Set(['start', 'durationSec', 'peakBps', 'peakPps', 'droppedPackets', 'dropShare'])
 
 export async function GET(req: NextRequest) {
   const auth = await requirePerm(req, null) // live: disabled accounts lose access at once
   if (auth.error) return auth.error
-  const key = Math.floor(Date.now() / 1000 / STEP) * STEP
   try {
-    await loadDisk()
-    // Warm cache: serve it instantly. If it's for an old bucket or getting old,
-    // kick off a background refresh so the NEXT poll gets fresh data — the user
-    // never waits on the 5-7s reconstruction.
-    if (CACHE) {
-      const stale = CACHE.key !== key || Date.now() - CACHE.builtAt > FRESH_MS
-      if (stale) void rebuild(key).catch(() => {})
-      return NextResponse.json(CACHE.data)
+    await loadArchive()
+    const all = await index()
+    const sp = req.nextUrl.searchParams
+
+    // Legacy shape: every analysed attack (overview, IP lookup, host pages).
+    if (!sp.has('offset')) {
+      const attacks = all.map(known).filter((b): b is Built => !!b).map(withId)
+      return NextResponse.json({ status: 'success', retentionDays, attacks, total: all.length, pending: all.length - attacks.length })
     }
-    // Cold start (no cache yet): build synchronously this once.
-    const data = await rebuild(key)
-    return NextResponse.json(data)
+
+    const offset = Math.max(0, Number(sp.get('offset')) || 0)
+    const limit = Math.min(500, Math.max(1, Number(sp.get('limit')) || 20))
+    const from = Number(sp.get('from')) || 0
+    const to = Number(sp.get('to')) || Infinity
+    const vector = sp.get('vector') || ''
+    const ip = (sp.get('ip') || '').trim()
+    const sort = SORTS.has(sp.get('sort') || '') ? (sp.get('sort') as string) : 'start'
+    const desc = sp.get('desc') !== '0'
+    const analysedOnly = sp.get('analysedOnly') === '1'
+
+    const inWindow = all.filter((e) => e.end >= from && e.start <= to)
+    // Summary over everything in the window: counts/time from the list,
+    // traffic numbers from the attacks analysed so far.
+    const builtAll = inWindow.map(known).filter((b): b is Built => !!b)
+    const num = (b: Built, k: string) => Number(b[k]) || 0
+    const summary = {
+      count: inWindow.length,
+      totalDurationSec: inWindow.reduce((n, e) => n + Math.max(30, e.end - e.start), 0),
+      analysed: builtAll.length,
+      peakBps: Math.max(0, ...builtAll.map((b) => num(b, 'peakBps'))),
+      peakPps: Math.max(0, ...builtAll.map((b) => num(b, 'peakPps'))),
+      droppedPackets: builtAll.reduce((n, b) => n + num(b, 'droppedPackets'), 0),
+      avgDropShare: builtAll.length ? builtAll.reduce((n, b) => n + num(b, 'dropShare'), 0) / builtAll.length : 0,
+      medianDurationSec: (() => { const d = inWindow.map((e) => Math.max(30, e.end - e.start)).sort((x, y) => x - y); return d.length ? d[Math.floor(d.length / 2)] : 0 })(),
+      vectors: [...new Set(builtAll.flatMap(vectorsOf))].sort(),
+      oldest: inWindow.length ? inWindow[inWindow.length - 1].start * 1000 : null,
+      newest: inWindow.length ? inWindow[0].end * 1000 : null,
+      archived: ARCHIVE.size,
+    }
+
+    // Filters / sorts that need the breakdown run over analysed attacks; the
+    // rest are counted as `pending` (the background catch-up fills them in).
+    const needsBreakdown = !!vector || !!ip || sort !== 'start' || analysedOnly
+    if (needsBreakdown) {
+      let rows = builtAll
+      if (vector) rows = rows.filter((b) => vectorsOf(b).includes(vector))
+      if (ip) rows = rows.filter((b) => b.attackers.some((x) => x.ip.includes(ip)) || b.victims.some((x) => x.ip.includes(ip)))
+      rows = [...rows].sort((x, y) => (desc ? num(y, sort) - num(x, sort) : num(x, sort) - num(y, sort)))
+      void backfill(all)
+      return NextResponse.json({
+        status: 'success', retentionDays, total: rows.length, offset, limit,
+        attacks: rows.slice(offset, offset + limit).map(withId), pending: inWindow.length - builtAll.length, summary,
+      })
+    }
+
+    // Default: newest first; analyse exactly the requested page if needed.
+    const ordered = desc ? inWindow : [...inWindow].reverse()
+    const page = ordered.slice(offset, offset + limit)
+    const settled = await Promise.allSettled(page.map(getBuilt))
+    const attacks = settled.map((r, i) => (r.status === 'fulfilled'
+      ? withId(r.value)
+      : { ...withId({ start: page[i].start * 1000, end: page[i].end * 1000, durationSec: page[i].end - page[i].start, vectors: [], attackers: [], victims: [] } as Built), partial: true }))
+    return NextResponse.json({
+      status: 'success', retentionDays, total: ordered.length, offset, limit, attacks,
+      pending: inWindow.length - inWindow.filter((e) => known(e)).length, summary,
+    })
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     return NextResponse.json({ status: 'error', error: msg }, { status: 502 })

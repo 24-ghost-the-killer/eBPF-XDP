@@ -36,6 +36,7 @@ export async function GET(req: NextRequest) {
     username: live.username, group: live.group, kind: live.kind,
     perms: live.perms, pages: live.perms, // `pages` kept for older clients
     isAdmin: live.perms.includes(ADMIN_PAGE),
+    mfaSetupRequired: !!live.mfaSetupRequired, // group requires two-factor; send them to their profile
   }
   const res = NextResponse.json(body)
   const expiringSoon = s.exp - Math.floor(Date.now() / 1000) < SESSION_REFRESH

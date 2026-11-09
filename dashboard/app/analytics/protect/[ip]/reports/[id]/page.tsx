@@ -4,7 +4,8 @@ import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { Badge, Empty } from '@/components/aa/kit'
 import { useMe } from '@/components/aa/Shell'
-import { CsvButton } from '@/components/aa/export'
+import { CsvButton, PdfButton } from '@/components/aa/export'
+import { exportReportsPdf } from '@/lib/report-pdf'
 import { downloadCsv } from '@/lib/csv'
 import {
   useProtect, CLIENT_ID, EditingBadge, useEditingPresence, hostHref, fmtWhen, validIp, emptyMeta, NeedsPerm,
@@ -175,6 +176,7 @@ function ReportView({ ip, id }: { ip: string; id: string }) {
               ) : (
                 <button onClick={() => setStatus('draft')} disabled={busy} className="inline-flex items-center gap-1 rounded-lg border border-nd-line px-3 py-1.5 text-[12.5px] text-nd-fg-3 hover:text-nd-fg"><CircleDashed className="h-3.5 w-3.5" /> Back to draft</button>
               )}
+              <PdfButton onClick={() => exportReportsPdf([report], { ip, nickname: meta.nickname }, access.me?.username ?? '')} />
               <CsvButton onClick={() => downloadCsv(`report-${hostName}-${report.title}`, report.sections.map((s, i) => ({ ...s, n: i + 1 })), [
                 { key: 'host', label: 'host', get: () => ip }, { key: 'nickname', label: 'nickname', get: () => meta.nickname },
                 { key: 'title', label: 'report', get: () => report.title }, { key: 'kind', label: 'type', get: () => kindOf(report.kind).label },
