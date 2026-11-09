@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { verifyChallenge, signSession, SESSION_TTL } from '@/lib/authz'
 import { verifySecondFactor, userEpoch } from '@/lib/users'
 import { cookieOpts } from '@/lib/api-auth'
+import { clientAddr, isTwingateConnector } from '@/lib/client-addr'
 import { loginBlocked, loginFailed, loginSucceeded, FAIL_DELAY_MS } from '@/lib/login-guard'
 import { audit } from '@/lib/audit'
 
@@ -12,8 +13,10 @@ import { audit } from '@/lib/audit'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const clientAddr = (req: NextRequest) =>
-  req.headers.get('x-forwarded-for')?.split(',')[0].trim() || req.headers.get('x-real-ip') || null
+// Per-address lockouts use the user's address. Behind a Twingate connector every
+// user shares the connector's address, so it is left out there (per-username
+// and global limits still apply) — one person's typos must not lock out all.
+const guardAddr = (req: NextRequest) => { const a = clientAddr(req); return isTwingateConnector(a) ? null : a }
 
 export async function POST(req: NextRequest) {
   const secret = process.env.DASH_SESSION
@@ -22,7 +25,7 @@ export async function POST(req: NextRequest) {
   const ch = await verifyChallenge(secret, typeof body?.challenge === 'string' ? body.challenge : undefined)
   if (!ch) return NextResponse.json({ error: 'the sign-in took too long — enter your password again', restart: true }, { status: 401 })
   if (ch.e < userEpoch(ch.u)) return NextResponse.json({ error: 'please sign in again', restart: true }, { status: 401 })
-  const addr = clientAddr(req)
+  const addr = guardAddr(req)
   const wait = loginBlocked(ch.u, addr)
   if (wait > 0) {
     audit(req, { user: ch.u, category: 'auth', action: 'auth.mfa', target: `user:${ch.u}`, summary: `Two-factor code refused for ${ch.u}: locked after repeated failures`, result: 'denied' })

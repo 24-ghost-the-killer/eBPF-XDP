@@ -3,11 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ShieldAlert, Timer, Maximize2, Ban, ShieldCheck, Search, X, LineChart as LineIcon, Network, Crosshair, Gauge, Users, ArrowRight, Activity,
-  ChevronLeft, ChevronRight, Loader2, Archive,
+  ChevronLeft, ChevronRight, Loader2, Archive, List, Info,
 } from 'lucide-react'
+import Link from 'next/link'
 import { rangeAbs, toSeries } from '@/lib/prom'
 import { usePoll } from '@/hooks/usePoll'
-import { fetchAttackPage, vectorsOf, type Episode, type AttackPage } from '@/lib/attacks'
+import { fetchAttackPage, fetchAttack, fetchParties, attackHref, vectorsOf, type Episode, type AttackPage, type Party, type Parties } from '@/lib/attacks'
 import { pps, bps, duration, si, pretty } from '@/lib/format'
 import { niceStep } from '@/lib/stats'
 import { SERIES, BarList } from '@/components/nd/ui'
@@ -34,7 +35,133 @@ const COLS: { key: SortKey; label: string; right?: boolean }[] = [
 const when = (ms: number) => new Date(ms).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 const blockedTone = (x: number): Tone => (x >= 0.9 ? 'good' : x >= 0.5 ? 'warn' : 'bad')
 
+// Every source / target of one attack, searchable, with CSV export. Opened from
+// the attack's slide-over; the list there only shows the top 8.
+type Side = 'sources' | 'targets'
+function PartiesDialog({ a, side: initial, onClose }: { a: Episode; side: Side; onClose: () => void }) {
+  const [side, setSide] = useState<Side>(initial)
+  const [data, setData] = useState<Parties | null>(null)
+  const [err, setErr] = useState('')
+  const [q, setQ] = useState('')
+  const [shown, setShown] = useState(200)
+  useEffect(() => {
+    fetchParties(a.id).then(setData).catch((e) => setErr(e instanceof Error ? e.message : 'failed'))
+  }, [a.id])
+  // Esc closes this dialog only, not the attack behind it.
+  useEffect(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose() } }
+    document.addEventListener('keydown', esc, true)
+    return () => document.removeEventListener('keydown', esc, true)
+  }, [onClose])
+  useEffect(() => setShown(200), [side, q])
+
+  const all: Party[] = data ? (side === 'sources' ? data.attackers : data.victims) : []
+  const total = all.reduce((n, p) => n + p.packets, 0)
+  const rows = q.trim() ? all.filter((p) => p.ip.includes(q.trim())) : all
+  const dropped = a.droppedPackets
+  const traced = dropped > 0 ? Math.min(1, total / dropped) : 0
+  const isSrc = side === 'sources'
+  const exportCsv = () => downloadCsv(`attack-${a.id}-${side}`, rows, [
+    { key: 'ip', label: isSrc ? 'source IP' : 'target IP' },
+    ...(isSrc ? [{ key: 'scope', label: 'scope' } as const] : []),
+    { key: 'packets', label: 'dropped packets' },
+    { key: 'share', label: 'share of traced %', get: (p: Party) => (total ? (p.packets / total) * 100 : 0).toFixed(2) },
+    { key: 'bytes', label: 'dropped bytes' },
+    { key: 'pps', label: 'avg packets/s', get: (p: Party) => p.pps ?? Math.round(p.packets / Math.max(1, a.durationSec)) },
+  ], `${rows.length} attack ${side} of the ${new Date(a.start).toISOString()} attack`, `attack:${a.id}`)
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={`All ${side} of this attack`}>
+      <button aria-label="Close" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" />
+      <div className="aa-in relative flex h-[min(86vh,780px)] w-full max-w-[860px] flex-col overflow-hidden rounded-2xl border border-nd-line bg-nd-bg shadow-nd-lg">
+        <header className="flex items-start justify-between gap-4 border-b border-nd-line bg-nd-card px-5 py-4">
+          <div className="min-w-0">
+            <h3 className="text-[16px] font-semibold tracking-[-0.01em] text-nd-fg">Sources and targets</h3>
+            <p className="mt-0.5 text-[12.5px] text-nd-dim">{vectorsOf(a).map(pretty).slice(0, 3).join(', ')} · {when(a.start)} · {duration(a.durationSec)}</p>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-nd-dim hover:bg-nd-fill hover:text-nd-fg"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="flex flex-wrap items-center gap-2 border-b border-nd-line px-5 py-3">
+          <div className="inline-flex rounded-lg border border-nd-line bg-nd-fill p-0.5 text-[12.5px]" role="tablist">
+            {(['sources', 'targets'] as Side[]).map((t) => (
+              <button key={t} role="tab" aria-selected={side === t} onClick={() => setSide(t)}
+                className={`rounded-md px-3 py-1 font-medium transition-colors ${side === t ? 'bg-nd-card text-nd-fg shadow-nd' : 'text-nd-dim hover:text-nd-fg'}`}>
+                {t === 'sources' ? 'Attack sources' : 'Targets'}{data ? ` (${(t === 'sources' ? data.attackers : data.victims).length})` : ''}
+              </button>
+            ))}
+          </div>
+          <div className="relative ml-auto">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-nd-faint" />
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Find an IP" aria-label="Find an IP" className={`${btn.input} mono w-44 py-1.5 pl-8 text-[12.5px]`} />
+          </div>
+          <CsvButton disabled={!rows.length} onClick={exportCsv} title={`Every ${isSrc ? 'source' : 'target'} shown, as CSV`} />
+        </div>
+        {data && (
+          <div className="space-y-1 border-b border-nd-line bg-nd-panel px-5 py-2.5 text-[12px] text-nd-dim">
+            <p>
+              <span className="font-medium text-nd-fg-3">{si(total)}</span> of {si(dropped)} dropped packets traced to {isSrc ? 'a source' : 'a target'} address ({(traced * 100).toFixed(0)}%)
+              {traced < 0.95 && dropped > 0 && ' — the rest was IPv6 or non-IP traffic, which is not traced per address.'}
+            </p>
+            {data.sample > 1 && <p className="flex items-start gap-1.5"><Info className="mt-[1px] h-3.5 w-3.5 shrink-0" />Per-address counts are estimates: the dataplane records 1 in {data.sample} dropped packets per address (to stay fast under a flood) and they are scaled back up.</p>}
+            {!data.complete && <p className="flex items-start gap-1.5"><Archive className="mt-[1px] h-3.5 w-3.5 shrink-0" />This attack is older than Prometheus keeps, so only the top {all.length} kept in the archive are listed.</p>}
+          </div>
+        )}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {err ? (
+            <Empty icon={ShieldAlert} title="Couldn’t load the list" hint={err} />
+          ) : !data ? (
+            <div className="space-y-2 p-5">{Array.from({ length: 8 }).map((_, i) => <div key={i} className="aa-skeleton h-8 rounded-lg" />)}</div>
+          ) : rows.length === 0 ? (
+            <Empty icon={isSrc ? Users : Crosshair} title={q ? 'No address matches' : `No ${side} recorded`} hint={q ? 'Try part of an address.' : 'Nothing was traced to an address for this attack.'} />
+          ) : (
+            <table className="w-full text-left text-[12.5px]">
+              <thead className="sticky top-0 bg-nd-fill">
+                <tr className="text-[11px] uppercase tracking-[0.06em] text-nd-dim">
+                  <th className="w-10 py-2 pl-5 pr-2 font-medium">#</th>
+                  <th className="px-3 py-2 font-medium">{isSrc ? 'Source' : 'Target'}</th>
+                  {isSrc && <th className="px-3 py-2 font-medium">Scope</th>}
+                  <th className="px-3 py-2 text-right font-medium">Dropped packets</th>
+                  <th className="px-3 py-2 font-medium">Share</th>
+                  <th className="px-3 py-2 text-right font-medium">Data</th>
+                  <th className="py-2 pl-3 pr-5 text-right font-medium">Avg rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, shown).map((p) => {
+                  const share = total ? p.packets / total : 0
+                  return (
+                    <tr key={p.ip} className="border-b border-nd-line-soft last:border-0 hover:bg-nd-fill">
+                      <td className="py-2 pl-5 pr-2 text-nd-faint">{all.indexOf(p) + 1}</td>
+                      <td className="mono px-3 py-2"><Link href={`/analytics/ip?ip=${encodeURIComponent(p.ip)}`} className="text-nd-fg hover:underline" title="Look up this IP">{p.ip}</Link></td>
+                      {isSrc && <td className="px-3 py-2"><Badge tone={p.scope === 'lan' ? 'warn' : 'neutral'}>{p.scope || '—'}</Badge></td>}
+                      <td className="mono px-3 py-2 text-right text-nd-fg">{p.packets.toLocaleString()}</td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 w-20 overflow-hidden rounded-full bg-nd-fill-2"><div className="h-full rounded-full" style={{ width: `${Math.max(1, share * 100)}%`, background: isSrc ? SERIES[1] : SERIES[4] }} /></div>
+                          <span className="mono w-12 text-nd-dim">{(share * 100).toFixed(share < 0.01 ? 2 : 1)}%</span>
+                        </div>
+                      </td>
+                      <td className="mono px-3 py-2 text-right text-nd-fg-3">{si(p.bytes, 'B')}</td>
+                      <td className="mono py-2 pl-3 pr-5 text-right text-nd-fg-3">{pps(p.pps ?? p.packets / Math.max(1, a.durationSec))}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+          {data && rows.length > shown && (
+            <div className="flex justify-center p-4">
+              <button onClick={() => setShown((n) => n + 200)} className={btn.ghost}>Show {Math.min(200, rows.length - shown)} more of {rows.length - shown}</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentionDays: number; onClose: () => void; onExplore: () => void }) {
+  const [all, setAll] = useState<Side | null>(null)
   const archivedOnly = Date.now() - a.end > retentionDays * 86_400_000
   const pad = Math.max(120, Math.round(a.durationSec * 0.5))
   const start = Math.floor(a.start / 1000) - pad
@@ -64,6 +191,11 @@ function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentio
     document.addEventListener('keydown', esc)
     return () => document.removeEventListener('keydown', esc)
   }, [onClose])
+  const viewAll = (side: Side, n: number) => (
+    <button onClick={() => setAll(side)} className={`${btn.ghost} py-1 text-[12px]`} title={`Every ${side === 'sources' ? 'source' : 'target'} of this attack`}>
+      <List className="h-3.5 w-3.5" /> View all{n ? ` ${si(n)}` : ''}
+    </button>
+  )
 
   return (
     <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label={`Attack episode ${a.id}`}>
@@ -116,16 +248,25 @@ function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentio
               <TimeChart loading={!q.data} data={q.data?.risk ?? []} series={[{ key: 'risk', label: 'Risk', color: SERIES[1] }]} yfmt={(n) => n.toFixed(2)} spanMs={spanMs} height={190} />
             </Panel>
           </div>
+          {(a.v ?? 2) < 3 && (
+            <div className="flex items-start gap-2 rounded-xl border border-nd-line bg-nd-panel px-4 py-3 text-[12.5px] text-nd-dim">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{archivedOnly ? 'The source and target counts for this attack were saved by an older version that undercounted them, and Prometheus no longer has the data to redo them. Treat them as a lower bound.' : 'The source and target counts are being recalculated with the corrected method — reopen this attack in a minute.'}</span>
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-            <Panel icon={Users} title="Attack sources" sub={a.uniqueSources ? `${si(a.uniqueSources)} distinct${a.uniqueSources > 1000 ? ' — likely spoofed' : ''}` : 'Not attributed'}>
+            <Panel icon={Users} title="Attack sources" actions={viewAll('sources', a.uniqueSources)}
+              sub={a.uniqueSources ? `${si(a.uniqueSources)} distinct${a.uniqueSources > 1000 ? ' — likely spoofed' : ''}${a.sample && a.sample > 1 ? ' · estimated' : ''}` : 'Not attributed'}>
               <BarList rows={a.attackers.slice(0, 8).map((x) => ({ label: x.ip, sub: x.scope, v: x.packets }))} fmt={(n) => si(n)} mono color={SERIES[1]} empty="No per-source attribution — on-box or injected traffic bypasses the talker tap." />
             </Panel>
-            <Panel icon={Crosshair} title="Targets" sub={a.classifier ? `Classifier: ${pretty(a.classifier.label)} (${Math.round(a.classifier.conf * 100)}%)` : 'Victim hosts'}>
+            <Panel icon={Crosshair} title="Targets" actions={viewAll('targets', a.uniqueTargets ?? a.victims.length)}
+              sub={`${a.uniqueTargets ?? a.victims.length} host${(a.uniqueTargets ?? a.victims.length) === 1 ? '' : 's'} hit${a.sample && a.sample > 1 ? ' · estimated' : ''}`}>
               <BarList rows={a.victims.slice(0, 8).map((v) => ({ label: v.ip, v: v.packets }))} fmt={(n) => si(n)} mono color={SERIES[4]} empty="No victim hosts recorded." />
             </Panel>
           </div>
         </div>
       </div>
+      {all && <PartiesDialog a={a} side={all} onClose={() => setAll(null)} />}
     </div>
   )
 }
@@ -155,6 +296,26 @@ export default function AttacksPage() {
   const gen = useRef(0) // bumps when the filters change; late answers for old filters are dropped
   const [err, setErr] = useState('')
   const [exporting, setExporting] = useState(false)
+  // Opened from a link (?attack=<id>, e.g. a host's page): that attack may not
+  // be on the page that is loaded, so it is fetched on its own.
+  const [deep, setDeep] = useState<{ attack: Episode; retentionDays: number } | null>(null)
+  const [deepState, setDeepState] = useState<{ id: number; error?: string } | null>(null)
+  useEffect(() => {
+    const id = Number(new URLSearchParams(window.location.search).get('attack'))
+    if (!id) return
+    setOpen(id)
+    setDeepState({ id })
+    fetchAttack(id)
+      .then((d) => { setDeep(d); setDeepState(null) })
+      .catch((e) => setDeepState({ id, error: e instanceof Error ? e.message : 'could not load that attack' }))
+  }, [])
+  // Keep the address bar in step with the open attack, so it can be shared and
+  // Back still returns to wherever the link came from.
+  const openAttack = (id: number | null) => {
+    setOpen(id)
+    if (id === null) setDeepState(null)
+    window.history.replaceState(window.history.state, '', id === null ? '/analytics/attacks' : attackHref(id))
+  }
 
   useEffect(() => { const t = setTimeout(() => setIpDeb(ipq.trim()), 350); return () => clearTimeout(t) }, [ipq])
 
@@ -226,7 +387,7 @@ export default function AttacksPage() {
   const rows: Row[] = []
   for (let i = (page - 1) * PAGE; i < Math.min(page * PAGE, total); i++) if (items[i]) rows.push(items[i])
   const cur = hasPage(page) ? meta : null
-  const sel = rows.find((a) => a.id === open) ?? null
+  const sel = rows.find((a) => a.id === open) ?? (deep && deep.attack.id === open ? deep.attack : null)
   const goPage = (p: number) => {
     setPage(Math.max(1, Math.min(nPages, p)))
     document.getElementById('episodes')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -335,7 +496,7 @@ export default function AttacksPage() {
               </thead>
               <tbody>
                 {rows.map((a) => (
-                  <tr key={a.id} onClick={() => !a.partial && setOpen(a.id)} className={`group border-b border-nd-line-soft transition-colors last:border-0 ${a.partial ? '' : 'cursor-pointer hover:bg-nd-fill'}`}>
+                  <tr key={a.id} onClick={() => !a.partial && openAttack(a.id)} className={`group border-b border-nd-line-soft transition-colors last:border-0 ${a.partial ? '' : 'cursor-pointer hover:bg-nd-fill'}`}>
                     <td className="py-3 pl-5 pr-4">
                       <div className="font-medium text-nd-fg">{when(a.start)}</div>
                       <div className="text-[11.5px] text-nd-dim">{a.partial ? 'being analysed…' : a.target?.label ?? 'target unknown'}</div>
@@ -363,14 +524,31 @@ export default function AttacksPage() {
       {sel && (
         <Drawer
           a={sel}
-          retentionDays={cur?.retentionDays ?? 15}
-          onClose={() => setOpen(null)}
+          retentionDays={cur?.retentionDays ?? deep?.retentionDays ?? 15}
+          onClose={() => openAttack(null)}
           onExplore={() => {
             const pad = Math.max(120, Math.round(sel.durationSec * 0.5))
             rng.setCustom(Math.floor(sel.start / 1000) - pad, Math.ceil(sel.end / 1000) + pad)
             router.push('/analytics/explore?metric=ingress_bps&by=iface')
           }}
         />
+      )}
+      {!sel && deepState && deepState.id === open && (
+        <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Loading attack">
+          <button aria-label="Close" onClick={() => openAttack(null)} className="absolute inset-0 bg-black/30 backdrop-blur-[2px]" />
+          <div className="aa-in absolute inset-y-0 right-0 flex w-full max-w-[900px] flex-col items-center justify-center gap-3 border-l border-nd-line bg-nd-bg px-6 text-center shadow-nd-lg">
+            {deepState.error ? (
+              <>
+                <ShieldAlert className="h-6 w-6 text-nd-dim" />
+                <p className="text-[14px] font-medium text-nd-fg">Couldn’t open that attack</p>
+                <p className="max-w-sm text-[12.5px] text-nd-dim">{deepState.error}</p>
+                <button onClick={() => openAttack(null)} className={btn.ghost}>Show all attacks</button>
+              </>
+            ) : (
+              <><Loader2 className="h-5 w-5 animate-spin text-nd-dim" /><p className="text-[13px] text-nd-dim">Loading attack…</p></>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )

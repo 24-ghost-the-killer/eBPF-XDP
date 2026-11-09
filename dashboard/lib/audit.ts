@@ -15,6 +15,7 @@ import { appendFileSync, readFileSync, renameSync, statSync, existsSync, mkdirSy
 import { dirname } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import type { NextRequest } from 'next/server'
+import { clientAddr, normIp, isValidIp, isTwingateConnector } from './client-addr'
 
 export type AuditCategory = 'auth' | 'access' | 'users' | 'groups' | 'protect' | 'lockdown' | 'notes' | 'reports' | 'export' | 'query' | 'view'
 export type AuditResult = 'ok' | 'denied' | 'error' | 'conflict'
@@ -24,6 +25,9 @@ export interface AuditEntry {
   user: string // '' = not signed in / unknown
   kind?: string // user | kiosk | breakglass | default
   ip: string | null
+  // 'twingate' = `ip` is the Twingate connector that relayed the user, not the
+  // user's own address (which the dashboard cannot see)
+  via?: 'twingate'
   ua: string | null
   category: AuditCategory
   action: string // e.g. "user.update"
@@ -91,7 +95,7 @@ function rotateIfNeeded(file: string) {
 
 export function clientInfo(req: NextRequest | null): { ip: string | null; ua: string | null } {
   if (!req) return { ip: null, ua: null }
-  const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim() || req.headers.get('x-real-ip') || null
+  const ip = clientAddr(req)
   const ua = (req.headers.get('user-agent') || '').slice(0, 160) || null
   return { ip, ua }
 }
@@ -122,7 +126,7 @@ export function audit(req: NextRequest | null, e: AuditInput): void {
       user: e.user || '',
       ...(e.kind ? { kind: e.kind } : {}),
       ...clientInfo(req),
-      ...(e.ip !== undefined ? { ip: e.ip } : {}),
+      ...(e.ip !== undefined ? { ip: isValidIp(e.ip) ? normIp(e.ip) : null } : {}),
       ...(e.ua !== undefined ? { ua: e.ua } : {}),
       category: e.category,
       action: e.action,
@@ -132,6 +136,7 @@ export function audit(req: NextRequest | null, e: AuditInput): void {
       result: e.result ?? 'ok',
       prev,
     }
+    if (isTwingateConnector(body.ip)) body.via = 'twingate'
     const hash = entryHash(prev, body)
     const fresh = !existsSync(file)
     appendFileSync(file, JSON.stringify({ ...body, hash }) + '\n', { mode: 0o600 })

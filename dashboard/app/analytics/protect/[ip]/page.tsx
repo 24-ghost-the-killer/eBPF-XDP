@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 import { instantAt, scalar, rangeAbs, toSeries } from '@/lib/prom'
 import { usePoll } from '@/hooks/usePoll'
-import { fetchAttacks } from '@/lib/attacks'
+import { fetchAttacks, attackHref } from '@/lib/attacks'
 import { si, pps, bps, duration } from '@/lib/format'
 import { Stat, Panel, Badge, Empty } from '@/components/aa/kit'
 import { TimeChart } from '@/components/nd/charts'
@@ -481,7 +481,7 @@ function DetailCharts({ ip, iface }: { ip: string; iface: string }) {
           <TimeChart loading={!d} data={d?.verdict ?? []} series={[{ key: 'pass', label: 'Passed', color: SERIES[2] }, { key: 'drop', label: 'Dropped', color: SERIES[1] }]} yfmt={pps} spanMs={spanMs} height={200} />
         </Panel>
       </div>
-      <Panel icon={ShieldAlert} title="Attack episodes involving this host" sub="from the Attacks history">
+      <Panel icon={ShieldAlert} title="Attack episodes involving this host" sub="from the Attacks history · click one to open it">
         {!hist.data ? (
           <div className="space-y-1.5">{[0, 1].map((i) => <div key={i} className="aa-skeleton h-9 rounded-lg" />)}</div>
         ) : episodes.length === 0 ? (
@@ -489,11 +489,15 @@ function DetailCharts({ ip, iface }: { ip: string; iface: string }) {
         ) : (
           <ul className="divide-y divide-nd-line overflow-hidden rounded-xl border border-nd-line">
             {episodes.slice(0, 20).map((a) => (
-              <li key={a.id} className="flex flex-wrap items-center gap-3 px-3.5 py-2.5 text-[12.5px]">
-                <Badge tone="bad">{a.vectors[0] ?? 'attack'}</Badge>
-                <span className="text-nd-fg-3">{new Date(a.start).toLocaleString()}</span>
-                <span className="text-nd-dim">{duration(a.durationSec)} · peak {pps(a.peakPps)} · {Math.round(a.dropShare * 100)}% dropped</span>
-                <span className="ml-auto text-nd-dim">{a.victims.some((x) => x.ip === ip) ? 'target' : 'source'}</span>
+              <li key={a.id}>
+                <Link href={attackHref(a.id)} title="Open this attack"
+                  className="group flex flex-wrap items-center gap-3 px-3.5 py-2.5 text-[12.5px] transition-colors hover:bg-nd-fill focus-visible:bg-nd-fill focus-visible:outline-none">
+                  <Badge tone="bad">{a.vectors[0] ?? 'attack'}</Badge>
+                  <span className="text-nd-fg-3">{new Date(a.start).toLocaleString()}</span>
+                  <span className="text-nd-dim">{duration(a.durationSec)} · peak {pps(a.peakPps)} · {Math.round(a.dropShare * 100)}% dropped</span>
+                  <span className="ml-auto text-nd-dim">{a.victims.some((x) => x.ip === ip) ? 'target' : 'source'}</span>
+                  <ChevronRight className="h-4 w-4 shrink-0 text-nd-faint transition-transform group-hover:translate-x-0.5 group-hover:text-nd-fg" />
+                </Link>
               </li>
             ))}
           </ul>

@@ -3,7 +3,8 @@ import { Suspense, useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { instantAt, rangeAbs, toSeries, scalar, type InstantResult } from '@/lib/prom'
 import { usePoll } from '@/hooks/usePoll'
-import { fetchAttacks, vectorsOf } from '@/lib/attacks'
+import Link from 'next/link'
+import { fetchAttacks, vectorsOf, attackHref } from '@/lib/attacks'
 import { bps, pps, duration, si, pretty } from '@/lib/format'
 import { SERIES } from '@/components/nd/ui'
 import { Panel, Stat, Badge, Empty, btn, type Tone } from '@/components/aa/kit'
@@ -155,14 +156,17 @@ function Report({ ip }: { ip: string }) {
         ) : episodes.length ? (
           <ul className="divide-y divide-nd-line-soft text-[13px]">
             {episodes.map((a) => (
-              <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5">
+              <li key={a.id}>
+                <Link href={attackHref(a.id)} title="Open this attack" className="group -mx-2 flex flex-wrap items-center justify-between gap-2 rounded-lg px-2 py-2.5 transition-colors hover:bg-nd-fill">
                 <span className="flex flex-wrap items-center gap-2">
                   <Badge tone={a.attackers.some((x) => x.ip === ip) ? 'bad' : 'warn'}>{a.attackers.some((x) => x.ip === ip) ? 'source' : 'target'}</Badge>
                   <span className="font-medium text-nd-fg-2">{vectorsOf(a).map(pretty).slice(0, 3).join(', ')}</span>
                 </span>
                 <span className="mono text-[12px] text-nd-dim">
                   {new Date(a.start).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} · {duration(a.durationSec)} · {bps(a.peakBps)}
+                  <ChevronRight className="ml-2 inline h-4 w-4 align-[-3px] text-nd-faint transition-transform group-hover:translate-x-0.5 group-hover:text-nd-fg" />
                 </span>
+                </Link>
               </li>
             ))}
           </ul>

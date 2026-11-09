@@ -1,3 +1,4 @@
+import { isTwingateConnector, normIp } from '@/lib/client-addr'
 import { NextRequest, NextResponse } from 'next/server'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { requirePerm, currentAccess } from '@/lib/api-auth'
@@ -45,9 +46,14 @@ export async function GET(req: NextRequest) {
     (!user || e.user === user) &&
     (!cats.length || cats.includes(e.category)) &&
     (!result || e.result === result) &&
-    (!q || `${e.user} ${e.action} ${e.target ?? ''} ${e.summary} ${e.ip ?? ''} ${JSON.stringify(e.detail ?? {})}`.toLowerCase().includes(q))
+    (!q || `${e.user} ${e.action} ${e.target ?? ''} ${e.summary} ${e.ip ?? ''} ${e.via ?? ''} ${JSON.stringify(e.detail ?? {})}`.toLowerCase().includes(q))
   const out: AuditEntry[] = []
-  for (let i = all.length - 1; i >= 0 && out.length < limit; i--) if (match(all[i])) out.push(all[i])
+  for (let i = all.length - 1; i >= 0 && out.length < limit; i--) {
+    // Entries written before connector labelling: label them in the answer
+    // (the stored line, and so its hash, is untouched).
+    const e = all[i].via || !isTwingateConnector(all[i].ip) ? all[i] : { ...all[i], ip: normIp(all[i].ip), via: 'twingate' as const }
+    if (match(e)) out.push(e)
+  }
   const body: Record<string, unknown> = { entries: out, summary, more: out.length === limit }
   if (sp.get('verify') === '1') body.chain = verifyChain()
   return NextResponse.json(body)

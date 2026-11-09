@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse, type NextFetchEvent } from 'next/server'
 import { verifySession, routePageId, sessionCan, firstAllowedPath, authMode, signInternal } from '@/lib/authz'
+import { clientAddr } from '@/lib/client-addr'
 
 // The Edge runtime can't write the audit file, so refusals decided HERE are sent
 // to /api/audit as an HMAC-signed internal event (fire-and-forget, never delays
@@ -11,7 +12,7 @@ function auditFromEdge(req: NextRequest, ev: NextFetchEvent, secret: string, e: 
   // document visit is logged. API calls are never prefetched and always logged.
   const isPage = !req.nextUrl.pathname.startsWith('/api/')
   if (isPage && (req.headers.get('sec-fetch-dest') !== 'document' || req.headers.get('next-url') || req.nextUrl.searchParams.has('_rsc'))) return
-  const body = JSON.stringify({ ...e, category: 'access', result: 'denied', ip: req.headers.get('x-forwarded-for')?.split(',')[0].trim() || req.headers.get('x-real-ip') || null, ua: req.headers.get('user-agent')?.slice(0, 160) || null })
+  const body = JSON.stringify({ ...e, category: 'access', result: 'denied', ip: clientAddr(req), ua: req.headers.get('user-agent')?.slice(0, 160) || null })
   ev.waitUntil(
     signInternal(secret, body)
       // Straight to the app (DASH_INTERNAL_URL, e.g. http://127.0.0.1:3001 behind the

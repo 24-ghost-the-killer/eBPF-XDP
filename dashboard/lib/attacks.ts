@@ -21,6 +21,22 @@ export interface Episode {
   attackers: Attacker[]
   target: { iface: string; label: string; rxPackets: number; rxShare: number } | null
   victims: { ip: string; packets: number; bytes: number }[]
+  uniqueTargets?: number
+  // 16 = per-address counts are scaled up from the dataplane's 1-in-16 sample
+  sample?: number
+  // breakdown version; < 3 = an older, less accurate source/target calculation
+  v?: number
+}
+
+// One source or target of an attack, with its share of the dropped traffic.
+export interface Party { ip: string; scope?: string; packets: number; bytes: number; pps?: number; bps?: number }
+export interface Parties { attackers: Party[]; victims: Party[]; sample: number; complete: boolean }
+// Every source and target of one attack (the list only carries the top 25).
+export async function fetchParties(id: number): Promise<Parties> {
+  const r = await fetch(`/api/attacks?id=${encodeURIComponent(String(id))}&parties=1`, { cache: 'no-store' })
+  const j = await r.json().catch(() => ({}))
+  if (j.status !== 'success') throw new Error(j.error || 'could not load the sources and targets')
+  return j.parties as Parties
 }
 
 // `incomplete` = episodes whose breakdown failed this round (retried on the next refresh).
@@ -59,7 +75,17 @@ export async function fetchAttackPage(q: AttackQuery): Promise<AttackPage> {
   }
 }
 
-export async function fetchAttacks(): Promise<{ attacks: Episode[]; days: number; incomplete: number }> {
+// One attack by id (= its start time in seconds), for links into the Attacks page.
+export async function fetchAttack(id: number): Promise<{ attack: Episode; retentionDays: number }> {
+  const r = await fetch(`/api/attacks?id=${encodeURIComponent(String(id))}`, { cache: 'no-store' })
+  const j = await r.json().catch(() => ({}))
+  if (j.status !== 'success') throw new Error(j.error || 'could not load that attack')
+  return { attack: j.attack as Episode, retentionDays: (j.retentionDays as number) ?? 15 }
+}
+
+export const attackHref = (id: number) => `/analytics/attacks?attack=${id}`
+
+export async function fetchAttacks():Promise<{ attacks: Episode[]; days: number; incomplete: number }> {
   const ctrl = new AbortController()
   // the first reconstruction after a cold start takes ~25 s; later calls are cached
   const timer = setTimeout(() => ctrl.abort(), 90000)

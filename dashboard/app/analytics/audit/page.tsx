@@ -16,7 +16,7 @@ import {
 // chain and shows whether anything was edited or removed.
 
 interface Entry {
-  id: string; ts: number; user: string; kind?: string; ip: string | null; ua: string | null
+  id: string; ts: number; user: string; kind?: string; ip: string | null; via?: 'twingate'; ua: string | null
   category: string; action: string; target?: string; summary: string; detail?: Record<string, unknown>
   result: 'ok' | 'denied' | 'error' | 'conflict'; prev: string; hash: string
 }
@@ -150,7 +150,7 @@ function Audit() {
                 { key: 'ts', label: 'time (UTC)', get: (e) => new Date(e.ts).toISOString() },
                 { key: 'user', label: 'user' }, { key: 'kind', label: 'session' }, { key: 'category', label: 'category' },
                 { key: 'action', label: 'action' }, { key: 'target', label: 'target' }, { key: 'summary', label: 'what happened' },
-                { key: 'result', label: 'result' }, { key: 'ip', label: 'client IP' }, { key: 'ua', label: 'browser' },
+                { key: 'result', label: 'result' }, { key: 'ip', label: 'client IP' }, { key: 'via', label: 'via', get: (e) => (e.via === 'twingate' ? 'Twingate connector (user address not visible)' : 'direct') }, { key: 'ua', label: 'browser' },
                 { key: 'detail', label: 'detail' }, { key: 'hash', label: 'hash' },
               ], `${entries.length} audit log entries`, 'audit-log')} />
             </span>
@@ -186,7 +186,7 @@ function Audit() {
                   </span>
                   <span className="min-w-0">
                     <span className="block truncate text-[13px] text-nd-fg">{e.summary}</span>
-                    <span className="block truncate text-[11.5px] text-nd-faint">{CATS.find((c) => c.id === e.category)?.label ?? e.category} · {e.action}{e.ip ? ` · ${e.ip}` : ''}</span>
+                    <span className="block truncate text-[11.5px] text-nd-faint">{CATS.find((c) => c.id === e.category)?.label ?? e.category} · {e.action}{e.via === 'twingate' ? ' · via Twingate' : e.ip ? ` · ${e.ip}` : ''}</span>
                   </span>
                   <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset ${RESULT_CLS[e.result] ?? RESULT_CLS.ok}`}>
                     {e.result === 'ok' ? <CheckCircle2 className="h-3 w-3" /> : <ShieldAlert className="h-3 w-3" />} {e.result === 'ok' ? 'ok' : e.result}
@@ -198,7 +198,9 @@ function Audit() {
                       <dt className="text-nd-faint">Time</dt><dd className="font-mono text-nd-fg-3">{new Date(e.ts).toISOString()}</dd>
                       <dt className="text-nd-faint">User</dt><dd className="text-nd-fg-3">{e.user || 'anonymous'}{e.kind && e.kind !== 'user' ? ` (${e.kind})` : ''}</dd>
                       {e.target && <><dt className="text-nd-faint">Target</dt><dd className="font-mono text-nd-fg-3">{e.target}</dd></>}
-                      <dt className="text-nd-faint">Client</dt><dd className="text-nd-fg-3">{e.ip ?? 'direct (no proxy address)'}{e.ua ? ` · ${e.ua}` : ''}</dd>
+                      <dt className="text-nd-faint">Client</dt><dd className="text-nd-fg-3">{e.via === 'twingate'
+                        ? <span title="Twingate relays each user through its connector, so the user's own address never reaches the dashboard">via Twingate <span className="text-nd-faint">(connector {e.ip}; the user's own address is not visible)</span></span>
+                        : (e.ip ?? 'direct (no proxy address)')}{e.ua ? ` · ${e.ua}` : ''}</dd>
                       <dt className="text-nd-faint">Hash</dt><dd className="truncate font-mono text-nd-faint" title={e.hash}>{e.hash}</dd>
                     </dl>
                     {e.detail && <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-nd-line bg-nd-card p-2.5 font-mono text-[11.5px] text-nd-fg-3">{JSON.stringify(e.detail, null, 2)}</pre>}

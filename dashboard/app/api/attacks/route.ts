@@ -18,6 +18,9 @@ import { dirname, join } from 'node:path'
 //
 // GET /api/attacks?offset=0&limit=20[&vector=x][&ip=y][&from=s&to=s][&sort=k&desc=1][&analysedOnly=1]
 //   -> { status, total, offset, limit, attacks, pending, summary, retentionDays }
+// GET /api/attacks?id=<start seconds> -> { status, attack, retentionDays }
+// GET /api/attacks?id=<start seconds>&parties=1 -> every source and target of
+//   that attack (not just the top few kept in the list), { status, parties }
 // GET /api/attacks          (no offset) -> every analysed attack, newest first
 //   (the shape older callers — overview, IP lookup, host pages — expect).
 export const dynamic = 'force-dynamic'
@@ -29,7 +32,21 @@ const SETTLED_S = 600 // an episode that ended this long ago is final
 // Bump whenever the per-episode breakdown logic changes, so archived results
 // from an older build are recomputed (while Prometheus still has the data).
 // v2: per-source/victim counts read as peak-over-window (flush-safe) not instant.
-const CACHE_SCHEMA = 2
+// v3: per-source/victim counts summed over every burst of the episode (the map is
+//     flushed between bursts, v2 kept only the biggest one) and scaled by the
+//     dataplane's 1-in-16 attribution sampling.
+// The version is kept PER archived attack: an older entry is recomputed while
+// Prometheus still has its data, and kept as it is (marked) once it does not.
+const CACHE_SCHEMA = 3
+
+// Since the 27 Oct 2026 dataplane (xdp_main.c, "Sample the per-IP attribution
+// maps"), victims/attackers are credited on 1 drop in 16 to keep a spoofed
+// flood's LRU churn off the fast path. Counts from then on are scaled back up.
+// Measured on the box: drops / attributed was ~1.0-1.3 up to 17:31 that day
+// and ~16 from 17:52 on (no drops in between).
+const ATTRIB_SAMPLE = 16
+const ATTRIB_SAMPLED_SINCE = Number(process.env.DASH_ATTRIB_SAMPLED_SINCE) || 1793118700
+const sampleOf = (ep: Ep) => (ep.start >= ATTRIB_SAMPLED_SINCE ? ATTRIB_SAMPLE : 1)
 
 // Prometheus evaluates ~20 queries at a time; keep a bounded number in flight.
 const MAX_INFLIGHT = 8
@@ -47,7 +64,7 @@ async function limited<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 type Ep = { start: number; end: number } // seconds
-type Built = Record<string, unknown> & { start: number; end: number; durationSec: number; vectors: string[]; attackers: { ip: string }[]; victims: { ip: string }[] }
+type Built = Record<string, unknown> & { start: number; end: number; durationSec: number; vectors: string[]; attackers: { ip: string }[]; victims: { ip: string }[]; v?: number }
 const epKey = (ep: Ep) => `${ep.start}-${ep.end}`
 
 // ---- permanent archive ------------------------------------------------------
@@ -64,12 +81,13 @@ function loadArchive(): Promise<void> {
     loaded = (async () => {
       try {
         const j = JSON.parse(await readFile(archivePath(), 'utf8'))
-        if (j.schema === CACHE_SCHEMA) for (const [k, v] of Object.entries(j.episodes ?? {})) ARCHIVE.set(k, v as Built)
+        // v2 files are kept (their entries carry no `v` = version 2) and upgraded entry by entry
+        if (j.schema >= 2 && j.schema <= CACHE_SCHEMA) for (const [k, v] of Object.entries(j.episodes ?? {})) ARCHIVE.set(k, v as Built)
       } catch {}
       // One-time import of the old per-process cache (same breakdown schema).
       try {
         const old = JSON.parse(await readFile(join(tmpdir(), 'xs-attacks-cache.json'), 'utf8'))
-        if (old.schema === CACHE_SCHEMA) for (const [k, v] of old.episodes ?? []) if (!ARCHIVE.has(k)) ARCHIVE.set(k, v)
+        if (old.schema === 2) for (const [k, v] of old.episodes ?? []) if (!ARCHIVE.has(k)) ARCHIVE.set(k, v)
       } catch {}
     })()
   }
@@ -95,11 +113,11 @@ function saveArchive() {
   })().finally(() => { saving = null })
 }
 
-async function instant(expr: string, time?: number) {
+async function instant(expr: string, time?: number, timeoutMs = 20000) {
   const u = new URL(`${PROM}/api/v1/query`)
   u.searchParams.set('query', expr)
   if (time) u.searchParams.set('time', String(time))
-  const j = await limited(async () => (await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(20000) })).json())
+  const j = await limited(async () => (await fetch(u.toString(), { cache: 'no-store', signal: AbortSignal.timeout(timeoutMs) })).json())
   if (j.status !== 'success') throw new Error(j.error || 'query failed')
   return j.data.result as { metric: Record<string, string>; value: [number, string] }[]
 }
@@ -115,39 +133,56 @@ async function range(expr: string, start: number, end: number, step: number) {
 }
 const num = (r: { value: [number, string] }[]) => (r[0] ? parseFloat(r[0].value[1]) : 0)
 
-// Per-key episode delta, correct whether or not the counter was reset. For each
-// key we have its value at the end of the attack, its value just before the
-// attack, and how many resets happened in the window:
-//   * absent-before  -> the series was born in-window: use the full end value
-//     (captures the first scrape's packets that increase() drops);
-//   * reset in-window -> the map was flushed / agent restarted: the end value is
-//     entirely this episode's (everything since the reset);
-//   * otherwise       -> a monotonic counter with prior history: subtract the
-//     pre-attack value to isolate this episode.
-// This keeps Σ(per-source) == Σ(per-victim) == episode drops in every case,
-// including back-to-back flushed test runs that reuse the same source IPs.
+// ---- sources and targets of one attack ---------------------------------------
+// The dataplane credits each dropped packet's source and destination in two LRU
+// maps; the agent exports them as counters per src / dst. Those counters are
+// NOT monotonic over an attack: the maps are flushed between test bursts (and
+// LRU churn can evict an entry), so one episode is often several 0 -> N runs.
+// The episode total per address is therefore the SUM of every increase,
+// counting a drop or a re-appearance (after a flush) as a fresh start:
+//   per step:  x - x[step ago]   if that is >= 0
+//              x                 otherwise (reset, or the series is new/back)
+// summed over the padded window (`x * 1` drops the metric name so both branches
+// share one label set). Steps telescope, so a plain monotonic counter
+// still gives end - start, and nothing from before the attack leaks in.
+// (v1 used increase(), which drops each new series' first scrape; v2 took the
+// peak over the window, which keeps only the biggest burst.)
+const PAD = 90 // seconds of padding around the detected span
+function windowOf(ep: Ep) {
+  const dur = ep.end - ep.start + 2 * PAD
+  return { dur, at: ep.end + PAD, step: dur > 3 * 3600 ? 15 : 5 } // 5 s = the agent's scrape interval
+}
+const episodeSum = (metric: string, by: string, w: { dur: number; step: number }) =>
+  `sum by(${by})(sum_over_time((((${metric} - ${metric} offset ${w.step}s) >= 0) or (${metric} * 1))[${w.dur}s:${w.step}s]))`
+
 type Vec = { metric: Record<string, string>; value: [number, string] }[]
 function toMap(v: Vec, key: string): Map<string, number> {
   const m = new Map<string, number>()
   for (const r of v) if (r.metric[key] !== undefined) m.set(r.metric[key], parseFloat(r.value[1]))
   return m
 }
-function deltaByKey(end: Vec, start: Vec, resets: Vec, key: string): Map<string, number> {
-  const s = toMap(start, key)
-  const rs = toMap(resets, key)
-  const out = new Map<string, number>()
-  for (const r of end) {
-    const k = r.metric[key]
-    if (k === undefined) continue
-    const endV = parseFloat(r.value[1])
-    const startV = s.get(k)
-    let d: number
-    if (startV === undefined) d = endV // born in-window
-    else if ((rs.get(k) ?? 0) > 0) d = endV // counter reset in-window (flush/restart)
-    else d = endV - startV // monotonic: isolate this episode
-    if (d > 0) out.set(k, d)
+interface Party { ip: string; scope?: string; packets: number; bytes: number; pps: number; bps: number }
+async function parties(ep: Ep, durSec: number): Promise<{ attackers: Party[]; victims: Party[]; sample: number }> {
+  const w = windowOf(ep)
+  const k = sampleOf(ep)
+  const [ap, ab, vp, vb] = await Promise.all([
+    instant(episodeSum('xs_attacker_packets_total', 'src', w), w.at, 60000),
+    instant(episodeSum('xs_attacker_bytes_total', 'src', w), w.at, 60000),
+    instant(episodeSum('xs_target_packets_total', 'dst', w), w.at, 60000),
+    instant(episodeSum('xs_target_bytes_total', 'dst', w), w.at, 60000),
+  ])
+  const list = (pk: Vec, by: Vec, key: string, withScope: boolean): Party[] => {
+    const bytes = toMap(by, key)
+    return [...toMap(pk, key).entries()]
+      .filter(([, n]) => n > 0)
+      .map(([ip, n]) => {
+        const packets = Math.round(n * k)
+        const b = Math.round((bytes.get(ip) ?? 0) * k)
+        return { ip, ...(withScope ? { scope: scopeOf(ip) } : {}), packets, bytes: b, pps: Math.round(packets / durSec), bps: (b * 8) / durSec }
+      })
+      .sort((x, y) => y.packets - x.packets)
   }
-  return out
+  return { attackers: list(ap, ab, 'src', true), victims: list(vp, vb, 'dst', false), sample: k }
 }
 const vlanName = (ifc: string) => (ifc === 'vlan10' ? 'VLAN10 · wan' : ifc === 'vlan20' ? 'VLAN20 · lan' : ifc)
 
@@ -258,17 +293,13 @@ async function analyse(ep: Ep): Promise<Built> {
   // pad the window by one step on each side so the counters fully cover the spike
   // stats window: the detection span padded ±PAD so increase()/max_over_time
   // capture the flood's counter rise without pulling in a neighbouring attack.
-  const PAD = 90
-  const dur = ep.end - ep.start + 2 * PAD
-  const at = ep.end + PAD
-  const atStart = ep.start - PAD // evaluation instant just before the attack
+  const { dur, at } = windowOf(ep)
   const sub = `[${dur}s:30s]`
   const win = `[${dur}s]`
 
   const [
     peakPps, peakBps, totPkts, totBytes, dropped, peakRisk, peakThreat, uniq, cls,
-    atkPEnd, atkPStart, atkBEnd, atkBStart, atkResets, durActive,
-    detIface, rxIface, vicPEnd, vicPStart, vicBEnd, vicBStart, vicResets,
+    durActive, detIface, rxIface,
     ...vecRes
   ] = await Promise.all([
     instant(`max_over_time((sum(rate(xs_rx_packets_total[30s])))${sub})`, at),
@@ -288,22 +319,6 @@ async function analyse(ep: Ep): Promise<Built> {
     // rule-based detection is what actually drives mitigation and is correct.
     // count_over_time gives how many windows each type was active -> dominant.
     instant(`sum by(type)(count_over_time(xs_detection_info${win}))`, at),
-    // Per-source attacker drops. The "end" value is the per-source counter's
-    // PEAK over the episode window (max_over_time), NOT its value at `at`:
-    // the attacker map is flushed to 0 within ~seconds of the attack ending,
-    // and `at` = ep.end + PAD lands AFTER that flush, so an instant read there
-    // returns 0 for every flood source and the whole attack vanishes from the
-    // breakdown (only leftover local traffic survives). The peak is the value
-    // the counter reached just before the flush = this source's episode total.
-    // deltaByKey then isolates the episode: subtract the pre-attack value for a
-    // monotonic series, or take the full peak for one born in-window / reset.
-    // (increase() is still WRONG here -- it drops the first scrape's packets for
-    // every young series, which every freshly-seen attacker IP is.)
-    instant(`sum by(src)(max_over_time(xs_attacker_packets_total${win}))`, at),
-    instant(`sum by(src)(xs_attacker_packets_total)`, atStart),
-    instant(`sum by(src)(max_over_time(xs_attacker_bytes_total${win}))`, at),
-    instant(`sum by(src)(xs_attacker_bytes_total)`, atStart),
-    instant(`sum by(src)(resets(xs_attacker_packets_total${win}))`, at),
     // True attack length in seconds (count of 1s windows detection was active),
     // used as the denominator for average rates. The episode's coarse 30s-step
     // span over/under-estimates; this is accurate to the second.
@@ -311,12 +326,6 @@ async function analyse(ep: Ep): Promise<Built> {
     // target: which interface(s) were under attack + which absorbed the ingress
     instant(`max_over_time((xs_detection_active)${sub})`, at),
     instant(`sum by(iface)(increase(xs_rx_packets_total${win}))`, at),
-    // victim destinations: same flush-safe peak-over-window as attackers.
-    instant(`sum by(dst)(max_over_time(xs_target_packets_total${win}))`, at),
-    instant(`sum by(dst)(xs_target_packets_total)`, atStart),
-    instant(`sum by(dst)(max_over_time(xs_target_bytes_total${win}))`, at),
-    instant(`sum by(dst)(xs_target_bytes_total)`, atStart),
-    instant(`sum by(dst)(resets(xs_target_packets_total${win}))`, at),
     ...VECTORS.map(([, m]) => instant(`sum(increase(${m}${win}))`, at)),
   ])
 
@@ -324,42 +333,17 @@ async function analyse(ep: Ep): Promise<Built> {
   // denominator for all average rates, with a sane fallback.
   const durSec = Math.max(1, Math.round(num(durActive)) || ep.end - ep.start + 30) // +30: one fine-scan step
 
-  // victim destination hosts (exact IPs the flood was aimed at), top 5
-  const vicPkt = deltaByKey(vicPEnd, vicPStart, vicResets, 'dst')
-  const vicByte = deltaByKey(vicBEnd, vicBStart, vicResets, 'dst')
-  const victims = [...vicPkt.entries()]
-    .map(([ip, packets]) => ({ ip, packets: Math.round(packets), bytes: Math.round(vicByte.get(ip) ?? 0) }))
-    .filter((v) => v.packets > 0)
-    .sort((a, b) => b.packets - a.packets)
-    .slice(0, 5)
+  // Sources and targets, summed over every burst (see parties()). The list keeps
+  // the top 25 of each; ?parties=1 serves the full lists on demand.
+  const who = await parties(ep, durSec)
+  const victims = who.victims.slice(0, 25).map(({ ip, packets, bytes }) => ({ ip, packets, bytes }))
 
   // vectors above 5% of the strongest signal
   const vecVals = vecRes.map((r, k) => ({ name: VECTORS[k][0], v: num(r) }))
   const vmax = Math.max(1, ...vecVals.map((x) => x.v))
   const vectors = vecVals.filter((x) => x.v > vmax * 0.05 && x.v > 100).sort((a, b) => b.v - a.v).map((x) => x.name)
 
-  // attacker sources: per-source dropped packets/bytes (accurate end-start
-  // delta), averaged over the true attack duration. Summed over all sources
-  // these now equal the episode's total drops.
-  const atkPkt = deltaByKey(atkPEnd, atkPStart, atkResets, 'src')
-  const atkByte = deltaByKey(atkBEnd, atkBStart, atkResets, 'src')
-  const attackers = [...atkPkt.entries()]
-    .map(([ip, pkts]) => {
-      const bytes = atkByte.get(ip) ?? 0
-      return {
-        ip,
-        scope: scopeOf(ip),
-        bytes,
-        packets: Math.round(pkts),
-        pps: Math.round(pkts / durSec),
-        bps: (bytes * 8) / durSec,
-      }
-    })
-    .filter((a) => a.packets > 0)
-    .sort((a, b) => b.packets - a.packets)
-    // keep the payload small: a spoofed flood has thousands of sources, the
-    // UI shows the top few, and uniqueSources still carries the full count
-    .slice(0, 25)
+  const attackers = who.attackers.slice(0, 25)
 
   // ---- target: where the attack was aimed ----
   const rxByIface = new Map<string, number>()
@@ -405,21 +389,36 @@ async function analyse(ep: Ep): Promise<Built> {
     peakThreatState: Math.round(num(peakThreat)),
     classifier,
     vectors,
-    uniqueSources: Math.round(num(uniq)),
+    // the map's peak size per burst, or every source seen over all bursts
+    uniqueSources: Math.max(Math.round(num(uniq)), who.attackers.length),
+    uniqueTargets: who.victims.length,
     attackers,
     target,
     victims,
+    sample: who.sample,
+    v: CACHE_SCHEMA,
   }
   return built
 }
 
+// An archived breakdown from an older build is recomputed while Prometheus still
+// holds the attack (an hour's margin before it ages out); after that it is kept.
+const inRetention = (ep: Ep) => ep.start > Date.now() / 1000 - retentionDays * 86400 + 3600
+const outdated = (ep: Ep, b: Built) => (b.v ?? 2) < CACHE_SCHEMA && inRetention(ep)
+
 async function getBuilt(ep: Ep): Promise<Built> {
   const k = epKey(ep)
   const a = ARCHIVE.get(k)
-  if (a) return a
+  if (a && !outdated(ep, a)) return a
   const l = LIVE.get(k)
   if (l && Date.now() - l.at < 60_000) return l.b
-  const b = await analyse(ep)
+  let b: Built
+  try {
+    b = await analyse(ep)
+  } catch (e) {
+    if (a) return a // keep showing the older numbers rather than nothing
+    throw e
+  }
   if (Date.now() / 1000 - ep.end >= SETTLED_S) {
     ARCHIVE.set(k, b)
     saveArchive()
@@ -439,11 +438,37 @@ async function backfill(eps: Ep[]) {
   backfilling = true
   try {
     const now = Date.now() / 1000
-    const todo = eps.filter((e) => now - e.end >= SETTLED_S && !ARCHIVE.has(epKey(e))).reverse().slice(0, 6)
+    const todo = eps.filter((e) => {
+      if (now - e.end < SETTLED_S) return false
+      const a = ARCHIVE.get(epKey(e))
+      return !a || outdated(e, a)
+    }).reverse().slice(0, 6)
     for (const e of todo) { try { await getBuilt(e) } catch {} }
   } finally {
     backfilling = false
   }
+}
+
+// Every source and target of one attack, for the "view all" list. Computed
+// from Prometheus while it has the attack (cached once settled); after that,
+// what the archive kept (the top 25 of each).
+const PARTIES = new Map<string, { at: number; p: unknown }>()
+async function allParties(ep: Ep) {
+  const k = epKey(ep)
+  const hit = PARTIES.get(k)
+  const settled = Date.now() / 1000 - ep.end >= SETTLED_S
+  if (hit && (settled || Date.now() - hit.at < 30_000)) return hit.p
+  const b = await getBuilt(ep)
+  let p: unknown
+  if (inRetention(ep)) {
+    const who = await parties(ep, Math.max(1, Number(b.durationSec) || 1))
+    p = { ...who, complete: true }
+  } else {
+    p = { attackers: b.attackers, victims: b.victims, sample: (b.sample as number) ?? 1, complete: false }
+  }
+  PARTIES.set(k, { at: Date.now(), p })
+  if (PARTIES.size > 20) PARTIES.delete(PARTIES.keys().next().value as string)
+  return p
 }
 
 const withId = (b: Built) => ({ ...b, id: Math.floor(b.start / 1000) }) // stable: start time in seconds
@@ -457,6 +482,15 @@ export async function GET(req: NextRequest) {
     await loadArchive()
     const all = await index()
     const sp = req.nextUrl.searchParams
+
+    // One attack by id (its start time in seconds) — deep links from host pages.
+    if (sp.has('id')) {
+      const id = Number(sp.get('id'))
+      const ep = Number.isFinite(id) ? all.find((e) => Math.floor(e.start) === id) : undefined
+      if (!ep) return NextResponse.json({ status: 'error', error: 'That attack is no longer in the history.' }, { status: 404 })
+      if (sp.get('parties') === '1') return NextResponse.json({ status: 'success', parties: await allParties(ep) })
+      return NextResponse.json({ status: 'success', retentionDays, attack: withId(await getBuilt(ep)) })
+    }
 
     // Legacy shape: every analysed attack (overview, IP lookup, host pages).
     if (!sp.has('offset')) {
