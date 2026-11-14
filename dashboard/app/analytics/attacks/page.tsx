@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ShieldAlert, Timer, Maximize2, Ban, ShieldCheck, Search, X, LineChart as LineIcon, Network, Crosshair, Gauge, Users, ArrowRight, Activity,
-  ChevronLeft, ChevronRight, Loader2, Archive, List, Info,
+  ChevronLeft, ChevronRight, Loader2, Archive, List, Info, Globe,
 } from 'lucide-react'
 import Link from 'next/link'
 import { rangeAbs, toSeries } from '@/lib/prom'
@@ -32,6 +32,8 @@ const COLS: { key: SortKey; label: string; right?: boolean }[] = [
   { key: 'droppedPackets', label: 'Dropped', right: true },
   { key: 'dropShare', label: 'Blocked', right: true },
 ]
+// ISO-3166 alpha-2 -> flag emoji (two regional-indicator letters).
+const flagOf = (cc?: string) => (cc && /^[A-Za-z]{2}$/.test(cc) ? String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)) : '🏳️')
 const when = (ms: number) => new Date(ms).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 const blockedTone = (x: number): Tone => (x >= 0.9 ? 'good' : x >= 0.5 ? 'warn' : 'bad')
 
@@ -61,9 +63,15 @@ function PartiesDialog({ a, side: initial, onClose }: { a: Episode; side: Side; 
   const dropped = a.droppedPackets
   const traced = dropped > 0 ? Math.min(1, total / dropped) : 0
   const isSrc = side === 'sources'
+  const hasGeo = isSrc && rows.some((p) => p.cc || p.asn)
   const exportCsv = () => downloadCsv(`attack-${a.id}-${side}`, rows, [
     { key: 'ip', label: isSrc ? 'source IP' : 'target IP' },
     ...(isSrc ? [{ key: 'scope', label: 'scope' } as const] : []),
+    ...(hasGeo ? [
+      { key: 'cc', label: 'country', get: (p: Party) => p.country || p.cc || '' },
+      { key: 'asn', label: 'ASN', get: (p: Party) => (p.asn ? `AS${p.asn}` : '') },
+      { key: 'org', label: 'network', get: (p: Party) => p.org || '' },
+    ] as const : []),
     { key: 'packets', label: 'dropped packets' },
     { key: 'share', label: 'share of traced %', get: (p: Party) => (total ? (p.packets / total) * 100 : 0).toFixed(2) },
     { key: 'bytes', label: 'dropped bytes' },
@@ -71,9 +79,9 @@ function PartiesDialog({ a, side: initial, onClose }: { a: Episode; side: Side; 
   ], `${rows.length} attack ${side} of the ${new Date(a.start).toISOString()} attack`, `attack:${a.id}`)
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={`All ${side} of this attack`}>
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-3 sm:p-6" role="dialog" aria-modal="true" aria-label={`All ${side} of this attack`}>
       <button aria-label="Close" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" />
-      <div className="aa-in relative flex h-[min(86vh,780px)] w-full max-w-[860px] flex-col overflow-hidden rounded-2xl border border-nd-line bg-nd-bg shadow-nd-lg">
+      <div className="aa-in relative flex h-[min(94vh,1040px)] w-full max-w-[1200px] flex-col overflow-hidden rounded-2xl border border-nd-line bg-nd-bg shadow-nd-lg">
         <header className="flex items-start justify-between gap-4 border-b border-nd-line bg-nd-card px-5 py-4">
           <div className="min-w-0">
             <h3 className="text-[16px] font-semibold tracking-[-0.01em] text-nd-fg">Sources and targets</h3>
@@ -120,6 +128,8 @@ function PartiesDialog({ a, side: initial, onClose }: { a: Episode; side: Side; 
                   <th className="w-10 py-2 pl-5 pr-2 font-medium">#</th>
                   <th className="px-3 py-2 font-medium">{isSrc ? 'Source' : 'Target'}</th>
                   {isSrc && <th className="px-3 py-2 font-medium">Scope</th>}
+                  {hasGeo && <th className="px-3 py-2 font-medium">Country</th>}
+                  {hasGeo && <th className="px-3 py-2 font-medium">Network (ASN)</th>}
                   <th className="px-3 py-2 text-right font-medium">Dropped packets</th>
                   <th className="px-3 py-2 font-medium">Share</th>
                   <th className="px-3 py-2 text-right font-medium">Data</th>
@@ -134,6 +144,8 @@ function PartiesDialog({ a, side: initial, onClose }: { a: Episode; side: Side; 
                       <td className="py-2 pl-5 pr-2 text-nd-faint">{all.indexOf(p) + 1}</td>
                       <td className="mono px-3 py-2"><Link href={`/analytics/ip?ip=${encodeURIComponent(p.ip)}`} className="text-nd-fg hover:underline" title="Look up this IP">{p.ip}</Link></td>
                       {isSrc && <td className="px-3 py-2"><Badge tone={p.scope === 'lan' ? 'warn' : 'neutral'}>{p.scope || '—'}</Badge></td>}
+                      {hasGeo && <td className="px-3 py-2 text-nd-fg-3" title={p.country}>{p.cc ? `${flagOf(p.cc)} ${p.cc}` : '—'}</td>}
+                      {hasGeo && <td className="max-w-[180px] truncate px-3 py-2 text-nd-fg-3" title={p.org ? `AS${p.asn} · ${p.org}` : undefined}>{p.asn ? (p.org || `AS${p.asn}`) : '—'}</td>}
                       <td className="mono px-3 py-2 text-right text-nd-fg">{p.packets.toLocaleString()}</td>
                       <td className="px-3 py-2">
                         <div className="flex items-center gap-2">
@@ -264,6 +276,19 @@ function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentio
               <BarList rows={a.victims.slice(0, 8).map((v) => ({ label: v.ip, v: v.packets }))} fmt={(n) => si(n)} mono color={SERIES[4]} empty="No victim hosts recorded." />
             </Panel>
           </div>
+          {a.sourceGeo && (a.sourceGeo.countries.length > 0 || a.sourceGeo.asns.length > 0) && (
+            <>
+              <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+                <Panel icon={Globe} title="Top source countries" sub={`${si(a.sourceGeo.located)} of the sources geolocated`}>
+                  <BarList rows={a.sourceGeo.countries.map((c) => ({ label: `${flagOf(c.cc)}  ${c.label}`, sub: `${si(c.sources)} source${c.sources === 1 ? '' : 's'}`, v: c.packets }))} fmt={(n) => si(n)} color={SERIES[1]} empty="No geolocated sources." />
+                </Panel>
+                <Panel icon={Network} title="Top source networks" sub="by autonomous system (ASN)">
+                  <BarList rows={a.sourceGeo.asns.map((c) => ({ label: c.label, sub: `AS${c.asn} · ${si(c.sources)} source${c.sources === 1 ? '' : 's'}`, v: c.packets }))} fmt={(n) => si(n)} color={SERIES[4]} empty="No ASN data for these sources." />
+                </Panel>
+              </div>
+              <p className="text-[11px] text-nd-faint">IP geolocation by DB-IP (CC BY 4.0)</p>
+            </>
+          )}
         </div>
       </div>
       {all && <PartiesDialog a={a} side={all} onClose={() => setAll(null)} />}

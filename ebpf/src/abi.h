@@ -49,6 +49,7 @@ enum xs_counter_id {
 	XS_CNT_SAMPLE_DROP            = 13, /* ring-buffer reserve failed (collector behind) */
 	XS_CNT_CT_UNTRACKED           = 14, /* TCP packets matching no tracked flow (ACK/RST flood) */
 	XS_CNT_SERVICE_DENY           = 15, /* dropped by the service allowlist (default-deny on a protected dst) */
+	XS_CNT_ARP_RATE_LIMITED       = 56, /* ARP frames dropped by the always-on ARP storm cap */
 
 	/* L2 */
 	XS_CNT_L2_VLAN1               = 8,  /* exactly one 802.1Q/802.1ad tag */

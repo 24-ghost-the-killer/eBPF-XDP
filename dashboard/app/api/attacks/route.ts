@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requirePerm } from '@/lib/api-auth'
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
+import { geoInit, geoReady, withGeo, summariseSources, type SourceGeo } from '@/lib/geo'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -37,7 +38,8 @@ const SETTLED_S = 600 // an episode that ended this long ago is final
 //     dataplane's 1-in-16 attribution sampling.
 // The version is kept PER archived attack: an older entry is recomputed while
 // Prometheus still has its data, and kept as it is (marked) once it does not.
-const CACHE_SCHEMA = 3
+// 4: + 'ARP storm' vector (in-retention episodes are re-analysed once)
+const CACHE_SCHEMA = 4
 
 // Since the 27 Oct 2026 dataplane (xdp_main.c, "Sample the per-IP attribution
 // maps"), victims/attackers are credited on 1 drop in 16 to keep a spoofed
@@ -161,8 +163,8 @@ function toMap(v: Vec, key: string): Map<string, number> {
   for (const r of v) if (r.metric[key] !== undefined) m.set(r.metric[key], parseFloat(r.value[1]))
   return m
 }
-interface Party { ip: string; scope?: string; packets: number; bytes: number; pps: number; bps: number }
-async function parties(ep: Ep, durSec: number): Promise<{ attackers: Party[]; victims: Party[]; sample: number }> {
+interface Party { ip: string; scope?: string; packets: number; bytes: number; pps: number; bps: number; cc?: string; country?: string; asn?: number; org?: string }
+async function parties(ep: Ep, durSec: number): Promise<{ attackers: Party[]; victims: Party[]; sample: number; sourceGeo?: SourceGeo }> {
   const w = windowOf(ep)
   const k = sampleOf(ep)
   const [ap, ab, vp, vb] = await Promise.all([
@@ -171,6 +173,7 @@ async function parties(ep: Ep, durSec: number): Promise<{ attackers: Party[]; vi
     instant(episodeSum('xs_target_packets_total', 'dst', w), w.at, 60000),
     instant(episodeSum('xs_target_bytes_total', 'dst', w), w.at, 60000),
   ])
+  await geoInit() // warm the geo readers (no-op/false if the DBs aren't installed)
   const list = (pk: Vec, by: Vec, key: string, withScope: boolean): Party[] => {
     const bytes = toMap(by, key)
     return [...toMap(pk, key).entries()]
@@ -178,16 +181,25 @@ async function parties(ep: Ep, durSec: number): Promise<{ attackers: Party[]; vi
       .map(([ip, n]) => {
         const packets = Math.round(n * k)
         const b = Math.round((bytes.get(ip) ?? 0) * k)
-        return { ip, ...(withScope ? { scope: scopeOf(ip) } : {}), packets, bytes: b, pps: Math.round(packets / durSec), bps: (b * 8) / durSec }
+        const base: Party = { ip, ...(withScope ? { scope: scopeOf(ip) } : {}), packets, bytes: b, pps: Math.round(packets / durSec), bps: (b * 8) / durSec }
+        return withScope ? withGeo(base) : base // enrich attacker sources; the few victims are our own hosts
       })
       .sort((x, y) => y.packets - x.packets)
   }
-  return { attackers: list(ap, ab, 'src', true), victims: list(vp, vb, 'dst', false), sample: k }
+  const attackers = list(ap, ab, 'src', true)
+  return { attackers, victims: list(vp, vb, 'dst', false), sample: k, sourceGeo: geoReady() ? summariseSources(attackers) : undefined }
 }
 const vlanName = (ifc: string) => (ifc === 'vlan10' ? 'VLAN10 · wan' : ifc === 'vlan20' ? 'VLAN20 · lan' : ifc)
 
-// RFC1918 → lan, else wan (best-effort from the address alone).
+// RFC1918 (v4) / ULA + link-local (v6) → lan, else wan (from the address alone).
 function scopeOf(ip: string): string {
+  if (ip.includes(':')) {
+    const h = ip.toLowerCase()
+    if (h.startsWith('fe8') || h.startsWith('fe9') || h.startsWith('fea') || h.startsWith('feb')) return 'lan' // fe80::/10 link-local
+    if (/^f[cd]/.test(h)) return 'lan' // fc00::/7 unique local
+    if (h === '::1') return 'lan'
+    return 'wan'
+  }
   const o = ip.split('.').map(Number)
   if (o.length !== 4 || o.some((n) => Number.isNaN(n))) return ''
   if (o[0] === 10) return 'lan'
@@ -205,6 +217,8 @@ const VECTORS: [string, string][] = [
   ['Fragment flood', 'xs_fragment_packets_total'],
   ['Anomalous/bad-flags', 'xs_anomaly_packets_total'],
   ['Malformed', 'xs_parse_outcome_packets_total{class="malformed"}'],
+  // non-IP: an L2 loop / broadcast storm (the 10 Nov episode read as 'UDP reflection')
+  ['ARP storm', 'xs_l3_packets_total{proto="arp"}'],
 ]
 
 
@@ -344,6 +358,9 @@ async function analyse(ep: Ep): Promise<Built> {
   const vectors = vecVals.filter((x) => x.v > vmax * 0.05 && x.v > 100).sort((a, b) => b.v - a.v).map((x) => x.name)
 
   const attackers = who.attackers.slice(0, 25)
+  // Top source countries / networks, rolled up over EVERY attacker (not just the
+  // 25 listed), so a spoofed flood's geography still reads right.
+  const sourceGeo = who.sourceGeo
 
   // ---- target: where the attack was aimed ----
   const rxByIface = new Map<string, number>()
@@ -396,6 +413,7 @@ async function analyse(ep: Ep): Promise<Built> {
     target,
     victims,
     sample: who.sample,
+    ...(sourceGeo ? { sourceGeo } : {}),
     v: CACHE_SCHEMA,
   }
   return built
@@ -464,7 +482,7 @@ async function allParties(ep: Ep) {
     const who = await parties(ep, Math.max(1, Number(b.durationSec) || 1))
     p = { ...who, complete: true }
   } else {
-    p = { attackers: b.attackers, victims: b.victims, sample: (b.sample as number) ?? 1, complete: false }
+    p = { attackers: b.attackers, victims: b.victims, sample: (b.sample as number) ?? 1, sourceGeo: b.sourceGeo, complete: false }
   }
   PARTIES.set(k, { at: Date.now(), p })
   if (PARTIES.size > 20) PARTIES.delete(PARTIES.keys().next().value as string)

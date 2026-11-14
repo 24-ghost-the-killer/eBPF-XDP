@@ -142,6 +142,8 @@ pub struct WindowInput {
     /// TCP packets matching no tracked conntrack flow (ACK/RST-flood signal).
     /// Raw — not a model feature, so it doesn't change the schema hash.
     pub ct_untracked: u64,
+    /// ARP frames (L2-storm signal). Raw — not a model feature.
+    pub arp: u64,
     pub frag: u64,
     pub other_l4: u64,
     pub malformed: u64,

@@ -38,6 +38,7 @@ pub enum AttackType {
     Icmpv6Flood,
     Ipv6ExtFlood,
     Ipv6FragFlood,
+    ArpStorm,
 }
 
 impl AttackType {
@@ -58,6 +59,7 @@ impl AttackType {
             AttackType::Icmpv6Flood => "icmpv6_flood",
             AttackType::Ipv6ExtFlood => "ipv6_ext_flood",
             AttackType::Ipv6FragFlood => "ipv6_frag_flood",
+            AttackType::ArpStorm => "arp_storm",
         }
     }
 }
@@ -82,6 +84,56 @@ pub fn is_benign_bulk_transfer(wi: &crate::features::WindowInput) -> bool {
         && mean_size > 700.0 // large data packets (flag floods are ~40–64 B)
         && untracked < 0.3   // established / tracked (floods are untracked)
         && drop_ratio < 0.02 // nothing being dropped
+}
+
+/// The ACK half of a legitimate transfer. A host downloading over the bridge
+/// sends one small (~66 B) pure ACK per one or two data segments, so on the
+/// interface facing it the window is TCP, nearly all ACK, tiny packets -- the
+/// exact shape of an ACK flood, and `is_benign_bulk_transfer` cannot see it
+/// because the large data packets ride the OTHER interface. What separates it
+/// from a flood: every ACK belongs to a tracked connection (a spoofed ACK flood
+/// matches no flow), there are no handshakes/resets/bad flags, and nothing is
+/// being dropped. This alone is necessary, not sufficient: the agent also
+/// requires the peer interface to be carrying the matching bulk data
+/// ([`peer_bulk_explains`]) before treating the stream as benign.
+pub fn is_tracked_ack_stream(wi: &crate::features::WindowInput) -> bool {
+    if wi.packets == 0 || wi.tcp_total == 0 {
+        return false;
+    }
+    let tcp = wi.tcp_total as f64;
+    let share_tcp = tcp / wi.packets as f64;
+    let ack_share = wi.tcp_ack as f64 / tcp;
+    let control = (wi.tcp_syn + wi.tcp_synack + wi.tcp_rst + wi.tcp_bad_flags) as f64 / tcp;
+    let untracked = wi.ct_untracked as f64 / tcp;
+    let drop_ratio = wi.dropped as f64 / wi.packets as f64;
+    share_tcp > 0.8          // TCP-dominant
+        && ack_share > 0.8   // pure ACKs
+        && control < 0.02    // no handshake / reset / impossible-flag storm
+        && untracked < 0.01  // every ACK matches a live connection
+        && drop_ratio < 0.02 // nothing being dropped
+}
+
+/// Whether a bulk transfer seen on the peer interface accounts for an ACK
+/// stream of `ack_pps`. TCP acknowledges every 1-2 data segments, so the data
+/// side runs at roughly 1-2x the ACK rate (observed: exactly ~2x on this
+/// bridge). Allow down to 0.5x for NIC receive offload merging data frames.
+/// An ACK stream far larger than the data it could be acknowledging is not
+/// explained by it.
+pub fn peer_bulk_explains(ack_pps: f64, peer_data_pps: f64) -> bool {
+    ack_pps.is_finite() && peer_data_pps.is_finite() && ack_pps > 0.0 && peer_data_pps >= 0.5 * ack_pps
+}
+
+/// L2 storm classification from raw counts (outside the model vector). An ARP
+/// storm (switching loop, broken host) is non-IP, so the IP rules misname it
+/// from the sliver of IP traffic left in the window -- it was labelled
+/// udp_reflection, which armed DROP_UDP_STRICT and cut ALL UDP (DNS included)
+/// while the real problem was ARP. Naming it lets the agent skip IP drops; the
+/// dataplane's always-on ARP cap is what actually sheds it.
+pub fn classify_l2(wi: &crate::features::WindowInput) -> Option<AttackType> {
+    if wi.packets > 0 && (wi.arp as f64) > 0.5 * wi.packets as f64 {
+        return Some(AttackType::ArpStorm);
+    }
+    None
 }
 
 /// IPv6-specific classification from raw counts, kept OUT of the model feature
@@ -581,6 +633,48 @@ mod tests {
             tcp_total: 200_000, tcp_syn: 195_000, sub_counts: [20000; 10], ..Default::default()
         };
         assert!(!is_benign_bulk_transfer(&syn));
+    }
+
+    #[test]
+    fn download_ack_half_is_benign_only_with_peer_data() {
+        // Real 12 Nov 07:09 window on vlan20: ~2600 pure ACKs/s, 66 B, all
+        // tracked, no drops, while vlan10 carried ~5200 data pkts/s.
+        let acks = WindowInput {
+            dt_s: 1.0, packets: 2_600, bytes: 2_600 * 66,
+            tcp_total: 2_595, tcp_ack: 2_590, tcp_fin: 1, udp: 5,
+            ct_untracked: 0, dropped: 0, sub_counts: [260; 10], ..Default::default()
+        };
+        assert!(is_tracked_ack_stream(&acks));
+        assert!(!is_benign_bulk_transfer(&acks), "the old rule misses the ACK half");
+        assert!(peer_bulk_explains(2_600.0, 5_200.0));
+        assert!(!peer_bulk_explains(2_600.0, 0.0), "no peer data -> not explained");
+        assert!(!peer_bulk_explains(200_000.0, 5_200.0), "a flood dwarfs the transfer");
+
+        // A spoofed ACK flood: untracked -> never a benign ACK stream.
+        let flood = WindowInput {
+            dt_s: 1.0, packets: 200_000, bytes: 200_000 * 54,
+            tcp_total: 200_000, tcp_ack: 199_900, ct_untracked: 199_000,
+            sub_counts: [20_000; 10], ..Default::default()
+        };
+        assert!(!is_tracked_ack_stream(&flood));
+        // Tracked but being dropped (mitigation biting) -> not benign.
+        let biting = WindowInput { dropped: 20_000, ct_untracked: 0, ..flood };
+        assert!(!is_tracked_ack_stream(&biting));
+        // RST storm on tracked flows -> not a plain ACK stream.
+        let rst = WindowInput { tcp_ack: 1_000, tcp_rst: 1_500, ..acks };
+        assert!(!is_tracked_ack_stream(&rst));
+    }
+
+    #[test]
+    fn arp_storm_is_named() {
+        // Real 10 Nov 12:35 window: ~137k ARP/s, ~40 IP pkts/s.
+        let storm = WindowInput {
+            dt_s: 1.0, packets: 137_050, bytes: 137_050 * 60, arp: 137_012,
+            tcp_total: 21, udp: 10, sub_counts: [13_705; 10], ..Default::default()
+        };
+        assert_eq!(classify_l2(&storm), Some(AttackType::ArpStorm));
+        let normal = WindowInput { packets: 400, arp: 3, tcp_total: 300, ..Default::default() };
+        assert_eq!(classify_l2(&normal), None);
     }
 
     #[test]

@@ -1,7 +1,13 @@
 // Attack episodes as reconstructed server-side by /api/attacks (15-day
 // Prometheus retention; the route caches per 5-minute bucket).
 
-export interface Attacker { ip: string; scope: string; bytes: number; packets: number; pps: number; bps: number }
+// Geo/ASN enrichment (present only when the offline DB-IP databases are installed).
+export interface Geo { cc?: string; country?: string; asn?: number; org?: string }
+// Top source countries / networks of an attack, weighted by dropped packets.
+export interface GeoCount { key: string; label: string; packets: number; sources: number; cc?: string; asn?: number }
+export interface SourceGeo { countries: GeoCount[]; asns: GeoCount[]; located: number; unlocated: number }
+
+export interface Attacker extends Geo { ip: string; scope: string; bytes: number; packets: number; pps: number; bps: number }
 export interface Episode {
   id: number
   start: number // ms
@@ -24,13 +30,15 @@ export interface Episode {
   uniqueTargets?: number
   // 16 = per-address counts are scaled up from the dataplane's 1-in-16 sample
   sample?: number
+  // top source countries / networks (only when the geo DB is installed)
+  sourceGeo?: SourceGeo
   // breakdown version; < 3 = an older, less accurate source/target calculation
   v?: number
 }
 
 // One source or target of an attack, with its share of the dropped traffic.
-export interface Party { ip: string; scope?: string; packets: number; bytes: number; pps?: number; bps?: number }
-export interface Parties { attackers: Party[]; victims: Party[]; sample: number; complete: boolean }
+export interface Party extends Geo { ip: string; scope?: string; packets: number; bytes: number; pps?: number; bps?: number }
+export interface Parties { attackers: Party[]; victims: Party[]; sample: number; sourceGeo?: SourceGeo; complete: boolean }
 // Every source and target of one attack (the list only carries the top 25).
 export async function fetchParties(id: number): Promise<Parties> {
   const r = await fetch(`/api/attacks?id=${encodeURIComponent(String(id))}&parties=1`, { cache: 'no-store' })

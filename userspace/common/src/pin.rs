@@ -33,6 +33,10 @@ pub const MAP_RL_V6: &str = "xs_rl_v6";
 pub const MAP_VICTIM_V4: &str = "xs_victim_v4";
 /// Per-source attacker accounting (dropped attack packets by src IPv4).
 pub const MAP_ATTACKER_V4: &str = "xs_attacker_v4";
+/// Per-destination victim accounting, IPv6 (keyed by the full /128 dst).
+pub const MAP_VICTIM_V6: &str = "xs_victim_v6";
+/// Per-source attacker accounting, IPv6 (keyed by the src /64 prefix).
+pub const MAP_ATTACKER_V6: &str = "xs_attacker_v6";
 /// Service allowlist: destinations under default-deny.
 pub const MAP_PROTECTED_V4: &str = "xs_protected_v4";
 /// Service allowlist: permitted {dst,proto,dport} services on protected dsts.

@@ -28,8 +28,8 @@ use xs_common::iforest::Forest;
 use xs_common::risk::{Evidence, RiskEngine};
 use xs_common::metrics::prometheus;
 use xs_common::pin::{
-    PinLayout, MAP_ATTACKER_V4, MAP_CONFIG, MAP_POLICY_V4, MAP_POLICY_V6, MAP_PROTECTED_V4,
-    MAP_SERVICE_V4, MAP_STATS, MAP_VICTIM_V4, PROG_NAME,
+    PinLayout, MAP_ATTACKER_V4, MAP_ATTACKER_V6, MAP_CONFIG, MAP_POLICY_V4, MAP_POLICY_V6,
+    MAP_PROTECTED_V4, MAP_SERVICE_V4, MAP_STATS, MAP_VICTIM_V4, MAP_VICTIM_V6, PROG_NAME,
 };
 use xs_common::{Config as DpConfig, ConfigFlags, Snapshot};
 
@@ -321,22 +321,24 @@ fn all_metrics(cfg: &Config, analyses: &[(String, Arc<Mutex<Analysis>>)]) -> Str
 /// `label` (dst for victims, src for attackers). The dataplane credits these
 /// maps only on a drop, so when nothing is being mitigated they're empty and
 /// no series is emitted (idle = silent). Cardinality is bounded to the top N.
-fn render_drop_ips(iface: &str, layout: &PinLayout, map_name: &str, metric: &str, label: &str, count_metric: &str) -> String {
-    // Export every source/dest the LRU map holds (its max_entries is the ceiling:
-    // 8192 for attackers, 4096 for victims), so the dashboard can list ALL
-    // attributable sources, not just the top few. For a distributed botnet this
-    // surfaces every member; for a fully source-spoofed flood the map churns many
-    // 1-packet sources (none dominant), which the UI already summarises instead of
-    // listing. `xs_<count_metric>` still reports the true distinct total.
-    const TOP_N: usize = 8192;
+/// Read one drop-accounting LRU map's rows as (ip-string, packets, bytes).
+/// Handles both the IPv4 map (4-byte key -> dotted quad) and the IPv6 map
+/// (16-byte key -> IPv6 text; the attacker map stores a /64, i.e. the low 64
+/// bits are already zero, so it formats as the prefix address).
+fn collect_drop_rows(layout: &PinLayout, map_name: &str, out: &mut Vec<(String, u64, u64)>) {
     let Ok(map) = MapHandle::from_pinned_path(layout.map(map_name)) else {
-        return String::new();
+        return;
     };
-    let mut rows: Vec<([u8; 4], u64, u64)> = Vec::new();
     for key in map.keys() {
-        if key.len() != 4 {
-            continue;
-        }
+        let ip = match key.len() {
+            4 => std::net::Ipv4Addr::new(key[0], key[1], key[2], key[3]).to_string(),
+            16 => {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&key);
+                std::net::Ipv6Addr::from(o).to_string()
+            }
+            _ => continue,
+        };
         let Ok(Some(val)) = map.lookup(&key, MapFlags::ANY) else {
             continue;
         };
@@ -348,44 +350,53 @@ fn render_drop_ips(iface: &str, layout: &PinLayout, map_name: &str, metric: &str
         if pkts == 0 {
             continue;
         }
-        rows.push(([key[0], key[1], key[2], key[3]], pkts, bytes));
+        out.push((ip, pkts, bytes));
+    }
+}
+
+/// Export the drop-accounting for one role (victim/attacker) across its IPv4 and
+/// IPv6 maps as a single `<metric>_packets_total` / `_bytes_total` block labelled
+/// by `label` (IPv4 and IPv6 addresses share the metric, so HELP/TYPE is emitted
+/// exactly once — a duplicate TYPE line would make Prometheus reject the scrape).
+fn render_drop_ips(iface: &str, layout: &PinLayout, maps: &[&str], metric: &str, label: &str, count_metric: &str) -> String {
+    // Export every source/dest the maps hold (up to their LRU caps: 8192
+    // attackers + 8192 v6, 4096 victims + 4096 v6), so the dashboard can list ALL
+    // attributable addresses. A fully spoofed flood churns many 1-packet entries
+    // (none dominant), which the UI summarises instead of listing; `count_metric`
+    // still reports the true distinct total.
+    const TOP_N: usize = 16384;
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
+    for m in maps {
+        collect_drop_rows(layout, m, &mut rows);
     }
     if rows.is_empty() {
         return String::new();
     }
-    // Total distinct addresses (up to the map's LRU cap) — the spoofed-vs-targeted
-    // signal. A spoofed flood fills this into the thousands; a targeted one is few.
     let total_distinct = rows.len();
     rows.sort_by(|a, b| b.1.cmp(&a.1));
     rows.truncate(TOP_N);
 
     let mut s = String::new();
-    s.push_str(&format!("# HELP {count_metric} Distinct addresses seen in the drop-accounting map (up to its LRU cap).\n"));
+    s.push_str(&format!("# HELP {count_metric} Distinct addresses seen in the drop-accounting maps (up to their LRU caps).\n"));
     s.push_str(&format!("# TYPE {count_metric} gauge\n"));
     s.push_str(&format!("{count_metric}{{iface=\"{iface}\"}} {total_distinct}\n"));
     s.push_str(&format!("# HELP {metric}_packets_total Dropped attack packets per {label} since attach.\n"));
     s.push_str(&format!("# TYPE {metric}_packets_total counter\n"));
     for (ip, pkts, _) in &rows {
-        s.push_str(&format!(
-            "{metric}_packets_total{{iface=\"{iface}\",{label}=\"{}.{}.{}.{}\"}} {pkts}\n",
-            ip[0], ip[1], ip[2], ip[3]
-        ));
+        s.push_str(&format!("{metric}_packets_total{{iface=\"{iface}\",{label}=\"{ip}\"}} {pkts}\n"));
     }
     s.push_str(&format!("# HELP {metric}_bytes_total Dropped attack bytes per {label} since attach.\n"));
     s.push_str(&format!("# TYPE {metric}_bytes_total counter\n"));
     for (ip, _, bytes) in &rows {
-        s.push_str(&format!(
-            "{metric}_bytes_total{{iface=\"{iface}\",{label}=\"{}.{}.{}.{}\"}} {bytes}\n",
-            ip[0], ip[1], ip[2], ip[3]
-        ));
+        s.push_str(&format!("{metric}_bytes_total{{iface=\"{iface}\",{label}=\"{ip}\"}} {bytes}\n"));
     }
     s
 }
 
-/// Victim (dst) and attacker (src) drop-accounting for an interface.
+/// Victim (dst) and attacker (src) drop-accounting for an interface (IPv4+IPv6).
 fn render_victims(iface: &str, layout: &PinLayout) -> String {
-    let mut s = render_drop_ips(iface, layout, MAP_VICTIM_V4, "xs_target", "dst", "xs_target_hosts");
-    s.push_str(&render_drop_ips(iface, layout, MAP_ATTACKER_V4, "xs_attacker", "src", "xs_attacker_sources"));
+    let mut s = render_drop_ips(iface, layout, &[MAP_VICTIM_V4, MAP_VICTIM_V6], "xs_target", "dst", "xs_target_hosts");
+    s.push_str(&render_drop_ips(iface, layout, &[MAP_ATTACKER_V4, MAP_ATTACKER_V6], "xs_attacker", "src", "xs_attacker_sources"));
     s
 }
 
@@ -678,6 +689,36 @@ fn read_flags(layout: &PinLayout) -> ConfigFlags {
 
 // ---- Phase 6-13 analysis loop: features -> detector/models/risk -> gauges ----
 
+/// Bulk transfers currently seen per interface: (iface, when, data pps). Each
+/// interface's analyzer runs in its own thread, but on the inline bridge one
+/// download shows up on BOTH sides: large data packets on the side facing the
+/// server, and the downloader's small ACKs on the side facing the client. The
+/// ACK side alone looks like an ACK flood (it was flagged as one, risk 5, a
+/// dozen times in two days), so an analyzer consults what its peers saw.
+static PEER_BULK: Mutex<Vec<(String, Instant, f64)>> = Mutex::new(Vec::new());
+
+/// How recent a peer's bulk-transfer window must be to explain an ACK stream
+/// (analyzer threads tick every ~1 s, unsynchronised).
+const PEER_BULK_MAX_AGE: Duration = Duration::from_secs(3);
+
+/// Record (or clear, with `None`) this interface's bulk-transfer data rate.
+fn note_bulk(iface: &str, data_pps: Option<f64>) {
+    let Ok(mut v) = PEER_BULK.lock() else { return };
+    v.retain(|(i, _, _)| i != iface);
+    if let Some(pps) = data_pps {
+        v.push((iface.to_string(), Instant::now(), pps));
+    }
+}
+
+/// Highest fresh bulk-transfer data rate on any OTHER interface (0 if none).
+fn peer_bulk_pps(iface: &str) -> f64 {
+    let Ok(v) = PEER_BULK.lock() else { return 0.0 };
+    v.iter()
+        .filter(|(i, t, _)| i != iface && t.elapsed() <= PEER_BULK_MAX_AGE)
+        .map(|(_, _, p)| *p)
+        .fold(0.0, f64::max)
+}
+
 /// Build the feature-window input from a counter delta over `dt` seconds.
 fn window_input(delta: &Snapshot, dt: f64, prev_pps: f64) -> WindowInput {
     let cv = |n: &str| cval(delta, n);
@@ -707,6 +748,7 @@ fn window_input(delta: &Snapshot, dt: f64, prev_pps: f64) -> WindowInput {
         ipv6,
         ipv6_ext,
         ct_untracked: cv("ct_untracked"),
+        arp: cv("l3_arp"),
         frag: cv("frag_first") + cv("frag_later"),
         other_l4: cv("l4_other"),
         malformed: sum_prefix(delta, "parse_err_"),
@@ -1126,6 +1168,10 @@ impl Analyzer {
                     // Generic IPv6 volumetric flood: no safe per-vector drop, rely on
                     // the per-source + aggregate rate limiters below.
                     "ipv6_flood" => 0,
+                    // ARP storm: non-IP, so no IP drop helps and any would only
+                    // hurt real traffic. The dataplane's always-on ARP cap
+                    // (xs_arp_rl) sheds it.
+                    "arp_storm" => 0,
                     // ACK/RST floods: the correct, safe tool is conntrack's
                     // drop_untracked (drops ACKs with no established flow). It is
                     // NOT drop_ack, which would kill every live connection.
@@ -1270,6 +1316,12 @@ impl Analyzer {
                 dtype = name.to_string();
             }
         }
+        // L2 storm: ARP-dominant windows are named as such, overriding whatever
+        // the IP rules guessed from the sliver of IP traffic left in the window
+        // (an ARP storm read as udp_reflection, which cut all UDP incl. DNS).
+        if let Some(t) = xs_common::detect::classify_l2(&wi) {
+            dtype = t.as_str().to_string();
+        }
         if let Some(clf) = &self.classifier {
             let probs = clf.predict_proba(&vec);
             for (c, p) in clf.classes().iter().zip(&probs) {
@@ -1307,7 +1359,16 @@ impl Analyzer {
         // like a flood but is TCP-dominant, conntrack-tracked, large-packet, and
         // not dropping -- no flood looks like that. Suppress the attack state for
         // it so curl/wget downloads are not mistaken for an attack and throttled.
-        let benign_bulk = xs_common::detect::is_benign_bulk_transfer(&wi);
+        let data_bulk = xs_common::detect::is_benign_bulk_transfer(&wi);
+        note_bulk(iface, data_bulk.then_some(pps));
+        // The other half of the same transfer: the downloader's tracked ACK
+        // stream on this interface, explained by bulk data on the peer one. A
+        // spoofed ACK flood is untracked, and even a tracked one would need a
+        // matching real transfer on the other side, so it is never exempted.
+        let ack_half = !data_bulk
+            && xs_common::detect::is_tracked_ack_stream(&wi)
+            && xs_common::detect::peer_bulk_explains(pps, peer_bulk_pps(iface));
+        let benign_bulk = data_bulk || ack_half;
         let anomalous = det.anomalous && plausible && !benign_bulk;
         if !plausible || benign_bulk {
             ddos = 0.0;

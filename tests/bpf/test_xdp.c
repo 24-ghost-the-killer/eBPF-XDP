@@ -151,6 +151,57 @@ static void run_corpus(int prog_fd, int stats_fd, int cfg_fd, int strict)
 	       strict ? "strict" : "default", XS_N_CASES - skipped, skipped);
 }
 
+/*
+ * ARP storm cap: replay one ARP frame back-to-back (a storm compressed into a
+ * few ms). The always-on cap must pass the burst allowance (~500) and drop the
+ * rest, attributing every drop to ARP_RATE_LIMITED. Runs LAST: it drains the
+ * shared ARP budget, which would make the corpus's own ARP cases drop.
+ */
+static void run_arp_storm(int prog_fd, int stats_fd, int cfg_fd)
+{
+	const __u32 n = 5000;
+	struct totals before, after;
+	struct pb b;
+	int err;
+
+	if (set_flags(cfg_fd, 0)) {
+		perror("config update");
+		exit(2);
+	}
+	pb_init(&b);
+	pb_eth(&b, XS_ETH_P_ARP);
+	pb_payload(&b, 28);
+	if (read_totals(stats_fd, &before))
+		exit(2);
+	LIBBPF_OPTS(bpf_test_run_opts, opts,
+		.data_in = b.buf,
+		.data_size_in = b.len,
+		.repeat = n,
+	);
+	err = bpf_prog_test_run_opts(prog_fd, &opts);
+	if (err) {
+		fprintf(stderr, "FAIL arp_storm test_run: %s\n", strerror(-err));
+		failures++;
+		return;
+	}
+	if (read_totals(stats_fd, &after))
+		exit(2);
+
+	__u64 rl = after.c[XS_CNT_ARP_RATE_LIMITED].packets - before.c[XS_CNT_ARP_RATE_LIMITED].packets;
+	__u64 drop = after.c[XS_CNT_VERDICT_DROP].packets - before.c[XS_CNT_VERDICT_DROP].packets;
+	__u64 pass = after.c[XS_CNT_VERDICT_PASS].packets - before.c[XS_CNT_VERDICT_PASS].packets;
+
+	/* burst 500 (+1 for the conforming first slot, + a few for elapsed time) */
+	if (rl != drop || pass < 400 || pass > 1000 || drop + pass != n) {
+		fprintf(stderr, "FAIL arp_storm: %u frames -> pass %llu drop %llu arp_rl %llu\n", n,
+			(unsigned long long)pass, (unsigned long long)drop, (unsigned long long)rl);
+		failures++;
+	} else {
+		printf("arp storm: %u frames -> %llu passed (burst), %llu capped\n", n,
+		       (unsigned long long)pass, (unsigned long long)drop);
+	}
+}
+
 static void check_invariants(int stats_fd)
 {
 	struct totals t;
@@ -213,6 +264,7 @@ int main(int argc, char **argv)
 
 	run_corpus(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg), 0);
 	run_corpus(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg), 1);
+	run_arp_storm(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg));
 	check_invariants(bpf_map__fd(stats));
 
 	bpf_object__close(obj);

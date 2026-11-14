@@ -139,6 +139,26 @@ static __always_inline int xs_global_rl_drop(const struct xs_rl_params *grl, __u
 }
 
 /*
+ * Always-on ARP storm cap. Normal ARP is a handful of frames per second (even
+ * a full /24 ARP sweep is a few hundred); an L2 loop or broadcast storm is
+ * 10^5/s and, being non-IP, slips past every IP mitigation. Cap ARP per
+ * interface at XS_ARP_RL_PPS with a generous burst so resolution and sweeps
+ * are never touched, while a storm is cut by ~99%. Returns 1 to drop.
+ */
+#define XS_ARP_RL_PPS   2000u
+#define XS_ARP_RL_BURST 500u
+static __always_inline int xs_arp_rl_drop(__u64 now)
+{
+	const __u32 z = 0;
+	__u64 *tat = bpf_map_lookup_elem(&xs_arp_rl, &z);
+	const __u32 interval = 1000000000u / XS_ARP_RL_PPS;
+
+	if (!tat)
+		return 0;
+	return !xs_gcra(tat, interval, (__u64)interval * XS_ARP_RL_BURST, now);
+}
+
+/*
  * Service allowlist (positive security model). On a destination listed in
  * xs_protected_v4, only the {proto,dport} services present in xs_service_v4 are
  * permitted; anything else returns 1 (deny). A destination that is NOT protected
@@ -275,8 +295,12 @@ int xs_xdp_main(struct xdp_md *ctx)
 	 * the deterministic validity checks.
 	 */
 	int decision = XS_POL_CONTINUE;
+	/* ARP storm cap (always on, see xs_arp_rl_drop). Decided first: ARP never
+	 * reaches the IP-only stages below, so this is its only guard. */
+	int arp_drop = rc == XS_PARSE_NOT_IP && pkt.eth_proto == bpf_htons(XS_ETH_P_ARP) &&
+		       xs_arp_rl_drop(now);
 
-	if (flags & (XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT))
+	if (!arp_drop && (flags & (XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT)))
 		decision = xs_policy_stage(st, &pkt, flags, &rl, now, len,
 					   (flags & XS_CFG_CHECK_ALLOW) ? xs_upstream_router(data, data_end) : NULL);
 
@@ -285,7 +309,10 @@ int xs_xdp_main(struct xdp_md *ctx)
 	 * off by those blunt, under-attack mitigations. */
 	int exempt = (decision == XS_POL_EXEMPT);
 
-	if (decision == XS_POL_PASS)
+	if (arp_drop) {
+		xs_count(st, XS_CNT_ARP_RATE_LIMITED, len);
+		verdict = XDP_DROP;
+	} else if (decision == XS_POL_PASS)
 		verdict = XDP_PASS;
 	else if (decision == XS_POL_DROP)
 		verdict = XDP_DROP;
@@ -367,28 +394,57 @@ int xs_xdp_main(struct xdp_md *ctx)
 	 * statistical and unaffected by 16x downsampling. (The VERDICT_DROP counter
 	 * was just incremented, so its low nibble cycles 0..15 across drops.)
 	 */
-	if (verdict == XDP_DROP && pkt.l3 == XS_L3_IPV4 &&
-	    (st->c[XS_CNT_VERDICT_DROP].packets & 0xF) == 0) {
-		__be32 dkey = pkt.daddr.v4;
-		struct xs_victim *v = bpf_map_lookup_elem(&xs_victim_v4, &dkey);
-		__be32 skey = pkt.saddr.v4;
-		struct xs_victim *a = bpf_map_lookup_elem(&xs_attacker_v4, &skey);
+	if (verdict == XDP_DROP && (st->c[XS_CNT_VERDICT_DROP].packets & 0xF) == 0) {
+		if (pkt.l3 == XS_L3_IPV4) {
+			__be32 dkey = pkt.daddr.v4;
+			struct xs_victim *v = bpf_map_lookup_elem(&xs_victim_v4, &dkey);
+			__be32 skey = pkt.saddr.v4;
+			struct xs_victim *a = bpf_map_lookup_elem(&xs_attacker_v4, &skey);
 
-		if (v) {
-			__sync_fetch_and_add(&v->packets, 1);
-			__sync_fetch_and_add(&v->bytes, len);
-		} else {
-			struct xs_victim nv = { .packets = 1, .bytes = len };
+			if (v) {
+				__sync_fetch_and_add(&v->packets, 1);
+				__sync_fetch_and_add(&v->bytes, len);
+			} else {
+				struct xs_victim nv = { .packets = 1, .bytes = len };
 
-			bpf_map_update_elem(&xs_victim_v4, &dkey, &nv, BPF_ANY);
-		}
-		if (a) {
-			__sync_fetch_and_add(&a->packets, 1);
-			__sync_fetch_and_add(&a->bytes, len);
-		} else {
-			struct xs_victim na = { .packets = 1, .bytes = len };
+				bpf_map_update_elem(&xs_victim_v4, &dkey, &nv, BPF_ANY);
+			}
+			if (a) {
+				__sync_fetch_and_add(&a->packets, 1);
+				__sync_fetch_and_add(&a->bytes, len);
+			} else {
+				struct xs_victim na = { .packets = 1, .bytes = len };
 
-			bpf_map_update_elem(&xs_attacker_v4, &skey, &na, BPF_ANY);
+				bpf_map_update_elem(&xs_attacker_v4, &skey, &na, BPF_ANY);
+			}
+		} else if (pkt.l3 == XS_L3_IPV6) {
+			/* Victim: the full /128 destination. */
+			struct xs_in6 dkey = {};
+			struct xs_in6 skey = {};
+			struct xs_victim *v, *a;
+
+			__builtin_memcpy(dkey.a, &pkt.daddr, 16);
+			/* Attacker: the source /64 (zero the low 64 bits). */
+			__builtin_memcpy(skey.a, &pkt.saddr, 8);
+
+			v = bpf_map_lookup_elem(&xs_victim_v6, &dkey);
+			a = bpf_map_lookup_elem(&xs_attacker_v6, &skey);
+			if (v) {
+				__sync_fetch_and_add(&v->packets, 1);
+				__sync_fetch_and_add(&v->bytes, len);
+			} else {
+				struct xs_victim nv = { .packets = 1, .bytes = len };
+
+				bpf_map_update_elem(&xs_victim_v6, &dkey, &nv, BPF_ANY);
+			}
+			if (a) {
+				__sync_fetch_and_add(&a->packets, 1);
+				__sync_fetch_and_add(&a->bytes, len);
+			} else {
+				struct xs_victim na = { .packets = 1, .bytes = len };
+
+				bpf_map_update_elem(&xs_attacker_v6, &skey, &na, BPF_ANY);
+			}
 		}
 	}
 

@@ -156,6 +156,19 @@ struct {
 } xs_global_rl SEC(".maps");
 
 /*
+ * ARP storm cap: one shared GCRA word for ALL ARP frames on the interface.
+ * ARP is not IP, so every IP mitigation (validity drops, rate limiters,
+ * conntrack) passes it untouched; an L2 loop or a broken host then floods the
+ * bridge with 100k+ ARP/s and nothing caps it. Same shape as xs_global_rl.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);  /* ARP GCRA tat_ns */
+} xs_arp_rl SEC(".maps");
+
+/*
  * Connection tracking table (anti-ACK/RST-flood). Keyed by a 64-bit hash of the
  * ingress 5-tuple; value is the last-seen time. A TCP SYN or SYN-ACK creates an
  * entry; any other TCP packet whose flow is absent is "untracked" (an ACK/RST
@@ -245,6 +258,34 @@ struct {
 	__type(key, __be32);              /* source IPv4, network order */
 	__type(value, struct xs_victim);
 } xs_attacker_v4 SEC(".maps");
+
+/* 16-byte IPv6 address key (network order), for the v6 drop-accounting maps. */
+struct xs_in6 { __u8 a[16]; };
+
+/*
+ * IPv6 per-destination victim accounting: the full /128 destination, so a
+ * protected host is named exactly. Same drop-only, 1-in-16-sampled credit as
+ * the IPv4 map; LRU-bounded.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct xs_in6);
+	__type(value, struct xs_victim);
+} xs_victim_v6 SEC(".maps");
+
+/*
+ * IPv6 per-source attacker accounting, keyed by the source /64 (low 64 bits
+ * zeroed before insert). IPv6 hosts are allocated a /64, and a spoofed flood
+ * churns whole /64s; aggregating there both matches how blocking treats IPv6
+ * (by /64) and stops a single spoofed /64 from filling the map with /128s.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct xs_in6);
+	__type(value, struct xs_victim);
+} xs_attacker_v6 SEC(".maps");
 
 /*
  * Upstream routers on this leg, by source MAC (see struct xs_l2_trust). Filled

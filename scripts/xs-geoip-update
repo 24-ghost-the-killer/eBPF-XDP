@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# xs-geoip-update — fetch the DB-IP Lite country + ASN databases for the
+# dashboard's offline attacker geo/ASN enrichment, and (with --install) set up a
+# systemd timer that refreshes them monthly.
+#
+# No account or key needed. Files land in $DEST (default /usr/share/GeoIP) as
+# dbip-country-lite.mmdb / dbip-asn-lite.mmdb, world-readable so the dashboard
+# (running as test_server) can read them. The dashboard looks there by default
+# (override with DASH_GEOIP_DIR); it works fine with the files absent — geo
+# panels just don't show.
+#
+# Data: IP geolocation by DB-IP (https://db-ip.com), licensed CC BY 4.0. The
+# dashboard shows that attribution wherever it uses the data.
+#
+# Usage:
+#   sudo xs-geoip-update              # download/refresh now
+#   sudo xs-geoip-update --install    # install to /usr/local/sbin + monthly timer, and run once
+#   sudo xs-geoip-update --rollback   # remove the timer (keeps the data)
+set -euo pipefail
+
+DEST="${DASH_GEOIP_DIR:-/usr/share/GeoIP}"
+BASE="https://download.db-ip.com/free"
+SELF=/usr/local/sbin/xs-geoip-update
+ACTION="${1:-}"
+
+msg() { printf '  %s\n' "$*"; }
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+fetch_db() {
+  # $1 = dbip dataset name (country|asn). Tries this month, then last month
+  # (the new month's file can lag a day or two), writing $DEST/dbip-$1-lite.mmdb.
+  local name="$1" out="$DEST/dbip-${1}-lite.mmdb" tmp ym url ok=no
+  tmp="$(mktemp "${out}.XXXXXX.gz")"
+  for ym in "$(date -u +%Y-%m)" "$(date -u -d 'last month' +%Y-%m 2>/dev/null || date -u -v-1m +%Y-%m)"; do
+    url="$BASE/dbip-${name}-lite-${ym}.mmdb.gz"
+    if curl -fsSL --retry 3 --max-time 120 "$url" -o "$tmp" && [ -s "$tmp" ]; then
+      msg "fetched dbip-${name}-lite ${ym}"
+      ok=yes; break
+    fi
+  done
+  [ "$ok" = yes ] || { rm -f "$tmp"; die "could not download the ${name} database (tried this and last month)"; }
+  gunzip -c "$tmp" > "${out}.new" && rm -f "$tmp"
+  # sanity: a real .mmdb carries the "MaxMind.com" metadata marker near its end;
+  # a truncated download or an HTML error page won't, so refuse it.
+  if ! grep -aq 'MaxMind.com' "${out}.new"; then
+    rm -f "${out}.new"; die "downloaded ${name} file is not a valid .mmdb"
+  fi
+  chmod 0644 "${out}.new"
+  mv -f "${out}.new" "$out"          # atomic replace; the dashboard re-opens on mtime change
+  msg "installed $out ($(du -h "$out" | cut -f1))"
+}
+
+case "$ACTION" in
+  --rollback)
+    systemctl disable --now xs-geoip-update.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/xs-geoip-update.service /etc/systemd/system/xs-geoip-update.timer
+    systemctl daemon-reload
+    printf '✓ geoip refresh timer removed (data in %s kept)\n' "$DEST"
+    exit 0 ;;
+  --install|'' |--update) : ;;
+  *) die "unknown option: $ACTION (use --install, --rollback, or no argument)" ;;
+esac
+
+[ "$(id -u)" = 0 ] || die "run as root (sudo)."
+command -v curl >/dev/null || die "needs curl."
+mkdir -p "$DEST"
+fetch_db country
+fetch_db asn
+
+if [ "$ACTION" = --install ]; then
+  install -m 0755 "$0" "$SELF"
+  cat > /etc/systemd/system/xs-geoip-update.service <<EOF
+[Unit]
+Description=Refresh DB-IP geo/ASN databases for the xdp-sentinel dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=DASH_GEOIP_DIR=$DEST
+ExecStart=$SELF --update
+EOF
+  cat > /etc/systemd/system/xs-geoip-update.timer <<'EOF'
+[Unit]
+Description=Monthly refresh of the DB-IP geo/ASN databases
+
+[Timer]
+OnCalendar=*-*-04 04:30:00
+Persistent=true
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xs-geoip-update.timer
+  printf '✓ installed %s and enabled the monthly refresh timer\n' "$SELF"
+  printf '  next run: %s\n' "$(systemctl show -p NextElapseUSecRealtime --value xs-geoip-update.timer 2>/dev/null || echo 'see: systemctl list-timers xs-geoip-update.timer')"
+fi
+printf '✓ geo databases ready in %s — the dashboard picks them up within 5 minutes\n' "$DEST"
