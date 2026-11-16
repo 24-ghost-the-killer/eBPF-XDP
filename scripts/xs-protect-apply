@@ -12,6 +12,14 @@ Management IPs MAY be protected, but a lifeline (SSH + dashboard) is always
 forced open and never removed, so default-deny can never blackhole the
 appliance's own SSH / the dashboard. The live sshd port is detected as a backstop
 on top of XS_PROTECT_LIFELINE.
+
+IPv6: the plan lists IPv4 hosts, but a host with a global IPv6 address was
+reachable on EVERY port over IPv6. Each protected host's global IPv6 addresses
+are therefore protected with the same services: the box's own addresses from
+`ip -6 addr`, other hosts' from the IPv6 neighbour table (same MAC as their
+IPv4 entry). Addresses change (SLAAC, new ISP prefix), so this also runs on a
+15-minute timer; addresses that went away are unprotected again. ICMPv6 always
+passes in the dataplane (IPv6 cannot work without it).
 """
 import json
 import os
@@ -124,6 +132,31 @@ def ctl(*args):
     return True
 
 
+def ipj(*args):
+    try:
+        out = subprocess.run(["ip", "-j", *args], capture_output=True, text=True, timeout=5).stdout
+        return json.loads(out or "[]")
+    except Exception:
+        return []
+
+
+def local_ipv4s():
+    return {a["local"] for l in ipj("-4", "addr", "show") for a in l.get("addr_info", []) if a.get("local")}
+
+
+def ipv6_of(ip):
+    """Global IPv6 addresses of the host with IPv4 `ip` (best effort)."""
+    if ip in local_ipv4s():
+        return sorted({a["local"] for l in ipj("-6", "addr", "show", "scope", "global")
+                       for a in l.get("addr_info", []) if a.get("local") and not a.get("deprecated")})
+    mac = next((n.get("lladdr") for n in ipj("-4", "neigh", "show") if n.get("dst") == ip and n.get("lladdr")), None)
+    if not mac:
+        return []
+    return sorted({n["dst"] for n in ipj("-6", "neigh", "show")
+                   if n.get("lladdr") == mac and not n.get("dst", "").lower().startswith("fe80")
+                   and "FAILED" not in (n.get("state") or [])})
+
+
 def main():
     plan = load_json(PLAN, {"hosts": []})
     lifeline = lifeline_keys()
@@ -165,14 +198,43 @@ def main():
         log(f"unprotecting {ip} on {iface} (removed from plan)")
         ctl("unprotect", "-i", iface, ip)
 
+    # ---- IPv6: the same services on every global IPv6 address of each host ----
+    prev6 = {(h[0], h[1]): set(h[2]) for h in load_json(APPLIED, {}).get("hosts6", [])}
+    desired6 = {}
+    v6_ok = True
+    for (iface, ip), svcs in desired.items():
+        for v6 in ipv6_of(ip):
+            desired6[(iface, v6)] = svcs
+    for (iface, v6), svcs in desired6.items():
+        if not v6_ok:
+            break
+        if not ctl("protect", "-i", iface, v6):
+            log("IPv6 protection unavailable (dataplane without xs_protected_v6?) -- skipping IPv6")
+            v6_ok = False
+            desired6 = {}
+            break
+        before = prev6.get((iface, v6), set())
+        for k in svcs - before:
+            proto, port = k.split("/")
+            ctl("service", "-i", iface, v6, proto, port)
+        for k in before - svcs:
+            proto, port = k.split("/")
+            ctl("service", "-i", iface, v6, proto, port, "--remove")
+    if v6_ok:
+        for (iface, v6) in set(prev6) - set(desired6):
+            log(f"unprotecting {v6} on {iface} (address gone or host removed)")
+            ctl("unprotect", "-i", iface, v6)
+
     try:
         os.makedirs(os.path.dirname(APPLIED), exist_ok=True)
         with open(APPLIED, "w") as f:
-            json.dump({"hosts": [list(k) for k in desired]}, f)
+            json.dump({"hosts": [list(k) for k in desired],
+                       "hosts6": [[i, a, sorted(s)] for (i, a), s in desired6.items()] if v6_ok else
+                                 [[i, a, sorted(s)] for (i, a), s in prev6.items()]}, f)
     except Exception as e:
         log(f"WARNING: could not write {APPLIED}: {e}")
 
-    log(f"reconciled {len(desired)} host(s); lifeline={sorted(lifeline)}")
+    log(f"reconciled {len(desired)} host(s) and {len(desired6)} IPv6 address(es); lifeline={sorted(lifeline)}")
 
 
 if __name__ == "__main__":

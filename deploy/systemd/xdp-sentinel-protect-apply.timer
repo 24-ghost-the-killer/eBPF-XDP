@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply the protection plan every 15 min (IPv6 addresses change: SLAAC, new ISP prefix)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=xdp-sentinel-protect-apply.service
+
+[Install]
+WantedBy=timers.target

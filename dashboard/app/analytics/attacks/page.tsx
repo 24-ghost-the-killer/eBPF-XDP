@@ -8,7 +8,7 @@ import {
 import Link from 'next/link'
 import { rangeAbs, toSeries } from '@/lib/prom'
 import { usePoll } from '@/hooks/usePoll'
-import { fetchAttackPage, fetchAttack, fetchParties, attackHref, vectorsOf, type Episode, type AttackPage, type Party, type Parties } from '@/lib/attacks'
+import { fetchAttackPage, fetchAttack, fetchParties, attackHref, vectorsOf, type Episode, type AttackPage, type Party, type Parties, type GeoCount } from '@/lib/attacks'
 import { pps, bps, duration, si, pretty } from '@/lib/format'
 import { niceStep } from '@/lib/stats'
 import { SERIES, BarList } from '@/components/nd/ui'
@@ -17,6 +17,12 @@ import { Panel, Stat, Badge, Empty, btn, type Tone } from '@/components/aa/kit'
 import { CsvButton } from '@/components/aa/export'
 import { downloadCsv } from '@/lib/csv'
 import { useRange } from '@/components/aa/Shell'
+import { AttackGlobe } from '@/components/globe/AttackGlobe'
+import { LivePanel } from '@/components/globe/LivePanel'
+import { flagOf } from '@/lib/country-centroids'
+import { WhyPanel } from '@/components/attacks/Explain'
+import { Replay } from '@/components/attacks/Replay'
+import { markLabel, type AttackMark } from '@/lib/attacks'
 
 // Attacks: every attack the appliance has recorded — Prometheus' retention plus
 // the permanent archive — paged (20, then 10 per page), filterable and sortable
@@ -32,8 +38,6 @@ const COLS: { key: SortKey; label: string; right?: boolean }[] = [
   { key: 'droppedPackets', label: 'Dropped', right: true },
   { key: 'dropShare', label: 'Blocked', right: true },
 ]
-// ISO-3166 alpha-2 -> flag emoji (two regional-indicator letters).
-const flagOf = (cc?: string) => (cc && /^[A-Za-z]{2}$/.test(cc) ? String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)) : '🏳️')
 const when = (ms: number) => new Date(ms).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 const blockedTone = (x: number): Tone => (x >= 0.9 ? 'good' : x >= 0.5 ? 'warn' : 'bad')
 
@@ -172,8 +176,9 @@ function PartiesDialog({ a, side: initial, onClose }: { a: Episode; side: Side; 
   )
 }
 
-function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentionDays: number; onClose: () => void; onExplore: () => void }) {
+function Drawer({ a, retentionDays, onClose, onExplore, onMarked }: { a: Episode; retentionDays: number; onClose: () => void; onExplore: () => void; onMarked: (m: AttackMark | null) => void }) {
   const [all, setAll] = useState<Side | null>(null)
+  const [geoSel, setGeoSel] = useState<string | null>(null)
   const archivedOnly = Date.now() - a.end > retentionDays * 86_400_000
   const pad = Math.max(120, Math.round(a.durationSec * 0.5))
   const start = Math.floor(a.start / 1000) - pad
@@ -219,6 +224,7 @@ function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentio
               <Badge tone="bad" icon={ShieldAlert}>Attack {new Date(a.start).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}</Badge>
               {archivedOnly && <Badge icon={Archive}>archived</Badge>}
               <Badge tone={blockedTone(a.dropShare)}>{(a.dropShare * 100).toFixed(0)}% blocked</Badge>
+              {a.mark && <Badge>False alarm · {markLabel(a.mark.reason)}</Badge>}
             </div>
             <h2 className="mt-2 text-[20px] font-semibold tracking-[-0.02em] text-nd-fg">{vectorsOf(a).map(pretty).slice(0, 3).join(', ')}</h2>
             <p className="mt-1 text-[13px] text-nd-dim">{when(a.start)} · lasted {duration(a.durationSec)}{a.target ? ` · hit ${a.target.label}` : ''}</p>
@@ -235,12 +241,14 @@ function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentio
             <Stat label="Dropped" icon={Ban} value={si(a.droppedPackets)} sub={`${(a.dropShare * 100).toFixed(1)}% of the flood`} />
             <Stat label="Peak risk" icon={Gauge} value={`L${a.peakRiskLevel}`} sub={`threat state ${a.peakThreatState}`} />
           </div>
+          <WhyPanel a={a} onMarked={onMarked} />
           {archivedOnly && (
             <div className="flex items-start gap-2 rounded-xl border border-nd-line bg-nd-panel px-4 py-3 text-[12.5px] text-nd-dim">
               <Archive className="mt-0.5 h-4 w-4 shrink-0" />
               <span>This attack is older than Prometheus keeps raw data ({retentionDays} days), so the second-by-second charts below are empty. The numbers, sources and targets come from the permanent attack archive.</span>
             </div>
           )}
+          <Replay a={a} archived={archivedOnly} />
           <Panel icon={Network} title="Bandwidth by interface" sub="Episode window ± padding">
             <TimeChart kind="area" stacked loading={!q.data} data={q.data?.bw ?? []} series={(q.data?.bwKeys ?? []).map((k, i) => ({ key: k, label: k, color: SERIES[i % SERIES.length] }))} yfmt={bps} spanMs={spanMs} height={200} />
           </Panel>
@@ -278,9 +286,16 @@ function Drawer({ a, retentionDays, onClose, onExplore }: { a: Episode; retentio
           </div>
           {a.sourceGeo && (a.sourceGeo.countries.length > 0 || a.sourceGeo.asns.length > 0) && (
             <>
+              {a.sourceGeo.countries.length > 0 && (
+                <Panel icon={Globe} title="Where this attack came from" sub="Each source country joined to this box · click one to zoom in">
+                  <AttackGlobe countries={a.sourceGeo.countries} height={320} scope="attack" selected={geoSel} onSelect={setGeoSel} />
+                </Panel>
+              )}
               <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
                 <Panel icon={Globe} title="Top source countries" sub={`${si(a.sourceGeo.located)} of the sources geolocated`}>
-                  <BarList rows={a.sourceGeo.countries.map((c) => ({ label: `${flagOf(c.cc)}  ${c.label}`, sub: `${si(c.sources)} source${c.sources === 1 ? '' : 's'}`, v: c.packets }))} fmt={(n) => si(n)} color={SERIES[1]} empty="No geolocated sources." />
+                  <BarList rows={a.sourceGeo.countries.map((c) => ({ label: `${flagOf(c.cc)}  ${c.label}`, sub: `${si(c.sources)} source${c.sources === 1 ? '' : 's'}`, v: c.packets }))} fmt={(n) => si(n)} color={SERIES[1]} empty="No geolocated sources."
+                    active={a.sourceGeo.countries.findIndex((c) => (c.cc ?? c.key) === geoSel)}
+                    onSelect={(i) => { const k = a.sourceGeo!.countries[i].cc ?? a.sourceGeo!.countries[i].key; setGeoSel((p) => (p === k ? null : k)) }} />
                 </Panel>
                 <Panel icon={Network} title="Top source networks" sub="by autonomous system (ASN)">
                   <BarList rows={a.sourceGeo.asns.map((c) => ({ label: c.label, sub: `AS${c.asn} · ${si(c.sources)} source${c.sources === 1 ? '' : 's'}`, v: c.packets }))} fmt={(n) => si(n)} color={SERIES[4]} empty="No ASN data for these sources." />
@@ -308,6 +323,10 @@ export default function AttacksPage() {
   const rng = useRange()
   const router = useRouter()
   const [vector, setVector] = useState('all')
+  // globe: the country picked on it (or in the list), and the country the history is filtered to
+  const [geoSel, setGeoSel] = useState<string | null>(null)
+  const [country, setCountry] = useState<{ cc: string; label: string } | null>(null)
+  const [marked, setMarked] = useState<'' | 'hide' | 'only'>('')
   const [inWindow, setInWindow] = useState(false)
   const [ipq, setIpq] = useState('')
   const [ipDeb, setIpDeb] = useState('')
@@ -350,13 +369,15 @@ export default function AttacksPage() {
     return {
       vector: vector === 'all' ? undefined : vector,
       ip: ipDeb || undefined,
+      country: country?.cc,
+      marked: marked || undefined,
       from: inWindow ? w.start : undefined,
       to: inWindow ? w.end : undefined,
       sort: sort.key,
       desc: sort.desc,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vector, ipDeb, inWindow, sort, inWindow ? rng.key : ''])
+  }, [vector, ipDeb, country, marked, inWindow, sort, inWindow ? rng.key : ''])
   const qkey = JSON.stringify(query)
   useEffect(() => { gen.current++; inflight.current.clear(); setItems({}); setMeta(null); setPage(1) }, [qkey])
 
@@ -445,7 +466,7 @@ export default function AttacksPage() {
         { key: 'attackers', label: 'top sources', get: (a) => a.attackers.map((x) => x.ip).join(' ') },
         { key: 'victims', label: 'targets', get: (a) => a.victims.map((x) => x.ip).join(' ') },
         { key: 'target', label: 'interface', get: (a) => a.target?.iface ?? '' },
-      ], `${out.length} DDoS attack episode${out.length === 1 ? '' : 's'}${query.vector ? ` (${query.vector})` : ''}${query.ip ? ` matching ${query.ip}` : ''}`, 'attacks')
+      ], `${out.length} DDoS attack episode${out.length === 1 ? '' : 's'}${query.vector ? ` (${query.vector})` : ''}${query.ip ? ` matching ${query.ip}` : ''}${country ? ` from ${country.label}` : ''}`, 'attacks')
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'export failed')
     }
@@ -454,18 +475,44 @@ export default function AttacksPage() {
 
   const firstShown = (page - 1) * PAGE + 1
   const lastShown = (page - 1) * PAGE + rows.length
-  const filtered = !!(query.vector || query.ip || query.sort !== 'start')
+  const filtered = !!(query.vector || query.ip || query.country || query.marked || query.sort !== 'start')
+  // a new or removed false-alarm mark: patch the attack where it is shown (the
+  // totals catch up on the next refresh)
+  const applyMark = (id: number, mark: AttackMark | null) => {
+    const patch = <T extends Episode>(x: T): T => (x.id === id ? { ...x, mark: mark ?? undefined } : x)
+    setItems((cur) => Object.fromEntries(Object.entries(cur).map(([k, v]) => [k, patch(v)])))
+    setDeep((d) => (d ? { ...d, attack: patch(d.attack) } : d))
+  }
+  const showFrom = (c: GeoCount) => {
+    setCountry({ cc: (c.cc ?? c.key).toUpperCase(), label: c.label })
+    document.getElementById('episodes')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
 
   return (
     <div className="space-y-6">
+      <LivePanel />
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <Stat label="Attacks" icon={ShieldAlert} loading={loading} value={s?.count ?? 0}
-          sub={s?.oldest ? `since ${new Date(s.oldest).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}` : 'none recorded'} />
+          sub={s?.falseAlarms ? `${s.falseAlarms} false alarm${s.falseAlarms === 1 ? '' : 's'} not counted` : s?.oldest ? `since ${new Date(s.oldest).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}` : 'none recorded'} />
         <Stat label="Time under attack" icon={Timer} loading={loading} value={duration(s?.totalDurationSec ?? 0)} sub={s?.count ? `median ${duration(s.medianDurationSec)} each` : 'no episodes'} />
         <Stat label="Largest" icon={Maximize2} loading={loading} value={bps(s?.peakBps ?? 0)} sub={`${pps(s?.peakPps ?? 0)} peak`} />
         <Stat label="Packets dropped" icon={Ban} loading={loading} value={si(s?.droppedPackets ?? 0)} sub={s && s.analysed < s.count ? `across ${s.analysed} analysed so far` : 'across all attacks'} />
         <Stat label="Avg blocked" icon={ShieldCheck} loading={loading} value={s?.analysed ? `${(s.avgDropShare * 100).toFixed(1)}%` : '—'} sub="mean share of each flood dropped" />
       </div>
+
+      {s?.countries && (
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-5">
+          <Panel icon={Globe} title="Attack origins" sub={`Source countries of ${s.analysed} analysed attack${s.analysed === 1 ? '' : 's'} · click one to zoom in`} className="lg:col-span-3">
+            <AttackGlobe countries={s.countries} height={460} selected={geoSel} onSelect={setGeoSel} onShowAttacks={showFrom} />
+          </Panel>
+          <Panel icon={Globe} title="Top source countries" sub="Dropped packets · click to show on the globe" className="lg:col-span-2">
+            <BarList rows={s.countries.slice(0, 12).map((c) => ({ label: `${flagOf(c.cc)}  ${c.label}`, sub: `${si(c.sources)} source${c.sources === 1 ? '' : 's'}`, v: c.packets }))} fmt={(n) => si(n)} color={SERIES[1]} empty="No geolocated sources."
+              active={s.countries.slice(0, 12).findIndex((c) => (c.cc ?? c.key).toUpperCase() === geoSel)}
+              onSelect={(i) => { const k = (s.countries![i].cc ?? s.countries![i].key).toUpperCase(); setGeoSel((p) => (p === k ? null : k)) }} />
+            <p className="mt-3 text-[11px] text-nd-faint">IP geolocation by DB-IP (CC BY 4.0) · source addresses can be spoofed</p>
+          </Panel>
+        </div>
+      )}
 
       <div id="episodes" className="scroll-mt-28" />
       <Panel
@@ -476,6 +523,12 @@ export default function AttacksPage() {
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <CsvButton label={exporting ? 'Exporting…' : 'Export CSV'} disabled={exporting || !total} onClick={exportAll} title="Every analysed attack matching the filters — all pages" />
+            {country && (
+              <button type="button" onClick={() => setCountry(null)} title="Show attacks from every country"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-nd-line-strong bg-nd-fill-2 px-2.5 py-1.5 text-[12.5px] font-medium text-nd-fg">
+                <span>{flagOf(country.cc)}</span> From {country.label} <X className="h-3.5 w-3.5 text-nd-dim" />
+              </button>
+            )}
             <div className="relative">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-nd-faint" />
               <input value={ipq} onChange={(e) => setIpq(e.target.value)} placeholder="Filter by IP" aria-label="Filter by IP" className={`${btn.input} mono w-40 py-1.5 pl-8 text-[12.5px]`} />
@@ -483,6 +536,11 @@ export default function AttacksPage() {
             <select value={vector} onChange={(e) => setVector(e.target.value)} aria-label="Attack type" className={`${btn.input} py-1.5 text-[12.5px]`}>
               <option value="all">All attack types</option>
               {(s?.vectors ?? []).map((v) => <option key={v} value={v}>{pretty(v)}</option>)}
+            </select>
+            <select value={marked} onChange={(e) => setMarked(e.target.value as '' | 'hide' | 'only')} aria-label="False alarms" className={`${btn.input} py-1.5 text-[12.5px]`}>
+              <option value="">With false alarms</option>
+              <option value="hide">Real attacks only</option>
+              <option value="only">False alarms only</option>
             </select>
             <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-nd-fg-3">
               <button role="switch" aria-checked={inWindow} onClick={() => setInWindow((x) => !x)} className={`relative h-5 w-9 rounded-full transition-colors ${inWindow ? 'bg-nd-fg' : 'bg-nd-fill-2'}`}>
@@ -521,7 +579,7 @@ export default function AttacksPage() {
               </thead>
               <tbody>
                 {rows.map((a) => (
-                  <tr key={a.id} onClick={() => !a.partial && openAttack(a.id)} className={`group border-b border-nd-line-soft transition-colors last:border-0 ${a.partial ? '' : 'cursor-pointer hover:bg-nd-fill'}`}>
+                  <tr key={a.id} onClick={() => !a.partial && openAttack(a.id)} className={`group border-b border-nd-line-soft transition-colors last:border-0 ${a.partial ? '' : 'cursor-pointer hover:bg-nd-fill'} ${a.mark ? 'opacity-60' : ''}`}>
                     <td className="py-3 pl-5 pr-4">
                       <div className="font-medium text-nd-fg">{when(a.start)}</div>
                       <div className="text-[11.5px] text-nd-dim">{a.partial ? 'being analysed…' : a.target?.label ?? 'target unknown'}</div>
@@ -533,6 +591,7 @@ export default function AttacksPage() {
                     <td className="px-4 py-3 text-right">{a.partial ? <Badge>…</Badge> : <Badge tone={blockedTone(a.dropShare)}>{(a.dropShare * 100).toFixed(0)}%</Badge>}</td>
                     <td className="px-4 py-3">
                       <div className="flex max-w-[300px] flex-wrap gap-1">
+                        {a.mark && <Badge tone="brand">False alarm</Badge>}
                         {a.partial ? <Badge>retrying</Badge> : vectorsOf(a).slice(0, 3).map((v) => <Badge key={v}>{pretty(v)}</Badge>)}
                         {!a.partial && vectorsOf(a).length > 3 && <Badge>+{vectorsOf(a).length - 3}</Badge>}
                       </div>
@@ -551,6 +610,7 @@ export default function AttacksPage() {
           a={sel}
           retentionDays={cur?.retentionDays ?? deep?.retentionDays ?? 15}
           onClose={() => openAttack(null)}
+          onMarked={(m) => applyMark(sel.id, m)}
           onExplore={() => {
             const pad = Math.max(120, Math.round(sel.durationSec * 0.5))
             rng.setCustom(Math.floor(sel.start / 1000) - pad, Math.ceil(sel.end / 1000) + pad)

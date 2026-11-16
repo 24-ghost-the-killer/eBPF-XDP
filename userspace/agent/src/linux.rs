@@ -208,6 +208,11 @@ fn restore_config(layout: &PinLayout) -> Result<()> {
         sample_shift: current.sample_shift,
         global_rl_interval_ns: current.global_rl_interval_ns,
         global_rl_burst: current.global_rl_burst,
+        // scan-detection settings are owned by the analysis loop at runtime
+        scan_threshold: current.scan_threshold,
+        scan_window_ms: current.scan_window_ms,
+        scan_block_s: current.scan_block_s,
+        lifeline_v4: current.lifeline_v4,
     };
     map.update(&0u32.to_ne_bytes(), &new.to_bytes(), MapFlags::ANY)?;
     eprintln!("interface {}: restored saved config {:?}", layout.iface(), flags);
@@ -504,6 +509,86 @@ fn api_services_json(cfg: &Config) -> String {
         ifaces.push(serde_json::json!({"iface": name, "protected": protected}));
     }
     serde_json::json!({"interfaces": ifaces}).to_string()
+}
+
+/// `/api/dataplane.json`: every interface with an XDP program attached (not
+/// only the configured ones -- e.g. the Twingate veth), with the program's id,
+/// name, tag and load time, plus the installed object's mtime. The dashboard's
+/// health page compares the two: a program loaded before the object on disk was
+/// installed is stale (`sentinelctl attach --replace` reloads it). Read-only;
+/// needs root for the program info, which the agent has.
+fn api_dataplane_json(cfg: &Config) -> String {
+    use libbpf_rs::query::ProgInfoIter;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    // program load times count from boot (CLOCK_BOOTTIME); turn them into wall-clock
+    // SAFETY: zero-initialised timespec is valid and clock_gettime only writes it.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: valid clock id and writable timespec.
+    let boot = if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == 0 {
+        now - (ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9)
+    } else {
+        0.0
+    };
+    let progs: HashMap<u32, (String, String, f64)> = ProgInfoIter::default()
+        .map(|p| {
+            let tag: String = p.tag.0.iter().map(|b| format!("{b:02x}")).collect();
+            (p.id, (p.name.to_string_lossy().into_owned(), tag, boot + p.load_time.as_secs_f64()))
+        })
+        .collect();
+
+    let mut ifaces = Vec::new();
+    if let (Ok(dir), Ok(devnull)) = (fs::read_dir("/sys/class/net"), fs::File::open("/dev/null")) {
+        let xdp = Xdp::new(devnull.as_fd());
+        let mut names: Vec<String> = dir.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        for name in names {
+            let Some(ix) = fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(q) = xdp.query(ix, XdpFlags::NONE) else { continue };
+            if q.prog_id == 0 {
+                continue;
+            }
+            let configured = cfg.interfaces.iter().any(|i| i.name == name);
+            let pinned = if configured {
+                PinLayout::new(&cfg.pin_root, &name).ok().and_then(|l| pinned_prog_id(&l))
+            } else {
+                None
+            };
+            let mode = match q.attach_mode {
+                1 => "native",
+                2 => "generic",
+                3 => "offload",
+                _ => "unknown",
+            };
+            let (pname, tag, loaded) = progs.get(&q.prog_id).cloned().unwrap_or_default();
+            ifaces.push(serde_json::json!({
+                "iface": name, "ifindex": ix, "prog_id": q.prog_id, "mode": mode,
+                "prog_name": pname, "tag": tag, "loaded_at": loaded,
+                "configured": configured, "pinned_prog_id": pinned,
+            }));
+        }
+    }
+    let obj = fs::metadata(&cfg.bpf_obj).ok();
+    let mtime = obj
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    serde_json::json!({
+        "now": now,
+        "agent": { "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id() },
+        "object": { "path": cfg.bpf_obj.display().to_string(), "mtime": mtime, "size": obj.map(|m| m.len()) },
+        "configured": cfg.interfaces.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+        "interfaces": ifaces,
+    })
+    .to_string()
 }
 
 /// Build the `/api/state.json` body: real rate deltas plus a live Phase 9
@@ -860,6 +945,12 @@ struct Analyzer {
     global_cap: u32,                // aggregate pps cap at full escalation (tunable)
     ct_enforce: bool,               // actually drop untracked TCP (else conntrack is shadow-only)
     steady_drops: u32,              // drop flags kept on at all risk levels (auto-managed)
+    rl_ceiling: u32,                // always-on per-source pps ceiling below level 3 (0 = off)
+    scan_block: bool,               // block sources that scan many internal targets
+    scan_threshold: u32,            // distinct internal targets per window that mark a scanner
+    scan_window_ms: u32,
+    scan_block_s: u32,
+    syn_auth: bool,                 // SYN authentication instead of drop_syn under a SYN flood
     // auto-lockdown (agent-armed default-deny kill-switch; opt-in)
     auto_lockdown: bool,                      // feature enabled (XS_AUTO_LOCKDOWN)
     auto_lockdown_leak: f64,                  // drop-ratio below which traffic is "leaking"
@@ -868,6 +959,57 @@ struct Analyzer {
     lockdown_on: bool,                        // last computed agent-lockdown state (for metrics)
     // multi-layer detector baseline over the LAYER_DEF rates
     layer_base: RobustBaseline,
+}
+
+/// A number from the environment, or `default` when unset/unparseable.
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// An on/off switch from the environment: only 0/false/off/no turn it off.
+fn env_on(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+    }
+}
+
+/// The IPv4 address the box itself answers on for `iface`: the address of its
+/// bridge (vlan10 -> br0), else of the interface itself; 0.0.0.0 if none. The
+/// scan detector never blocks traffic to it, so it can never cut the operator
+/// off SSH or the dashboard. Octets in network order.
+fn own_ipv4(iface: &str) -> [u8; 4] {
+    let want = fs::read_link(format!("/sys/class/net/{iface}/master"))
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| iface.to_string());
+    let mut out = [0u8; 4];
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills ifap with a list we free below; nothing else holds it.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: cur is a valid node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        // SAFETY: ifa_addr is either null or a valid sockaddr for this node.
+        let is_v4 = !ifa.ifa_addr.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET;
+        if is_v4 {
+            // SAFETY: ifa_name is a valid NUL-terminated string for this node.
+            let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy();
+            if name == want {
+                // SAFETY: family is AF_INET, so ifa_addr points to a sockaddr_in.
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                out = sin.sin_addr.s_addr.to_ne_bytes(); // stored in network order
+                break;
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: ifap came from a successful getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(ifap) };
+    out
 }
 
 /// Drop flags the agent keeps enabled at steady state, from `XS_STEADY_DROPS`
@@ -1004,6 +1146,15 @@ impl Analyzer {
             if auto { "ON" } else { "off" },
             steady_names.join(","),
         );
+        let rl_ceiling = env_u32("XS_RL_CEILING_PPS", 100_000);
+        let scan_block = env_on("XS_SCAN_BLOCK", true);
+        let syn_auth = env_on("XS_SYN_AUTH", true);
+        eprintln!(
+            "analysis: per-source ceiling {}; scan block {}; SYN authentication {}",
+            if rl_ceiling > 0 { format!("{rl_ceiling} pps") } else { "off".into() },
+            if scan_block { "on" } else { "off" },
+            if syn_auth { "on (under SYN floods)" } else { "off" },
+        );
         Analyzer {
             detector: Detector::new(features::N),
             classifier,
@@ -1032,6 +1183,17 @@ impl Analyzer {
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false),
             steady_drops,
+            // Always-on emergency brake: below level 3 every non-exempt source is
+            // still capped at this rate, so a single-source flood is cut from its
+            // first millisecond instead of after the ladder's windows. 100k pps is
+            // above what one source sends at full gigabit with full-size packets
+            // (~83k pps), so legitimate transfers are never touched.
+            rl_ceiling,
+            scan_block,
+            scan_threshold: env_u32("XS_SCAN_THRESHOLD", 64),
+            scan_window_ms: env_u32("XS_SCAN_WINDOW_MS", 10_000),
+            scan_block_s: env_u32("XS_SCAN_BLOCK_S", 600),
+            syn_auth,
             // Auto-lockdown is OFF by default (opt-in): a default-deny kill-switch
             // drops ALL non-protected internal IPv4 traffic, so it must be a
             // deliberate choice. XS_AUTO_LOCKDOWN=1/true arms the agent to engage
@@ -1093,7 +1255,9 @@ impl Analyzer {
             let auto_only = ConfigFlags::GLOBAL_RL.bits()
                 | ConfigFlags::DROP_UNTRACKED.bits()
                 | ConfigFlags::DROP_UDP_STRICT.bits()
-                | ConfigFlags::AUTO_LOCKDOWN.bits();
+                | ConfigFlags::AUTO_LOCKDOWN.bits()
+                | ConfigFlags::SYN_AUTH.bits()
+                | ConfigFlags::SCAN_BLOCK.bits();
             b.flags = ConfigFlags::from_bits_retain(b.flags.bits() & !auto_only);
             b.global_rl_interval_ns = 0;
             b.global_rl_burst = 0;
@@ -1133,6 +1297,31 @@ impl Analyzer {
         // flows are already known before a flood hits -- it is harmless in
         // shadow (counts untracked TCP; only drops when DROP_UNTRACKED is set).
         want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | ConfigFlags::CONNTRACK.bits());
+        // Always-on emergency brake (levels 0-2): cap every non-exempt source at
+        // rl_ceiling pps, so a single-source flood is cut at once while the ladder
+        // is still gathering evidence. An operator's own, stricter `sentinelctl
+        // ratelimit` baseline wins.
+        let operator_rl = base.flags.contains(ConfigFlags::RATELIMIT) && base.rl_pps() > 0;
+        if auto_pps == 0 && self.rl_ceiling > 0 && !(operator_rl && base.rl_pps() <= self.rl_ceiling) {
+            want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | ConfigFlags::RATELIMIT.bits());
+            want.rl_interval_ns = 1_000_000_000 / self.rl_ceiling;
+            want.rl_burst = (self.rl_ceiling / 10).max(20);
+        }
+        // Scan detection runs at every level (it is behaviour-based and never
+        // touches traffic to the box itself or to the internet).
+        if self.scan_block {
+            want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | ConfigFlags::SCAN_BLOCK.bits());
+            want.scan_threshold = self.scan_threshold;
+            want.scan_window_ms = self.scan_window_ms;
+            want.scan_block_s = self.scan_block_s;
+            want.lifeline_v4 = own_ipv4(layout.iface());
+        }
+        // SYN authentication under a SYN flood (level 3+): hold back first SYNs of
+        // unverified sources until they retransmit. Precise where drop_syn would
+        // shut out every new connection; exempt (LAN) sources are never delayed.
+        if self.syn_auth && level >= 3 && matches!(dtype, "syn_flood" | "connection_flood") {
+            want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | ConfigFlags::SYN_AUTH.bits());
+        }
         if auto_pps > 0 {
             want.flags = ConfigFlags::from_bits_retain(want.flags.bits() | ConfigFlags::RATELIMIT.bits());
             want.rl_interval_ns = 1_000_000_000 / auto_pps;
@@ -1661,6 +1850,7 @@ fn handle(
                 ("200 OK", "application/json", json)
             }
             "/api/services.json" => ("200 OK", "application/json", api_services_json(cfg)),
+            "/api/dataplane.json" => ("200 OK", "application/json", api_dataplane_json(cfg)),
             "/healthz" => ("200 OK", "text/plain", "ok\n".into()),
             "/readyz" => {
                 if ready(cfg) {

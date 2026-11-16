@@ -112,6 +112,10 @@ pub const COUNTERS: &[CounterDef] = &[
     c!(54, "anom_port_zero", "TCP/UDP source or destination port zero"),
     c!(55, "anom_spoofed_lan", "Local source address routed in by an upstream router (spoofed LAN): allowlist trust withheld"),
     c!(56, "arp_rate_limited", "ARP frames dropped by the always-on ARP storm cap"),
+    c!(57, "scan_detected", "Sources newly flagged as port/host scanners"),
+    c!(58, "scan_drop", "Packets dropped because their source is a blocked scanner"),
+    c!(59, "synauth_drop", "First SYNs held back by SYN authentication (the client must retransmit)"),
+    c!(60, "synauth_pass", "Sources verified by SYN authentication (retransmitted their SYN)"),
     c!(64, "parse_ok", "parse outcome: well formed IP"),
     c!(65, "parse_not_ip", "parse outcome: non-IP ethertype"),
     c!(66, "parse_unsup_vlan_depth", "parse outcome: more than two VLAN tags"),
@@ -236,12 +240,18 @@ impl ConfigFlags {
     /// auto-revert it when an attack leaks past all other mitigation, without ever
     /// clobbering the operator/dashboard LOCKDOWN bit. Agent-managed, not operator.
     pub const AUTO_LOCKDOWN: ConfigFlags = ConfigFlags(1 << 22);
-    pub const KNOWN: u32 = 0b1_11_1111_1111_1111_1111_1111;
+    /// Scan detection: block a source that probes many internal targets
+    /// (agent-managed, on at every risk level; params in scan_*).
+    pub const SCAN_BLOCK: ConfigFlags = ConfigFlags(1 << 23);
+    /// SYN authentication under a SYN flood: hold back an unverified source's
+    /// first SYN until it retransmits (agent-managed, armed under attack).
+    pub const SYN_AUTH: ConfigFlags = ConfigFlags(1 << 24);
+    pub const KNOWN: u32 = 0b1_1111_1111_1111_1111_1111_1111;
     /// Bits an operator toggles directly (the rest are auto-managed).
     pub const OPERATOR: u32 = 0b11_0000_0000_0000_1000_1111;
 
     /// Names in bit order, used for display and the CLI.
-    pub const NAMES: [(ConfigFlags, &'static str); 23] = [
+    pub const NAMES: [(ConfigFlags, &'static str); 25] = [
         (Self::DROP_MALFORMED, "drop_malformed"),
         (Self::DROP_BAD_TCP_FLAGS, "drop_bad_tcp_flags"),
         (Self::DROP_FRAGMENTS, "drop_fragments"),
@@ -265,6 +275,8 @@ impl ConfigFlags {
         (Self::LOCKDOWN, "lockdown"),
         (Self::DROP_SPOOFED, "drop_spoofed"),
         (Self::AUTO_LOCKDOWN, "auto_lockdown"),
+        (Self::SCAN_BLOCK, "scan_block"),
+        (Self::SYN_AUTH, "syn_auth"),
     ];
 
     /// Validate bits coming from an operator or API before they reach the
@@ -333,6 +345,14 @@ pub struct Config {
     pub global_rl_interval_ns: u32,
     /// Aggregate limiter: bucket depth in packets.
     pub global_rl_burst: u32,
+    /// Scan detection: distinct internal targets per window that mark a scanner (0 = 64).
+    pub scan_threshold: u32,
+    /// Scan detection: counting window in ms (0 = 10000).
+    pub scan_window_ms: u32,
+    /// Scan detection: how long a scanner stays blocked, s (0 = 600).
+    pub scan_block_s: u32,
+    /// Never scan-block traffic to this IPv4 (the box itself); octets, 0.0.0.0 = none.
+    pub lifeline_v4: [u8; 4],
 }
 
 impl Config {
@@ -351,6 +371,10 @@ impl Config {
             sample_shift: u32::from_ne_bytes(b[20..24].try_into().expect("4 bytes")),
             global_rl_interval_ns: u32::from_ne_bytes(b[24..28].try_into().expect("4 bytes")),
             global_rl_burst: u32::from_ne_bytes(b[28..32].try_into().expect("4 bytes")),
+            scan_threshold: u32::from_ne_bytes(b[32..36].try_into().expect("4 bytes")),
+            scan_window_ms: u32::from_ne_bytes(b[36..40].try_into().expect("4 bytes")),
+            scan_block_s: u32::from_ne_bytes(b[40..44].try_into().expect("4 bytes")),
+            lifeline_v4: b[44..48].try_into().expect("4 bytes"),
         })
     }
 
@@ -365,6 +389,10 @@ impl Config {
         b[20..24].copy_from_slice(&self.sample_shift.to_ne_bytes());
         b[24..28].copy_from_slice(&self.global_rl_interval_ns.to_ne_bytes());
         b[28..32].copy_from_slice(&self.global_rl_burst.to_ne_bytes());
+        b[32..36].copy_from_slice(&self.scan_threshold.to_ne_bytes());
+        b[36..40].copy_from_slice(&self.scan_window_ms.to_ne_bytes());
+        b[40..44].copy_from_slice(&self.scan_block_s.to_ne_bytes());
+        b[44..48].copy_from_slice(&self.lifeline_v4); // network order, as the dataplane reads it
         b
     }
 
@@ -439,7 +467,17 @@ mod tests {
         let cfg = Config { abi_version: ABI_VERSION, flags, ..Default::default() };
         assert_eq!(Config::from_bytes(&cfg.to_bytes()).unwrap(), cfg);
         assert_eq!(flags.bits(), 0b101);
-        assert_eq!(ConfigFlags::from_bits(1 << 23), Err(AbiError::UnknownFlags(1 << 23)));
+        assert_eq!(ConfigFlags::from_bits(1 << 25), Err(AbiError::UnknownFlags(1 << 25)));
+        assert!(ConfigFlags::from_bits(ConfigFlags::SCAN_BLOCK.bits() | ConfigFlags::SYN_AUTH.bits()).is_ok());
+        // the scan settings and the lifeline address survive a round trip, the
+        // address in network order at bytes 44..48 as the dataplane reads it
+        let scan = Config {
+            scan_threshold: 64, scan_window_ms: 10_000, scan_block_s: 600, lifeline_v4: [192, 168, 1, 193],
+            ..Default::default()
+        };
+        let b = scan.to_bytes();
+        assert_eq!(&b[44..48], &[192, 168, 1, 193]);
+        assert_eq!(Config::from_bytes(&b).unwrap(), scan);
         assert!(Config::from_bytes(&[0u8; 8]).is_err());
         assert_eq!(format!("{:?}", flags), "drop_malformed|drop_fragments");
     }

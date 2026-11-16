@@ -200,6 +200,139 @@ static __always_inline int xs_service_denied(const struct xs_pkt *p)
 }
 
 /*
+ * IPv6 twin of xs_service_denied: on a destination listed in xs_protected_v6,
+ * only the services in xs_service_v6 pass. ICMPv6 is always allowed -- IPv6
+ * cannot work without neighbour discovery and path-MTU messages -- and so is
+ * return traffic of the host's own connections (ephemeral dport, as for IPv4).
+ * Closes the gap where a protected host with a global IPv6 address was
+ * reachable on every port over IPv6 while IPv4 was default-deny.
+ */
+static __always_inline int xs_service_denied6(const struct xs_pkt *p)
+{
+	struct xs_in6 d = {};
+
+	__builtin_memcpy(d.a, p->daddr.v6, 16);
+	if (!bpf_map_lookup_elem(&xs_protected_v6, &d))
+		return 0; /* destination not protected -> default allow */
+	if (p->l4_proto == XS_IPPROTO_ICMPV6)
+		return 0;
+	if (p->l4_parsed && xs_ntohs_bounded(p->dport) >= XS_EPHEMERAL_PORT_MIN) {
+		if (p->l4_proto == XS_IPPROTO_UDP)
+			return 0;
+		if (p->l4_proto == XS_IPPROTO_TCP && (p->tcp_flags & XS_TCP_ACK))
+			return 0;
+	}
+
+	struct xs_service_key6 k = {};
+
+	__builtin_memcpy(k.daddr, p->daddr.v6, 16);
+	k.dport = p->l4_parsed ? p->dport : 0;
+	k.proto = p->l4_proto;
+	return bpf_map_lookup_elem(&xs_service_v6, &k) ? 0 : 1;
+}
+
+/*
+ * Scan detection (XS_CFG_SCAN_BLOCK). Called only for IPv4 packets to internal
+ * destinations other than the box itself. Returns 1 to drop: the source is a
+ * blocked scanner, or this probe just pushed it over the threshold.
+ *
+ * A "probe" is a new-connection attempt: TCP SYN without ACK, or UDP to a
+ * service port (< 32768; replies to ephemeral ports are return traffic).
+ * Distinct {destination, port} targets are counted in a 512-bit hashed set per
+ * window, so a vertical scan (many ports, one host) and a horizontal one (one
+ * port, many hosts) both count, while a client hammering one service does not.
+ */
+static __always_inline int xs_scan_drop(struct xs_stats *st, const struct xs_config *cfg,
+					const struct xs_pkt *p, __u64 now, __u64 len)
+{
+	__be32 sa = p->saddr.v4;
+	struct xs_scan *s = bpf_map_lookup_elem(&xs_scan_v4, &sa);
+
+	if (s && now < s->blocked_until_ns)
+		return 1;
+	if (!p->l4_parsed)
+		return 0;
+	int probe = (p->l4_proto == XS_IPPROTO_TCP && (p->tcp_flags & XS_TCP_SYN) &&
+		     !(p->tcp_flags & XS_TCP_ACK)) ||
+		    (p->l4_proto == XS_IPPROTO_UDP && xs_ntohs_bounded(p->dport) < XS_EPHEMERAL_PORT_MIN);
+	if (!probe || (bpf_ntohl(p->daddr.v4) & 0xff) == 0xff) /* .255: subnet broadcast */
+		return 0;
+
+	__u32 thr = cfg && cfg->scan_threshold ? cfg->scan_threshold : XS_SCAN_DEFAULT_THRESHOLD;
+	__u64 window = (__u64)(cfg && cfg->scan_window_ms ? cfg->scan_window_ms : XS_SCAN_DEFAULT_WINDOW_MS) * 1000000ULL;
+	__u64 block = (__u64)(cfg && cfg->scan_block_s ? cfg->scan_block_s : XS_SCAN_DEFAULT_BLOCK_S) * 1000000000ULL;
+	__u32 h = (__u32)xs_mix64(((__u64)p->daddr.v4 << 16) ^ (__u64)p->dport ^ ((__u64)p->l4_proto << 48)) & 511;
+	__u32 w = (h >> 6) & 7;
+	__u64 bit = 1ULL << (h & 63);
+
+	if (!s) {
+		struct xs_scan n = {};
+
+		n.window_ns = now;
+		n.count = 1;
+		n.bits[w] = bit;
+		bpf_map_update_elem(&xs_scan_v4, &sa, &n, BPF_ANY);
+		return 0;
+	}
+	if (now - s->window_ns > window) {
+		s->window_ns = now;
+		s->count = 0;
+		s->blocked_until_ns = 0;
+		for (int i = 0; i < 8; i++)
+			s->bits[i] = 0;
+	}
+	if (!(s->bits[w] & bit)) {
+		s->bits[w] |= bit;
+		s->count++;
+	}
+	if (s->count >= thr) {
+		s->blocked_until_ns = now + block;
+		s->count = 0;
+		xs_count(st, XS_CNT_SCAN_DETECTED, len);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * SYN authentication (XS_CFG_SYN_AUTH). Called for a TCP SYN (no ACK) from a
+ * non-exempt source. Returns 1 to drop. A verified source passes; otherwise the
+ * first SYN of a connection is held back and its {5-tuple, ISN} remembered, and
+ * the client's own retransmission of that exact SYN (0.2-30 s later) verifies
+ * the source for 10 minutes. Spoofed SYN floods never retransmit.
+ */
+static __always_inline int xs_syn_auth_drop(struct xs_stats *st, const struct xs_pkt *p,
+					    __u64 now, __u64 len)
+{
+	__u64 src = p->l3 == XS_L3_IPV4 ? ((__u64)p->saddr.v4 | (1ULL << 63)) : xs_addr_hi(&p->saddr);
+	__u64 *ok = bpf_map_lookup_elem(&xs_synauth_ok, &src);
+
+	if (ok && now < *ok)
+		return 0;
+
+	__u64 key = xs_mix64(xs_hash_flow(p) ^ ((__u64)p->tcp_seq << 13));
+	__u64 *first = bpf_map_lookup_elem(&xs_synauth_pend, &key);
+
+	if (first) {
+		__u64 age = now - *first;
+
+		if (age >= XS_SYNAUTH_MIN_NS && age <= XS_SYNAUTH_MAX_NS) {
+			__u64 until = now + XS_SYNAUTH_TRUST_NS;
+
+			bpf_map_update_elem(&xs_synauth_ok, &src, &until, BPF_ANY);
+			bpf_map_delete_elem(&xs_synauth_pend, &key);
+			xs_count(st, XS_CNT_SYNAUTH_PASS, len);
+			return 0;
+		}
+		if (age > XS_SYNAUTH_MAX_NS)
+			*first = now; /* stale: start over */
+		return 1;
+	}
+	bpf_map_update_elem(&xs_synauth_pend, &key, &now, BPF_ANY);
+	return 1;
+}
+
+/*
  * The xs_l2_trust entry when this frame's source MAC is a registered upstream
  * router (anti-spoofing for the allowlist, see policy.h), else NULL. One small
  * hash lookup, only made while the allowlist is armed.
@@ -317,7 +450,8 @@ int xs_xdp_main(struct xdp_md *ctx)
 	else if (decision == XS_POL_DROP)
 		verdict = XDP_DROP;
 	else if (!exempt && (flags & XS_CFG_SERVICE_ALLOW) && rc == XS_PARSE_OK &&
-		 pkt.l3 == XS_L3_IPV4 && xs_service_denied(&pkt)) {
+		 ((pkt.l3 == XS_L3_IPV4 && xs_service_denied(&pkt)) ||
+		  (pkt.l3 == XS_L3_IPV6 && xs_service_denied6(&pkt)))) {
 		/*
 		 * Positive security model: on a protected destination only the
 		 * explicitly allowed {proto,dport} services pass; everything else is
@@ -351,6 +485,30 @@ int xs_xdp_main(struct xdp_md *ctx)
 		 * is spent only on the ambiguous volumetric remainder.
 		 */
 		verdict = xs_validity_verdict(rc, &pkt, flags);
+		/*
+		 * Scan detection: a source probing many internal targets is cut off from
+		 * the internal network for a while. Runs for allowlist-exempt LAN sources
+		 * too (FULL trust never gets here), but never touches traffic aimed at
+		 * the box itself (lifeline_v4) or bound for the internet.
+		 */
+		if (verdict != XDP_DROP && (flags & XS_CFG_SCAN_BLOCK) && rc == XS_PARSE_OK &&
+		    pkt.l3 == XS_L3_IPV4 && xs_dst_is_internal(&pkt) &&
+		    !(cfg && cfg->lifeline_v4 && pkt.daddr.v4 == cfg->lifeline_v4) &&
+		    xs_scan_drop(st, cfg, &pkt, now, len)) {
+			xs_count(st, XS_CNT_SCAN_DROP, len);
+			verdict = XDP_DROP;
+		}
+		/*
+		 * SYN authentication under a SYN flood: hold back the first SYN of an
+		 * unverified source until it retransmits (exempt sources skip it).
+		 */
+		if (verdict != XDP_DROP && !exempt && (flags & XS_CFG_SYN_AUTH) && rc == XS_PARSE_OK &&
+		    pkt.l4_parsed && pkt.l4_proto == XS_IPPROTO_TCP &&
+		    (pkt.tcp_flags & XS_TCP_SYN) && !(pkt.tcp_flags & XS_TCP_ACK) &&
+		    xs_syn_auth_drop(st, &pkt, now, len)) {
+			xs_count(st, XS_CNT_SYNAUTH_DROP, len);
+			verdict = XDP_DROP;
+		}
 		/*
 		 * Connection tracking: for TCP that validity passed, count packets
 		 * matching no tracked flow (ACK/RST flood) and, only when

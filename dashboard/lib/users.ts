@@ -43,7 +43,7 @@ export interface Store { groups: Group[]; users: StoredUser[] }
 const DEFAULT_FILE = '/etc/xdp-sentinel/dash-users.json'
 const DEFAULT_ADMIN_USER = 'admin'
 const DEFAULT_ADMIN_PASSWORD = 'admin'
-const STORE_VERSION = 3
+const STORE_VERSION = 4
 
 const preset = (id: string) => [...(PRESETS.find((p) => p.id === id)?.perms ?? [])]
 // Seeded when the store has no groups yet; become editable once anything is saved.
@@ -74,6 +74,12 @@ function parseStore(raw: string): Store {
           if (ver < 2) for (const a of ACTIONS) if (perms.includes(a.page)) perms = [...perms, a.id]
           // v3 added the Audit log page: existing admin groups get it.
           if (ver < 3 && perms.includes(ADMIN_PAGE) && !perms.includes('audit')) perms = [...perms, 'audit']
+          // v4 added Devices, Dataplane health and their actions: admin groups get
+          // everything, groups that could see Protection get the two pages.
+          if (ver < 4) {
+            if (perms.includes(ADMIN_PAGE)) perms = [...perms, 'devices', 'health', 'attacks.mark', 'devices.edit']
+            else if (perms.includes('protect')) perms = [...perms, 'devices', 'health']
+          }
           return { name: g.name, perms: effectivePerms(perms), ...(g.requireMfa === true ? { requireMfa: true } : {}) }
         })
     : []

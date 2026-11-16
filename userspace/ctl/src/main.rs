@@ -187,11 +187,12 @@ pub enum Cmd {
 
     /// Mark a destination as PROTECTED (positive security / default-deny): only
     /// the services added with `service` reach it; all other traffic to it is
-    /// dropped. IPv4 only. Add your services BEFORE protecting to avoid an outage.
+    /// dropped. IPv4 or IPv6 (ICMPv6 always passes, IPv6 needs it). Add your
+    /// services BEFORE protecting to avoid an outage.
     Protect {
         #[arg(short, long)]
         iface: String,
-        /// Destination IP to protect (IPv4).
+        /// Destination IP to protect (IPv4 or IPv6).
         ip: IpAddr,
     },
     /// Remove a destination from default-deny (its service entries are kept).
@@ -205,7 +206,7 @@ pub enum Cmd {
     Service {
         #[arg(short, long)]
         iface: String,
-        /// Protected destination IP (IPv4).
+        /// Protected destination IP (IPv4 or IPv6).
         ip: IpAddr,
         /// Transport protocol.
         #[arg(value_enum)]

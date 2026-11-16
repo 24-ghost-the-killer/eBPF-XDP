@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -202,6 +203,186 @@ static void run_arp_storm(int prog_fd, int stats_fd, int cfg_fd)
 	}
 }
 
+/* ---- shared helpers for the feature tests below ---- */
+
+static __u32 ip4(int a, int b, int c, int d)
+{
+	return ((__u32)a << 24) | ((__u32)b << 16) | ((__u32)c << 8) | (__u32)d;
+}
+
+/* An IPv4 TCP frame with the given flags and sequence number. */
+static void tcp4(struct pb *b, __u32 src, __u32 dst, __u16 sport, __u16 dport, __u8 flags, __u32 seq)
+{
+	pb_init(b);
+	pb_eth(b, XS_ETH_P_IPV4);
+	pb_ipv4(b, 6, src, dst, 0, 0);
+	__u32 th = b->len;
+	pb_tcp(b, sport, dport, flags, 5);
+	pb_put32(b->buf + th + 4, seq);
+	pb_finalize(b);
+}
+
+static __u32 verdict_of(int prog_fd, const struct pb *b)
+{
+	__u32 rv = 0;
+
+	if (run_frame(prog_fd, b, &rv)) {
+		fprintf(stderr, "test_run failed\n");
+		exit(2);
+	}
+	return rv;
+}
+
+static __u64 delta(const struct totals *a, const struct totals *b, int slot)
+{
+	return b->c[slot].packets - a->c[slot].packets;
+}
+
+#define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL " __VA_ARGS__); fprintf(stderr, "\n"); failures++; } } while (0)
+
+/*
+ * Scan detection: a LAN source SYN-probing distinct ports on an internal host
+ * is blocked when it reaches the threshold, and stays blocked for internal
+ * destinations -- but its traffic to the box itself (lifeline) and to the
+ * internet still passes.
+ */
+static void run_scan(int prog_fd, int stats_fd, int cfg_fd)
+{
+	struct xs_config cfg = { .abi_version = XS_ABI_VERSION, .flags = XS_CFG_SCAN_BLOCK,
+				 .scan_threshold = 20, .scan_window_ms = 10000, .scan_block_s = 600,
+				 .lifeline_v4 = htonl(ip4(192, 168, 1, 193)) };
+	__u32 key = 0, scanner = ip4(192, 168, 1, 105), victim = ip4(192, 168, 1, 173);
+	struct totals before, after;
+	struct pb b;
+	int passed = 0, first_drop = -1;
+
+	if (bpf_map_update_elem(cfg_fd, &key, &cfg, BPF_ANY) || read_totals(stats_fd, &before))
+		exit(2);
+	for (int port = 1; port <= 30; port++) {
+		tcp4(&b, scanner, victim, 50000, (__u16)port, 0x02, 1000 + port);
+		if (verdict_of(prog_fd, &b) == XDP_PASS_RC)
+			passed++;
+		else if (first_drop < 0)
+			first_drop = port;
+	}
+	/* a normal connection to the box itself must still pass */
+	tcp4(&b, scanner, ip4(192, 168, 1, 193), 50001, 22, 0x02, 7);
+	__u32 lifeline = verdict_of(prog_fd, &b);
+	/* ... and so must internet-bound traffic */
+	tcp4(&b, scanner, ip4(8, 8, 8, 8), 50002, 443, 0x02, 8);
+	__u32 internet = verdict_of(prog_fd, &b);
+	/* while an innocent LAN host probing a few ports is untouched */
+	int other_ok = 1;
+	for (int port = 1; port <= 5; port++) {
+		tcp4(&b, ip4(192, 168, 1, 50), victim, 51000, (__u16)port, 0x02, 9);
+		other_ok &= verdict_of(prog_fd, &b) == XDP_PASS_RC;
+	}
+	if (read_totals(stats_fd, &after))
+		exit(2);
+
+	/* distinct targets are counted in a 512-bit hashed set, so a hash collision
+	 * can delay the block by a probe or two; never earlier than the threshold */
+	CHECK(first_drop >= 20 && first_drop <= 25 && passed == first_drop - 1,
+	      "scan: %d probes passed, first drop at port %d (want 19, 20 .. 24, 25)", passed, first_drop);
+	CHECK(delta(&before, &after, XS_CNT_SCAN_DETECTED) == 1, "scan: detected %llu times (want 1)",
+	      (unsigned long long)delta(&before, &after, XS_CNT_SCAN_DETECTED));
+	CHECK(delta(&before, &after, XS_CNT_SCAN_DROP) == (__u64)(30 - first_drop + 1), "scan: %llu scan drops (want %d)",
+	      (unsigned long long)delta(&before, &after, XS_CNT_SCAN_DROP), 30 - first_drop + 1);
+	CHECK(lifeline == XDP_PASS_RC, "scan: traffic to the box itself was dropped");
+	CHECK(internet == XDP_PASS_RC, "scan: internet-bound traffic was dropped");
+	CHECK(other_ok, "scan: an innocent host was blocked");
+	printf("scan detection: blocked at probe %d, box + internet still reachable\n", first_drop);
+}
+
+/*
+ * SYN authentication: the first SYN of an unverified source is held back; the
+ * same SYN retransmitted later verifies the source, whose next connections pass
+ * at once. A different (spoofed) source is still held.
+ */
+static void run_synauth(int prog_fd, int stats_fd, int cfg_fd)
+{
+	__u32 client = ip4(203, 0, 113, 7), server = ip4(192, 168, 1, 173);
+	struct totals before, after;
+	struct pb b;
+
+	if (set_flags(cfg_fd, XS_CFG_SYN_AUTH) || read_totals(stats_fd, &before))
+		exit(2);
+	tcp4(&b, client, server, 40000, 22, 0x02, 0x11223344);
+	__u32 first = verdict_of(prog_fd, &b);
+	__u32 too_soon = verdict_of(prog_fd, &b); /* immediate duplicate: not a real retransmit */
+	usleep(300000);
+	__u32 retrans = verdict_of(prog_fd, &b);
+	tcp4(&b, client, server, 40001, 443, 0x02, 0x55667788);
+	__u32 next_conn = verdict_of(prog_fd, &b);
+	tcp4(&b, ip4(198, 51, 100, 9), server, 40002, 22, 0x02, 0x1);
+	__u32 spoofed = verdict_of(prog_fd, &b);
+	/* established traffic (ACK) is never touched by it */
+	tcp4(&b, ip4(198, 51, 100, 10), server, 40003, 22, 0x10, 0x2);
+	__u32 ack = verdict_of(prog_fd, &b);
+	if (read_totals(stats_fd, &after))
+		exit(2);
+
+	CHECK(first == XDP_DROP_RC && too_soon == XDP_DROP_RC, "synauth: first SYN %u / immediate dup %u (want drop)", first, too_soon);
+	CHECK(retrans == XDP_PASS_RC, "synauth: retransmitted SYN was not let through");
+	CHECK(next_conn == XDP_PASS_RC, "synauth: verified source's next connection was held");
+	CHECK(spoofed == XDP_DROP_RC, "synauth: unverified source passed");
+	CHECK(ack == XDP_PASS_RC, "synauth: a plain ACK was dropped");
+	CHECK(delta(&before, &after, XS_CNT_SYNAUTH_PASS) == 1, "synauth: %llu verified (want 1)",
+	      (unsigned long long)delta(&before, &after, XS_CNT_SYNAUTH_PASS));
+	printf("syn authentication: held first SYN, verified on retransmit, spoofed source stays out\n");
+}
+
+/*
+ * IPv6 service allowlist: on a protected IPv6 destination only listed services
+ * pass; ICMPv6 and return traffic to ephemeral ports always pass.
+ */
+static void run_service6(int prog_fd, int stats_fd, int cfg_fd, int prot_fd, int svc_fd)
+{
+	__u8 dst[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 };
+	struct xs_service_key6 k = { .proto = 6 };
+	__u8 one = 1;
+	struct totals before, after;
+	struct pb b;
+	__u32 v[5];
+
+	memcpy(k.daddr, dst, 16);
+	k.dport = htons(22);
+	if (bpf_map_update_elem(prot_fd, dst, &one, BPF_ANY) || bpf_map_update_elem(svc_fd, &k, &one, BPF_ANY) ||
+	    set_flags(cfg_fd, XS_CFG_SERVICE_ALLOW) || read_totals(stats_fd, &before))
+		exit(2);
+	const struct { __u8 proto; __u16 dport; __u8 flags; } cases[5] = {
+		{ 6, 22, 0x02 },     /* allowed service */
+		{ 6, 80, 0x02 },     /* not listed */
+		{ 58, 0, 0 },        /* ICMPv6 */
+		{ 6, 40000, 0x10 },  /* return traffic (ACK to an ephemeral port) */
+		{ 17, 53, 0 },       /* UDP, not listed */
+	};
+	for (int i = 0; i < 5; i++) {
+		pb_init(&b);
+		pb_eth(&b, XS_ETH_P_IPV6);
+		pb_ipv6(&b, cases[i].proto, 0x99, 0x42);
+		if (cases[i].proto == 6)
+			pb_tcp(&b, 50000, cases[i].dport, cases[i].flags, 5);
+		else if (cases[i].proto == 17)
+			pb_udp(&b, 50000, cases[i].dport);
+		else
+			pb_icmp(&b, 128, 0);
+		pb_finalize(&b);
+		v[i] = verdict_of(prog_fd, &b);
+	}
+	if (read_totals(stats_fd, &after))
+		exit(2);
+	CHECK(v[0] == XDP_PASS_RC, "service6: allowed tcp/22 dropped");
+	CHECK(v[1] == XDP_DROP_RC, "service6: unlisted tcp/80 passed");
+	CHECK(v[2] == XDP_PASS_RC, "service6: ICMPv6 dropped (breaks IPv6)");
+	CHECK(v[3] == XDP_PASS_RC, "service6: return traffic dropped");
+	CHECK(v[4] == XDP_DROP_RC, "service6: unlisted udp/53 passed");
+	CHECK(delta(&before, &after, XS_CNT_SERVICE_DENY) == 2, "service6: %llu service denies (want 2)",
+	      (unsigned long long)delta(&before, &after, XS_CNT_SERVICE_DENY));
+	bpf_map_delete_elem(prot_fd, dst);
+	printf("ipv6 service allowlist: listed port passes, others dropped, ICMPv6 + replies pass\n");
+}
+
 static void check_invariants(int stats_fd)
 {
 	struct totals t;
@@ -264,6 +445,20 @@ int main(int argc, char **argv)
 
 	run_corpus(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg), 0);
 	run_corpus(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg), 1);
+	run_scan(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg));
+	run_synauth(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg));
+	{
+		struct bpf_map *p6 = bpf_object__find_map_by_name(obj, "xs_protected_v6");
+		struct bpf_map *s6 = bpf_object__find_map_by_name(obj, "xs_service_v6");
+
+		if (!p6 || !s6) {
+			fprintf(stderr, "FAIL object has no xs_protected_v6/xs_service_v6 maps\n");
+			failures++;
+		} else {
+			run_service6(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg),
+				     bpf_map__fd(p6), bpf_map__fd(s6));
+		}
+	}
 	run_arp_storm(bpf_program__fd(prog), bpf_map__fd(stats), bpf_map__fd(cfg));
 	check_invariants(bpf_map__fd(stats));
 

@@ -41,6 +41,9 @@ pub const MAP_ATTACKER_V6: &str = "xs_attacker_v6";
 pub const MAP_PROTECTED_V4: &str = "xs_protected_v4";
 /// Service allowlist: permitted {dst,proto,dport} services on protected dsts.
 pub const MAP_SERVICE_V4: &str = "xs_service_v4";
+/// IPv6 twins of the service allowlist maps.
+pub const MAP_PROTECTED_V6: &str = "xs_protected_v6";
+pub const MAP_SERVICE_V6: &str = "xs_service_v6";
 
 /// Linux IFNAMSIZ including the terminating NUL.
 const IFNAMSIZ: usize = 16;

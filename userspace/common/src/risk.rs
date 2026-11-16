@@ -97,6 +97,12 @@ pub fn fuse(e: &Evidence) -> f64 {
 pub struct Config {
     pub escalate_windows: u32,
     pub deescalate_windows: u32,
+    /// Fast lane: at or above this fused risk, escalate after only
+    /// `fast_escalate_windows` window(s) instead of `escalate_windows`. An
+    /// unmistakable flood then hits its rung in ~1 s instead of 2-3 s, while a
+    /// merely elevated signal still needs the normal hysteresis. >1.0 disables.
+    pub fast_escalate_risk: f64,
+    pub fast_escalate_windows: u32,
     pub ttl_s: u64,
     /// Max entities that may be escalated per window (blast-radius budget).
     pub escalation_budget: usize,
@@ -113,6 +119,8 @@ impl Default for Config {
         Config {
             escalate_windows: 3,
             deescalate_windows: 5,
+            fast_escalate_risk: 0.95,
+            fast_escalate_windows: 1,
             ttl_s: 600,
             escalation_budget: 64,
             breaker_threshold: 256,
@@ -227,8 +235,12 @@ impl RiskEngine {
         let mut reason = format!("risk {risk:.2} -> target {}", target.as_str());
         let mut want_escalate = false;
 
-        if st.above >= self.cfg.escalate_windows && st.level < Level::TemporaryBlock {
+        let fast = risk >= self.cfg.fast_escalate_risk && st.above >= self.cfg.fast_escalate_windows.max(1);
+        if (st.above >= self.cfg.escalate_windows || fast) && st.level < Level::TemporaryBlock {
             want_escalate = true;
+            if fast && st.above < self.cfg.escalate_windows {
+                reason = format!("{reason}; fast lane (risk >= {:.2})", self.cfg.fast_escalate_risk);
+            }
         } else if st.below >= self.cfg.deescalate_windows && st.level > Level::Pass {
             st.level = Level::from_usize(st.level as usize - 1);
             st.below = 0;
@@ -306,6 +318,28 @@ mod tests {
             level = e.decide("1.2.3.4", &ev, false, w).level;
         }
         assert_eq!(level, Level::TemporaryBlock, "reached {level:?}");
+    }
+
+    #[test]
+    fn extreme_risk_escalates_in_one_window() {
+        // The fast lane: an unmistakable flood (risk >= 0.95) acts in the very
+        // first window instead of waiting out escalate_windows.
+        let mut e = RiskEngine::new(Config::default());
+        e.begin_window(1);
+        let d = e.decide("svc", &attack_ev(), false, 0);
+        assert_eq!(d.level, Level::TemporaryBlock, "{}", d.reason);
+        assert!(d.reason.contains("fast lane"), "{}", d.reason);
+    }
+
+    #[test]
+    fn elevated_risk_still_needs_hysteresis() {
+        // Below the fast-lane threshold the normal hysteresis still applies: one
+        // window of a moderate signal must not move the ladder.
+        let mut e = RiskEngine::new(Config::default());
+        let ev = Evidence { anomaly: 0.6, ddos: 0.6, bot: 0.0, rule: 0.0, confidence: 1.0 };
+        assert!(fuse(&ev) < 0.95 && fuse(&ev) >= 0.5, "risk {}", fuse(&ev));
+        e.begin_window(1);
+        assert_eq!(e.decide("svc", &ev, false, 0).level, Level::Pass);
     }
 
     #[test]

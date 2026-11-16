@@ -1,10 +1,11 @@
 'use client'
+import { LiveAlert } from '@/components/aa/LiveAlert'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import {
   LayoutDashboard, LineChart, ShieldAlert, Fingerprint, TerminalSquare, Search, Moon, Sun, RefreshCw,
-  CalendarRange, Shield, Lock, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, ArrowLeft, History, UserRound,
+  CalendarRange, Lock, MonitorSmartphone, HeartPulse, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, ArrowLeft, History, UserRound,
   Server, FileText, type LucideIcon,
 } from 'lucide-react'
 import { PAGES } from '@/lib/authz'
@@ -88,12 +89,14 @@ const NAV: { group: string; items: NavItem[] }[] = [
       { href: '/analytics/ai', label: 'AI security', icon: BrainCircuit, hint: 'Risk engine, detectors and automated defenses' },
       { href: '/analytics/protect', label: 'Protection', icon: Lock, hint: 'Protected hosts and allowed services (default-deny)' },
       { href: '/analytics/ip', label: 'IP lookup', icon: Fingerprint, hint: 'Investigate one address' },
+      { href: '/analytics/devices', label: 'Devices', icon: MonitorSmartphone, hint: 'Every device seen on the network — name them, spot new ones' },
     ],
   },
   {
     group: 'Tools',
     items: [
       { href: '/analytics/query', label: 'Query console', icon: TerminalSquare, hint: 'Run raw PromQL' },
+      { href: '/analytics/health', label: 'Dataplane health', icon: HeartPulse, hint: 'Which firewall program each interface runs, and whether it is current' },
     ],
   },
   {
@@ -305,9 +308,6 @@ export default function Shell({ children }: { children: ReactNode }) {
           {/* sidebar */}
           <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-nd-line bg-nd-panel lg:flex print:!hidden">
             <div className="flex items-center gap-3 px-5 pb-4 pt-5">
-              <span className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-emerald-400 to-teal-600 text-white shadow-nd">
-                <Shield className="h-[18px] w-[18px]" strokeWidth={2.2} />
-              </span>
               <div className="leading-tight">
                 <div className="text-[14.5px] font-semibold tracking-[-0.01em] text-nd-fg">xdp-sentinel</div>
                 <div className="text-[11.5px] text-nd-dim">Analytics</div>
@@ -435,6 +435,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                   </Link>
                 ))}
               </nav>
+              <LiveAlert kiosk={me?.kind === 'kiosk'} />
             </header>
             <main className="mx-auto max-w-[1480px] px-4 py-6 lg:px-8 lg:py-8">
               <p className="mb-6 text-[13.5px] text-nd-dim print:hidden">{reportTitle ? 'Report — click Edit to change it; other editors’ saves are merged, never overwritten' : hostIp ? 'Protected host — reports, log, allowed ports and statistics' : page.hint} · <span className="text-nd-muted">{value.label}</span></p>

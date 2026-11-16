@@ -15,7 +15,7 @@ use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use xs_common::abi::ABI_VERSION;
 use xs_common::pin::{
     PinLayout, MAP_ALLOW_V4, MAP_ALLOW_V6, MAP_CONFIG, MAP_POLICY_V4, MAP_POLICY_V6,
-    MAP_PROTECTED_V4, MAP_SERVICE_V4,
+    MAP_PROTECTED_V4, MAP_PROTECTED_V6, MAP_SERVICE_V4, MAP_SERVICE_V6,
 };
 use xs_common::policy::{
     self, Action, Allow, Policy, Reason, Trust, ALLOW_SIZE, LPM_V4_SIZE, LPM_V6_SIZE, POLICY_SIZE,
@@ -85,7 +85,8 @@ fn refresh_check_bits(layout: &PinLayout) -> Result<()> {
 
     // SERVICE_ALLOW follows the protected-destination map. Tolerant if the map
     // is absent (a dataplane that predates the feature): treat as empty.
-    let service = open(layout, MAP_PROTECTED_V4).map(|m| is_nonempty(&m)).unwrap_or(false);
+    let service = open(layout, MAP_PROTECTED_V4).map(|m| is_nonempty(&m)).unwrap_or(false)
+        || open(layout, MAP_PROTECTED_V6).map(|m| is_nonempty(&m)).unwrap_or(false);
 
     let cfg_map = open(layout, MAP_CONFIG)?;
     let mut cfg = read_config(&cfg_map)?;
@@ -221,14 +222,35 @@ fn service_key(v4: std::net::Ipv4Addr, proto: u8, port: u16) -> [u8; 8] {
     k
 }
 
+/// `struct xs_service_key6`: 16-byte address, port (network order), proto, pad.
+fn service_key6(v6: std::net::Ipv6Addr, proto: u8, port: u16) -> [u8; 20] {
+    let mut k = [0u8; 20];
+    k[0..16].copy_from_slice(&v6.octets());
+    k[16..18].copy_from_slice(&port.to_be_bytes());
+    k[18] = proto;
+    k[19] = 0;
+    k
+}
+
+/// The protected-destination map and key for an address of either family.
+fn protected_entry(layout: &PinLayout, ip: IpAddr) -> Result<(MapHandle, Vec<u8>)> {
+    Ok(match ip {
+        IpAddr::V4(v4) => (open(layout, MAP_PROTECTED_V4)?, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (
+            open(layout, MAP_PROTECTED_V6)
+                .context("this dataplane predates the IPv6 service allowlist: attach the new xdp_main.bpf.o")?,
+            v6.octets().to_vec(),
+        ),
+    })
+}
+
 /// Mark a destination as protected: default-deny everything to it except the
-/// services added with `service`. IPv4 only (the maps are v4).
+/// services added with `service`. IPv4 or IPv6 (a /128; ICMPv6 always passes).
 pub fn protect(layout: &PinLayout, ip: IpAddr) -> Result<()> {
-    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only for now: {ip}") };
-    let key = v4.octets();
-    let map = open(layout, MAP_PROTECTED_V4)?;
+    let (map, key) = protected_entry(layout, ip)?;
     map.update(&key, &[1u8], MapFlags::ANY).context("insert protected destination")?;
     refresh_check_bits(layout)?;
+    let v4 = ip;
     println!(
         "protecting {v4} (DEFAULT-DENY): only services added with `service` reach it; \
          all other traffic to it is dropped. Add your services now, e.g. \
@@ -238,9 +260,8 @@ pub fn protect(layout: &PinLayout, ip: IpAddr) -> Result<()> {
 }
 
 pub fn unprotect(layout: &PinLayout, ip: IpAddr) -> Result<()> {
-    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only: {ip}") };
-    let key = v4.octets();
-    let map = open(layout, MAP_PROTECTED_V4)?;
+    let (map, key) = protected_entry(layout, ip)?;
+    let v4 = ip;
     match map.delete(&key) {
         Ok(()) => println!("unprotected {v4}: default-deny lifted (its service entries are kept)"),
         Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => println!("{v4} was not protected"),
@@ -253,9 +274,20 @@ pub fn unprotect(layout: &PinLayout, ip: IpAddr) -> Result<()> {
 /// Add (or, with `remove`, delete) one permitted `{proto,dport}` service on a
 /// destination. Use port 0 for portless protocols such as ICMP.
 pub fn service(layout: &PinLayout, ip: IpAddr, proto: u8, port: u16, remove: bool) -> Result<()> {
-    let IpAddr::V4(v4) = ip else { bail!("service allowlist is IPv4-only: {ip}") };
-    let key = service_key(v4, proto, port);
-    let map = open(layout, MAP_SERVICE_V4)?;
+    // ICMP for an IPv6 destination is ICMPv6 (always allowed by the dataplane anyway)
+    let (key, map, protected_map) = match ip {
+        IpAddr::V4(v4) => (service_key(v4, proto, port).to_vec(), open(layout, MAP_SERVICE_V4)?, MAP_PROTECTED_V4),
+        IpAddr::V6(v6) => {
+            let proto = if proto == 1 { 58 } else { proto };
+            (
+                service_key6(v6, proto, port).to_vec(),
+                open(layout, MAP_SERVICE_V6)
+                    .context("this dataplane predates the IPv6 service allowlist: attach the new xdp_main.bpf.o")?,
+                MAP_PROTECTED_V6,
+            )
+        }
+    };
+    let v4 = ip;
     if remove {
         match map.delete(&key) {
             Ok(()) => println!("removed service {v4} proto={proto} port={port}"),
@@ -266,7 +298,7 @@ pub fn service(layout: &PinLayout, ip: IpAddr, proto: u8, port: u16, remove: boo
         }
     } else {
         map.update(&key, &[1u8], MapFlags::ANY).context("insert service entry")?;
-        let protected = open(layout, MAP_PROTECTED_V4).map(|m| is_nonempty(&m)).unwrap_or(false);
+        let protected = open(layout, protected_map).map(|m| is_nonempty(&m)).unwrap_or(false);
         println!("allowed service {v4} proto={proto} port={port}");
         if !protected {
             println!("note: {v4} is not protected yet, so this has no effect until you run `sentinelctl protect {v4}`");

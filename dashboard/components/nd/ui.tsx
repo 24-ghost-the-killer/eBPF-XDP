@@ -108,31 +108,46 @@ export function Kpi({ label, value, sub, status, spark, sparkKey, color = SERIES
 export interface BarRow { label: string; v: number; sub?: string }
 
 // Ranked horizontal bars — one hue (magnitude), value text in neutral ink.
-export function BarList({ rows, fmt, empty = 'Nothing recorded in this range', color = SERIES[0], mono = false }: {
+export function BarList({ rows, fmt, empty = 'Nothing recorded in this range', color = SERIES[0], mono = false, onSelect, active = -1 }: {
   rows: BarRow[]
   fmt: (n: number) => string
   empty?: string
   color?: string
   mono?: boolean
+  // optional: rows become buttons; `active` is highlighted (e.g. the country picked on the globe)
+  onSelect?: (index: number) => void
+  active?: number
 }) {
   const max = Math.max(...rows.map((r) => r.v), 0)
   if (rows.length === 0 || max <= 0) return <div className="py-6 text-center text-[12px] text-nd-faint">{empty}</div>
   return (
     <ul className="space-y-2.5">
-      {rows.map((r) => (
-        <li key={r.label} title={`${r.label}: ${fmt(r.v)}`}>
-          <div className="mb-1 flex items-baseline justify-between gap-3 text-[12.5px]">
-            <span className={`truncate text-nd-fg-3 ${mono ? 'mono' : ''}`}>
-              {r.label}
-              {r.sub && <span className="ml-2 text-[11px] text-nd-faint">{r.sub}</span>}
-            </span>
-            <span className="mono shrink-0 tabular-nums text-nd-fg-2">{fmt(r.v)}</span>
-          </div>
-          <div className="h-1.5 rounded-full bg-nd-track">
-            <div className="h-full rounded-full" style={{ width: `${Math.max(1.5, (r.v / max) * 100)}%`, background: color }} />
-          </div>
-        </li>
-      ))}
+      {rows.map((r, i) => {
+        const body = (
+          <>
+            <div className="mb-1 flex items-baseline justify-between gap-3 text-[12.5px]">
+              <span className={`truncate ${i === active ? 'font-semibold text-nd-fg' : 'text-nd-fg-3'} ${mono ? 'mono' : ''}`}>
+                {r.label}
+                {r.sub && <span className="ml-2 text-[11px] font-normal text-nd-faint">{r.sub}</span>}
+              </span>
+              <span className="mono shrink-0 tabular-nums text-nd-fg-2">{fmt(r.v)}</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-nd-track">
+              <div className="h-full rounded-full" style={{ width: `${Math.max(1.5, (r.v / max) * 100)}%`, background: color, opacity: active >= 0 && i !== active ? 0.45 : 1 }} />
+            </div>
+          </>
+        )
+        return (
+          <li key={r.label} title={`${r.label}: ${fmt(r.v)}`}>
+            {onSelect ? (
+              <button type="button" onClick={() => onSelect(i)} aria-pressed={i === active}
+                className={`-mx-2 block w-[calc(100%+1rem)] rounded-lg px-2 py-1 text-left transition-colors hover:bg-nd-fill ${i === active ? 'bg-nd-fill' : ''}`}>
+                {body}
+              </button>
+            ) : body}
+          </li>
+        )
+      })}
     </ul>
   )
 }

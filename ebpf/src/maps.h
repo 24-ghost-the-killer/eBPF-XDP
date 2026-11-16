@@ -298,4 +298,44 @@ struct {
 	__type(value, struct xs_l2_trust);
 } xs_untrusted_l2 SEC(".maps");
 
+/* ---- IPv6 service allowlist (twin of xs_protected_v4 / xs_service_v4) ---- */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct xs_in6);     /* protected destination IPv6 (/128) */
+	__type(value, __u8);            /* presence marker */
+} xs_protected_v6 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct xs_service_key6);
+	__type(value, __u8);            /* presence marker */
+} xs_service_v6 SEC(".maps");
+
+/* ---- Scan detection (XS_CFG_SCAN_BLOCK) ---- */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1 << 14);
+	__type(key, __be32);            /* source IPv4 */
+	__type(value, struct xs_scan);
+} xs_scan_v4 SEC(".maps");
+
+/* ---- SYN authentication (XS_CFG_SYN_AUTH) ---- */
+/* First SYN seen per {5-tuple, sequence number}: value = when (ns). */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1 << 16);
+	__type(key, __u64);
+	__type(value, __u64);
+} xs_synauth_pend SEC(".maps");
+
+/* Verified sources (IPv4 address, or IPv6 /64): value = trusted until (ns). */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1 << 16);
+	__type(key, __u64);
+	__type(value, __u64);
+} xs_synauth_ok SEC(".maps");
+
 #endif /* XS_MAPS_H */

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requirePerm } from '@/lib/api-auth'
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
 import { geoInit, geoReady, withGeo, summariseSources, type SourceGeo } from '@/lib/geo'
+import { readMarks } from '@/lib/marks'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -39,7 +40,9 @@ const SETTLED_S = 600 // an episode that ended this long ago is final
 // The version is kept PER archived attack: an older entry is recomputed while
 // Prometheus still has its data, and kept as it is (marked) once it does not.
 // 4: + 'ARP storm' vector (in-retention episodes are re-analysed once)
-const CACHE_SCHEMA = 4
+// 5: + `mitigation` (what the defences did, for "why wasn't this blocked?") and
+//    dropped bytes per source country
+const CACHE_SCHEMA = 5
 
 // Since the 27 Oct 2026 dataplane (xdp_main.c, "Sample the per-IP attribution
 // maps"), victims/attackers are credited on 1 drop in 16 to keep a spoofed
@@ -219,6 +222,8 @@ const VECTORS: [string, string][] = [
   ['Malformed', 'xs_parse_outcome_packets_total{class="malformed"}'],
   // non-IP: an L2 loop / broadcast storm (the 10 Nov episode read as 'UDP reflection')
   ['ARP storm', 'xs_l3_packets_total{proto="arp"}'],
+  // scan detection (15 Nov): packets dropped from sources caught scanning
+  ['Port scan', 'xs_scan_packets_total{event="drop"}'],
 ]
 
 
@@ -391,6 +396,7 @@ async function analyse(ep: Ep): Promise<Built> {
 
   const dropPkts = num(dropped)
   const totP = num(totPkts)
+  const mitigation = await mitigationOf(ep, sub, win, at, primaryIface)
 
   const built: Built = {
     start: ep.start * 1000,
@@ -414,9 +420,65 @@ async function analyse(ep: Ep): Promise<Built> {
     victims,
     sample: who.sample,
     ...(sourceGeo ? { sourceGeo } : {}),
+    ...(mitigation ? { mitigation } : {}),
     v: CACHE_SCHEMA,
   }
   return built
+}
+
+// What the defences did during an attack: whether auto-mitigation was armed or
+// switched off, the strongest per-source cap, packets the rate limiter dropped,
+// defences switched on for the attack (vs already on before it), the mitigation
+// ladder over time, and the target interface's peak rate (to compare with the
+// cap). Best effort: an attack is still listed if this fails.
+const FLAG_ORDER = ['drop_syn', 'drop_ack', 'drop_udp', 'drop_udp_strict', 'drop_udp_dns', 'drop_icmp', 'drop_fragments', 'drop_untracked',
+  'drop_ipv6_ext', 'ratelimit', 'global_rl', 'lockdown', 'auto_lockdown', 'drop_spoofed', 'drop_malformed', 'drop_bad_tcp_flags', 'conntrack', 'check_allow', 'service_allow']
+async function mitigationOf(ep: Ep, sub: string, win: string, at: number, iface: string | null) {
+  try {
+    const before = ep.start - PAD - 30
+    const span = ep.end - ep.start + 90
+    const step = Math.max(5, Math.ceil(span / 1500))
+    const [on, off, cap, rl, autoLock, during, prior, ladder, peak, untracked] = await Promise.all([
+      instant(`max_over_time((max(xs_mitigation_active))${sub}) or vector(0)`, at),
+      instant(`max_over_time((max(xs_mitigation_disarmed))${sub}) or vector(0)`, at),
+      instant(`min_over_time((min(xs_mitigation_rate_pps > 0))${sub})`, at),
+      instant(`sum(increase(xs_policy_event_packets_total{event="rate_limited"}${win})) or vector(0)`, at),
+      instant(`max_over_time((max(xs_auto_lockdown_active))${sub}) or vector(0)`, at),
+      instant(`max by(flag)(max_over_time(xs_config_flag${win}))`, at),
+      instant(`max by(flag)(xs_config_flag)`, before),
+      range(`max(xs_risk_level)`, ep.start - 30, ep.end + 60, step),
+      instant(`max_over_time((sum by(iface)(rate(xs_rx_packets_total[30s])))${sub})`, at),
+      // TCP packets matching no tracked connection (what "drop untracked" can drop)
+      instant(`sum(increase(xs_conntrack_packets_total{event="untracked"}${win})) or vector(0)`, at),
+    ])
+    const flagsOn = (v: Vec) => new Set(v.filter((r) => parseFloat(r.value[1]) > 0).map((r) => r.metric.flag))
+    const was = flagsOn(prior)
+    const now = flagsOn(during)
+    const order = (xs: string[]) => xs.sort((a, b) => (FLAG_ORDER.indexOf(a) + 99) % 99 - (FLAG_ORDER.indexOf(b) + 99) % 99)
+    // ladder: only the points where the level changes, as [seconds from start, level]
+    const steps: [number, number][] = []
+    for (const [t, v] of ladder[0]?.values ?? []) {
+      const lv = Math.round(parseFloat(v))
+      if (!steps.length || steps[steps.length - 1][1] !== lv) steps.push([Math.round(+t - ep.start), lv])
+    }
+    const firstLimit = steps.find(([, lv]) => lv >= 3)
+    const peakBy = new Map(peak.map((r) => [r.metric.iface, parseFloat(r.value[1])]))
+    return {
+      active: num(on) > 0,
+      disarmed: num(off) > 0,
+      rateCap: cap[0] ? Math.round(parseFloat(cap[0].value[1])) : 0,
+      rateLimited: Math.round(num(rl)),
+      autoLockdown: num(autoLock) > 0,
+      armed: order([...now].filter((f) => !was.has(f))),
+      baseline: order([...was]),
+      ladder: steps.slice(0, 200),
+      limitAfterSec: firstLimit ? Math.max(0, firstLimit[0]) : null,
+      targetPeakPps: iface ? Math.round(peakBy.get(iface) ?? 0) : 0,
+      untracked: Math.round(num(untracked)),
+    }
+  } catch {
+    return null
+  }
 }
 
 // An archived breakdown from an older build is recomputed while Prometheus still
@@ -489,7 +551,29 @@ async function allParties(ep: Ep) {
   return p
 }
 
-const withId = (b: Built) => ({ ...b, id: Math.floor(b.start / 1000) }) // stable: start time in seconds
+// Dropped bytes per source country. Attacks analysed before that was recorded
+// only have packets per country: estimate bytes from the attack's own bytes per
+// packet over its recorded sources, and flag the figure as an estimate.
+type GeoC = { key: string; label: string; cc?: string; packets: number; sources: number; bytes?: number; bytesEstimated?: boolean }
+function geoWithBytes(b: Built): GeoC[] {
+  const sg = b.sourceGeo as { countries?: GeoC[] } | undefined
+  const cs = sg?.countries ?? []
+  if (cs.every((c) => typeof c.bytes === 'number')) return cs
+  let pk = 0, by = 0
+  for (const a of b.attackers as { packets?: number; bytes?: number }[]) {
+    if ((a.bytes ?? 0) > 0 && (a.packets ?? 0) > 0) { pk += a.packets!; by += a.bytes! }
+  }
+  const per = pk ? by / pk : 0
+  return cs.map((c) => (typeof c.bytes === 'number' || !per ? c : { ...c, bytes: Math.round(c.packets * per), bytesEstimated: true }))
+}
+const withGeoBytes = (b: Built): Built => (b.sourceGeo ? { ...b, sourceGeo: { ...(b.sourceGeo as object), countries: geoWithBytes(b) } } : b)
+// stable id = start time in seconds; `mark` = a false-alarm mark, if any
+const withId = (b: Built) => {
+  const id = Math.floor(b.start / 1000)
+  const mark = readMarks()[String(id)]
+  return { ...withGeoBytes(b), id, ...(mark ? { mark } : {}) }
+}
+const isMarked = (startSec: number, marks: Record<string, unknown>) => !!marks[String(Math.floor(startSec))]
 const vectorsOf = (b: Built) => (b.vectors.length ? b.vectors : [((b.classifier as { label?: string } | null)?.label) ?? 'unknown'])
 const SORTS = new Set(['start', 'durationSec', 'peakBps', 'peakPps', 'droppedPackets', 'dropShare'])
 
@@ -522,42 +606,73 @@ export async function GET(req: NextRequest) {
     const to = Number(sp.get('to')) || Infinity
     const vector = sp.get('vector') || ''
     const ip = (sp.get('ip') || '').trim()
+    const country = (sp.get('country') || '').trim().toUpperCase().slice(0, 2)
     const sort = SORTS.has(sp.get('sort') || '') ? (sp.get('sort') as string) : 'start'
     const desc = sp.get('desc') !== '0'
     const analysedOnly = sp.get('analysedOnly') === '1'
+    // false alarms: 'hide' = real attacks only, 'only' = just the marked ones
+    const markedFilter = sp.get('marked') || ''
+    const marks = readMarks()
 
-    const inWindow = all.filter((e) => e.end >= from && e.start <= to)
-    // Summary over everything in the window: counts/time from the list,
-    // traffic numbers from the attacks analysed so far.
-    const builtAll = inWindow.map(known).filter((b): b is Built => !!b)
+    const timeWindow = all.filter((e) => e.end >= from && e.start <= to)
+    // Summary over the REAL attacks in the window (marked false alarms are left
+    // out): counts/time from the list, traffic numbers from the analysed ones.
+    const real = timeWindow.filter((e) => !isMarked(e.start, marks))
+    const builtAll = real.map(known).filter((b): b is Built => !!b)
+    const inWindow = markedFilter === 'hide' ? real : markedFilter === 'only' ? timeWindow.filter((e) => isMarked(e.start, marks)) : timeWindow
+    const builtList = inWindow.map(known).filter((b): b is Built => !!b)
     const num = (b: Built, k: string) => Number(b[k]) || 0
     const summary = {
-      count: inWindow.length,
-      totalDurationSec: inWindow.reduce((n, e) => n + Math.max(30, e.end - e.start), 0),
+      count: real.length,
+      falseAlarms: timeWindow.length - real.length,
+      totalDurationSec: real.reduce((n, e) => n + Math.max(30, e.end - e.start), 0),
       analysed: builtAll.length,
       peakBps: Math.max(0, ...builtAll.map((b) => num(b, 'peakBps'))),
       peakPps: Math.max(0, ...builtAll.map((b) => num(b, 'peakPps'))),
       droppedPackets: builtAll.reduce((n, b) => n + num(b, 'droppedPackets'), 0),
       avgDropShare: builtAll.length ? builtAll.reduce((n, b) => n + num(b, 'dropShare'), 0) / builtAll.length : 0,
-      medianDurationSec: (() => { const d = inWindow.map((e) => Math.max(30, e.end - e.start)).sort((x, y) => x - y); return d.length ? d[Math.floor(d.length / 2)] : 0 })(),
-      vectors: [...new Set(builtAll.flatMap(vectorsOf))].sort(),
-      oldest: inWindow.length ? inWindow[inWindow.length - 1].start * 1000 : null,
-      newest: inWindow.length ? inWindow[0].end * 1000 : null,
+      medianDurationSec: (() => { const d = real.map((e) => Math.max(30, e.end - e.start)).sort((x, y) => x - y); return d.length ? d[Math.floor(d.length / 2)] : 0 })(),
+      vectors: [...new Set(builtList.flatMap(vectorsOf))].sort(),
+      oldest: timeWindow.length ? timeWindow[timeWindow.length - 1].start * 1000 : null,
+      newest: timeWindow.length ? timeWindow[0].end * 1000 : null,
       archived: ARCHIVE.size,
+      // Source countries over every analysed attack in the window (for the
+      // origins globe): each attack's top countries, summed by country code.
+      countries: (() => {
+        type C = { key: string; label: string; cc?: string; packets: number; sources: number; bytes: number; bytesPartial: boolean; bytesEstimated: boolean; attacks: number; last: number }
+        const by = new Map<string, C>()
+        for (const b of builtAll) {
+          for (const c of geoWithBytes(b)) {
+            const e = by.get(c.key) ?? { key: c.key, label: c.label, cc: c.cc, packets: 0, sources: 0, bytes: 0, bytesPartial: false, bytesEstimated: false, attacks: 0, last: 0 }
+            e.packets += Number(c.packets) || 0
+            e.sources += Number(c.sources) || 0
+            if (typeof c.bytes === 'number') e.bytes += c.bytes
+            else e.bytesPartial = true // no byte count at all for that attack
+            if (c.bytesEstimated) e.bytesEstimated = true
+            e.attacks += 1
+            e.last = Math.max(e.last, Number(b.end) || 0)
+            by.set(c.key, e)
+          }
+        }
+        return [...by.values()].sort((x, y) => y.packets - x.packets).slice(0, 40)
+      })(),
     }
 
     // Filters / sorts that need the breakdown run over analysed attacks; the
     // rest are counted as `pending` (the background catch-up fills them in).
-    const needsBreakdown = !!vector || !!ip || sort !== 'start' || analysedOnly
+    const needsBreakdown = !!vector || !!ip || !!country || sort !== 'start' || analysedOnly
     if (needsBreakdown) {
-      let rows = builtAll
+      let rows = builtList
       if (vector) rows = rows.filter((b) => vectorsOf(b).includes(vector))
       if (ip) rows = rows.filter((b) => b.attackers.some((x) => x.ip.includes(ip)) || b.victims.some((x) => x.ip.includes(ip)))
+      // attacks with at least one source in that country (the globe's "show these attacks")
+      if (country) rows = rows.filter((b) => ((b.sourceGeo as { countries?: { cc?: string }[] } | undefined)?.countries ?? []).some((c) => c.cc === country)
+        || (b.attackers as { cc?: string }[]).some((x) => x.cc === country))
       rows = [...rows].sort((x, y) => (desc ? num(y, sort) - num(x, sort) : num(x, sort) - num(y, sort)))
       void backfill(all)
       return NextResponse.json({
         status: 'success', retentionDays, total: rows.length, offset, limit,
-        attacks: rows.slice(offset, offset + limit).map(withId), pending: inWindow.length - builtAll.length, summary,
+        attacks: rows.slice(offset, offset + limit).map(withId), pending: inWindow.length - builtList.length, summary,
       })
     }
 

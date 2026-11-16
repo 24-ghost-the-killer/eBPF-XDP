@@ -225,6 +225,7 @@ struct xs_pkt {
 	__u8   anomalies;     /* enum xs_anomaly */
 	__u8   l4_parsed;     /* 1 if the transport header was read */
 	__u8   _pad;
+	__be32 tcp_seq;       /* TCP sequence number (SYN authentication) */
 };
 
 /* ---- helpers ---- */
@@ -466,6 +467,7 @@ static __always_inline int xs_parse_l4(void **pos, void *data_end, struct xs_pkt
 		p->sport = th->source;
 		p->dport = th->dest;
 		p->tcp_flags = th->flags;
+		p->tcp_seq = th->seq;
 		if (xs_tcp_flags_bad(th->flags))
 			p->anomalies |= XS_ANOM_TCP_BAD_FLAGS;
 		if (th->source == 0 || th->dest == 0)

@@ -42,6 +42,8 @@ export const PAGES: PageDef[] = [
   { id: 'ai', label: 'AI security', path: '/analytics/ai', hint: 'risk engine and automated defenses' },
   { id: 'protect', label: 'Protection', path: '/analytics/protect', hint: 'view protected hosts, reports and logs' },
   { id: 'ip', label: 'IP lookup', path: '/analytics/ip', hint: 'investigate one address' },
+  { id: 'devices', label: 'Devices', path: '/analytics/devices', hint: 'every device seen on the network, named or flagged as new' },
+  { id: 'health', label: 'Dataplane health', path: '/analytics/health', hint: 'which firewall program each interface runs, and whether it is stale' },
   { id: 'query', label: 'Query console', path: '/analytics/query', hint: 'run raw PromQL against Prometheus' },
   { id: 'users', label: 'Users & groups', path: '/analytics/users', hint: 'manage accounts and permissions (admin)' },
   { id: 'audit', label: 'Audit log', path: '/analytics/audit', hint: 'every action taken on the dashboard — who, what, when' },
@@ -61,6 +63,8 @@ export const ACTIONS: ActionDef[] = [
   { id: 'protect.notes', page: 'protect', label: 'Edit nicknames & log', hint: 'rename hosts and add dated log entries' },
   { id: 'protect.reports', page: 'protect', label: 'Write reports', hint: 'create and edit setup, incident, maintenance and audit reports' },
   { id: 'protect.delete', page: 'protect', label: 'Delete reports & log entries', hint: 'permanently remove reports and log entries', danger: true },
+  { id: 'attacks.mark', page: 'attacks', label: 'Mark false alarms', hint: 'mark an attack as not an attack (it then leaves the totals)' },
+  { id: 'devices.edit', page: 'devices', label: 'Name & trust devices', hint: 'name devices, mark them known, forget old ones' },
 ]
 export const ACTION_IDS = ACTIONS.map((a) => a.id)
 export const PERM_IDS = [...PAGE_IDS, ...ACTION_IDS]
@@ -71,9 +75,9 @@ export const actionsOf = (page: string) => ACTIONS.filter((a) => a.page === page
 
 // Pages grouped for the permission editor.
 export const AREAS: { id: string; label: string; pages: string[] }[] = [
-  { id: 'monitor', label: 'Monitoring', pages: ['overview', 'explore', 'attacks', 'ai', 'ip'] },
+  { id: 'monitor', label: 'Monitoring', pages: ['overview', 'explore', 'attacks', 'ai', 'ip', 'devices'] },
   { id: 'protect', label: 'Protection', pages: ['protect'] },
-  { id: 'tools', label: 'Tools', pages: ['query'] },
+  { id: 'tools', label: 'Tools', pages: ['query', 'health'] },
   { id: 'admin', label: 'Administration', pages: ['users', 'audit'] },
 ]
 
@@ -85,7 +89,7 @@ export function effectivePerms(perms: unknown): string[] {
 }
 
 // One-click starting points in the group editor.
-const MONITOR = ['overview', 'explore', 'attacks', 'ai', 'ip']
+const MONITOR = ['overview', 'explore', 'attacks', 'ai', 'ip', 'devices', 'health']
 export const PRESETS: { id: string; label: string; hint: string; perms: string[] }[] = [
   { id: 'viewer', label: 'Viewer', hint: 'all dashboards and Protection, read-only', perms: [...MONITOR, 'protect'] },
   { id: 'operator', label: 'Operator', hint: 'viewer + manage protection, notes and reports', perms: [...MONITOR, 'protect', 'query', ...ACTION_IDS] },
@@ -99,6 +103,8 @@ const EXTRA_ROUTES: Array<[string, string]> = [
   ['/api/protect-plan', 'protect'], // read/write the protection plan
   ['/api/protect-meta', 'protect'], // per-host nickname / reports / log
   ['/api/lockdown', 'protect'], // read/write the lockdown kill-switch
+  ['/api/devices', 'devices'], // device list (edits need devices.edit)
+  ['/api/health', 'health'], // dataplane health
   ['/analytics/groups', 'users'], // groups is its own page, still an admin surface
   ['/api/users', 'users'],
   ['/api/groups', 'users'],

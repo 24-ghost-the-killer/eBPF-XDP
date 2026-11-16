@@ -81,25 +81,25 @@ export function withGeo<T extends { ip: string }>(p: T): T & GeoInfo {
 }
 
 // ---- aggregates for an attack: top source countries / networks --------------
-export interface GeoCount { key: string; label: string; packets: number; sources: number; cc?: string; asn?: number }
+export interface GeoCount { key: string; label: string; packets: number; sources: number; cc?: string; asn?: number; bytes?: number }
 export interface SourceGeo { countries: GeoCount[]; asns: GeoCount[]; located: number; unlocated: number }
 
 // Roll a full attacker list up into the top countries and top ASNs, weighted by
 // dropped packets, with how many distinct sources each represents.
-export function summariseSources(attackers: { ip: string; packets: number }[], top = 8): SourceGeo {
+export function summariseSources(attackers: { ip: string; packets: number; bytes?: number }[], top = 8): SourceGeo {
   const byCc = new Map<string, GeoCount>()
   const byAsn = new Map<string, GeoCount>()
   let located = 0, unlocated = 0
   for (const a of attackers) {
     const g = geoLookup(a.ip)
     if (g?.cc) {
-      const e = byCc.get(g.cc) ?? { key: g.cc, label: g.country || g.cc, cc: g.cc, packets: 0, sources: 0 }
-      e.packets += a.packets; e.sources += 1; byCc.set(g.cc, e)
+      const e = byCc.get(g.cc) ?? { key: g.cc, label: g.country || g.cc, cc: g.cc, packets: 0, sources: 0, bytes: 0 }
+      e.packets += a.packets; e.sources += 1; e.bytes! += a.bytes ?? 0; byCc.set(g.cc, e)
     }
     if (g?.asn) {
       const k = String(g.asn)
-      const e = byAsn.get(k) ?? { key: k, label: g.org || `AS${g.asn}`, asn: g.asn, packets: 0, sources: 0 }
-      e.packets += a.packets; e.sources += 1; byAsn.set(k, e)
+      const e = byAsn.get(k) ?? { key: k, label: g.org || `AS${g.asn}`, asn: g.asn, packets: 0, sources: 0, bytes: 0 }
+      e.packets += a.packets; e.sources += 1; e.bytes! += a.bytes ?? 0; byAsn.set(k, e)
     }
     if (g?.cc || g?.asn) located += 1; else unlocated += 1
   }

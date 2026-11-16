@@ -45,7 +45,9 @@ pub fn save(iface: &str, cfg: &Config) -> io::Result<()> {
         | ConfigFlags::SERVICE_ALLOW.bits()
         | ConfigFlags::GLOBAL_RL.bits()
         | ConfigFlags::DROP_UNTRACKED.bits()
-        | ConfigFlags::DROP_UDP_STRICT.bits();
+        | ConfigFlags::DROP_UDP_STRICT.bits()
+        | ConfigFlags::SYN_AUTH.bits()
+        | ConfigFlags::SCAN_BLOCK.bits();
     c.flags = ConfigFlags::from_bits_retain(c.flags.bits() & !managed);
     // The aggregate-limiter params belong to GLOBAL_RL; drop them with the flag.
     c.global_rl_interval_ns = 0;

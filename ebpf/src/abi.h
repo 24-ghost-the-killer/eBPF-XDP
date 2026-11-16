@@ -50,6 +50,10 @@ enum xs_counter_id {
 	XS_CNT_CT_UNTRACKED           = 14, /* TCP packets matching no tracked flow (ACK/RST flood) */
 	XS_CNT_SERVICE_DENY           = 15, /* dropped by the service allowlist (default-deny on a protected dst) */
 	XS_CNT_ARP_RATE_LIMITED       = 56, /* ARP frames dropped by the always-on ARP storm cap */
+	XS_CNT_SCAN_DETECTED          = 57, /* sources newly flagged as port/host scanners */
+	XS_CNT_SCAN_DROP              = 58, /* packets dropped because their source is a blocked scanner */
+	XS_CNT_SYNAUTH_DROP           = 59, /* first SYNs held back by SYN authentication (client must retransmit) */
+	XS_CNT_SYNAUTH_PASS           = 60, /* sources that proved themselves with a retransmitted SYN */
 
 	/* L2 */
 	XS_CNT_L2_VLAN1               = 8,  /* exactly one 802.1Q/802.1ad tag */
@@ -222,6 +226,31 @@ enum xs_config_flags {
 	 * passing most packets) and lifts it when the flood subsides.
 	 */
 	XS_CFG_AUTO_LOCKDOWN      = 1u << 22,
+
+	/*
+	 * Scan detection (agent-managed, on at every risk level). Counts, per IPv4
+	 * source, the distinct internal {destination, port} pairs it probes (TCP SYN
+	 * without ACK, or UDP to a service port) in a window; a source that reaches
+	 * xs_config.scan_threshold is blocked from internal destinations for
+	 * scan_block_s. Applies to allowlist-exempt LAN sources too (a LAN laptop
+	 * scanning the network is the realistic case) except FULL trust, and never to
+	 * traffic aimed at xs_config.lifeline_v4 (the box itself), so the operator
+	 * can never lose SSH/dashboard to it. Internet-bound traffic is untouched.
+	 */
+	XS_CFG_SCAN_BLOCK         = 1u << 23,
+
+	/*
+	 * SYN authentication (agent-managed, armed under a SYN flood instead of the
+	 * blunt DROP_SYN). The first SYN of a connection from a not-yet-verified,
+	 * non-exempt source is dropped; every real TCP stack retransmits the same
+	 * SYN (same 4-tuple and sequence number) about a second later, and that
+	 * retransmission verifies the source for 10 minutes. A spoofed flood never
+	 * retransmits, so it is shed while real clients connect with one extra
+	 * round of delay. (True SYN cookies would need the box to answer SYN-ACKs
+	 * for the hosts behind it and rewrite every packet's sequence numbers --
+	 * not workable on a bridge.)
+	 */
+	XS_CFG_SYN_AUTH           = 1u << 24,
 };
 #define XS_CFG_KNOWN_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
 			    XS_CFG_DROP_FRAGMENTS | XS_CFG_DROP_UDP_DNS | XS_CFG_DROP_UDP | \
@@ -230,7 +259,7 @@ enum xs_config_flags {
 			    XS_CFG_DROP_ICMP | XS_CFG_DROP_SYN | XS_CFG_DROP_ACK | XS_CFG_DROP_UDP_STRICT | \
 			    XS_CFG_CONNTRACK | XS_CFG_DROP_UNTRACKED | XS_CFG_DROP_IPV6_EXT | \
 			    XS_CFG_SERVICE_ALLOW | XS_CFG_LOCKDOWN | XS_CFG_DROP_SPOOFED | \
-			    XS_CFG_AUTO_LOCKDOWN)
+			    XS_CFG_AUTO_LOCKDOWN | XS_CFG_SCAN_BLOCK | XS_CFG_SYN_AUTH)
 /* Flags an operator sets directly (sentinelctl config); CHECK_* are managed
  * automatically by the block/allow commands as the maps gain or lose entries. */
 #define XS_CFG_OPERATOR_FLAGS (XS_CFG_DROP_MALFORMED | XS_CFG_DROP_BAD_TCP_FLAGS | \
@@ -267,8 +296,31 @@ struct xs_config {
 	__u32 sample_shift;    /* Phase 5: sample 1-in-2^sample_shift packets (0 = every packet) */
 	__u32 global_rl_interval_ns; /* aggregate limiter: ns/packet = 1e9/global_pps; 0 = unset */
 	__u32 global_rl_burst;       /* aggregate limiter: bucket depth in packets */
-	__u64 reserved[4];
+	__u32 scan_threshold;  /* distinct internal targets per window that mark a scanner; 0 = 64 */
+	__u32 scan_window_ms;  /* scan counting window; 0 = 10000 */
+	__u32 scan_block_s;    /* how long a scanner stays blocked; 0 = 600 */
+	__be32 lifeline_v4;    /* never scan-block traffic TO this address (the box itself); 0 = none */
+	__u64 reserved[2];
 };
+#define XS_SCAN_DEFAULT_THRESHOLD 64u
+#define XS_SCAN_DEFAULT_WINDOW_MS 10000u
+#define XS_SCAN_DEFAULT_BLOCK_S   600u
+
+/* Per-source scan state (value of xs_scan_v4): 88 bytes. `bits` is a 512-bit
+ * set of hashed {destination, port} targets seen in the current window. */
+struct xs_scan {
+	__u64 window_ns;        /* start of the current counting window */
+	__u64 blocked_until_ns; /* blocked from internal destinations until then; 0 = not */
+	__u32 count;            /* distinct targets in this window */
+	__u32 _pad;
+	__u64 bits[8];
+};
+
+/* SYN authentication timing: a retransmitted SYN counts if it comes between
+ * these two ages of the first one; a verified source stays verified this long. */
+#define XS_SYNAUTH_MIN_NS    200000000ULL    /* 0.2 s */
+#define XS_SYNAUTH_MAX_NS    30000000000ULL  /* 30 s */
+#define XS_SYNAUTH_TRUST_NS  600000000000ULL /* 10 min */
 
 /* ---- Phase 5: flow aggregation (HLL, dport histogram, sampling) ---- */
 
@@ -347,6 +399,17 @@ struct xs_service_key {
 	__be16 dport;  /* destination port, network order (0 = none) */
 	__u8   proto;  /* IP protocol (6 TCP, 17 UDP, 1 ICMP, ...) */
 	__u8   _pad;   /* must be zero */
+};
+
+/*
+ * Key of xs_service_v6: the IPv6 twin of xs_service_key (destination /128).
+ * Fixed 20-byte layout, no implicit padding.
+ */
+struct xs_service_key6 {
+	__u8   daddr[16]; /* destination IPv6, network order */
+	__be16 dport;     /* destination port, network order (0 = none) */
+	__u8   proto;     /* next header after extension headers */
+	__u8   _pad;      /* must be zero */
 };
 
 /* ---- Phase 2: per-source policies and allowlist ---- */
@@ -440,6 +503,8 @@ _Static_assert(sizeof(struct xs_policy) == 32, "xs_policy ABI");
 _Static_assert(sizeof(struct xs_allow) == 16, "xs_allow ABI");
 _Static_assert(sizeof(struct xs_lpm_v4) == 8, "xs_lpm_v4 ABI");
 _Static_assert(sizeof(struct xs_lpm_v6) == 20, "xs_lpm_v6 ABI");
+_Static_assert(sizeof(struct xs_scan) == 88, "xs_scan ABI");
+_Static_assert(sizeof(struct xs_service_key6) == 20, "xs_service_key6 ABI");
 
 _Static_assert(XS_CNT_PARSE_BASE + XS_PARSE_RC_MAX <= XS_CNT_SLOTS, "counter slots");
 #endif

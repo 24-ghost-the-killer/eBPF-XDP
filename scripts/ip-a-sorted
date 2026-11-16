@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""`ip a`, grouped by what each interface is used for.
+
+    ip-a-sorted            full `ip a` output per interface, under its group
+    ip-a-sorted -b         one line per interface (like `ip -br a`)
+    ip-a-sorted --no-color
+
+Groups: firewall, uplinks (cable + internet), remote access, containers,
+tunnels, system. Each interface gets a line saying what it does (worked out
+live from its type, bridge, default routes, the Twingate state file and the
+docker-proxy port mappings) and its traffic since boot; one that has carried
+next to nothing is marked UNUSED. Read-only, no root needed.
+"""
+import json
+import subprocess
+import sys
+
+BRIEF = "-b" in sys.argv or "--brief" in sys.argv
+COLOR = sys.stdout.isatty() and "--no-color" not in sys.argv
+TWINGATE_STATE = "/var/lib/xdp-sentinel/twingate.applied.json"
+PORT_APP = {8123: "ClickHouse", 9000: "ClickHouse", 3000: "Grafana", 9090: "Prometheus",
+            5432: "PostgreSQL", 6379: "Redis", 80: "a web server", 443: "a web server"}
+GROUPS = [
+    ("firewall", "Firewall", "the box's main job: all traffic between the router and your LAN crosses these"),
+    ("uplink", "Uplinks", "the cable to the switch and the box's own internet"),
+    ("remote", "Remote access", "Twingate"),
+    ("containers", "Containers", "Docker networks of services running on the box"),
+    ("tunnels", "Tunnels", ""),
+    ("system", "System", ""),
+]
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+def run(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def jrun(*args):
+    try:
+        return json.loads(run(*args) or "[]")
+    except ValueError:
+        return []
+
+
+def human(n):
+    for unit in ("", "k", "M", "G", "T"):
+        if abs(n) < 1000:
+            return f"{n:.0f}{unit}" if unit == "" else f"{n:.1f}{unit}"
+        n /= 1000
+    return f"{n:.1f}P"
+
+
+def ipnum(ip):
+    a = [int(x) for x in ip.split(".")]
+    return (a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]
+
+
+links = jrun("ip", "-j", "-d", "-s", "link", "show")
+addrs = {a["ifname"]: a.get("addr_info", []) for a in jrun("ip", "-j", "addr", "show")}
+defaults = sorted(({"dev": r.get("dev"), "metric": r.get("metric", 0)} for r in jrun("ip", "-j", "route", "show", "default")),
+                  key=lambda r: r["metric"])
+try:
+    twingate_veth = json.load(open(TWINGATE_STATE)).get("veth")
+except Exception:
+    twingate_veth = None
+
+# docker-proxy: which container IP serves which port -> which Docker network runs what
+apps = {}
+for line in run("ps", "-eo", "args").splitlines():
+    if "docker-proxy" not in line or "-container-ip" not in line:
+        continue
+    parts = line.split()
+    try:
+        cip = parts[parts.index("-container-ip") + 1]
+        cport = int(parts[parts.index("-container-port") + 1])
+    except (ValueError, IndexError):
+        continue
+    for ifname, infos in addrs.items():
+        for i in infos:
+            if i.get("family") != "inet":
+                continue
+            mask = (0xFFFFFFFF << (32 - i["prefixlen"])) & 0xFFFFFFFF
+            if ipnum(i["local"]) & mask == ipnum(cip) & mask:
+                apps.setdefault(ifname, [])
+                name = PORT_APP.get(cport, f"port {cport}")
+                if name not in apps[ifname]:
+                    apps[ifname].append(name)
+
+
+def global_addrs(n):
+    return [f"{a['local']}/{a['prefixlen']}" for a in addrs.get(n, []) if a.get("scope") != "link"]
+
+
+def classify(l):
+    n = l["ifname"]
+    info = l.get("linkinfo", {})
+    kind = info.get("info_kind") or ("loopback" if n == "lo" else "physical")
+    xdp = (l.get("xdp") or {}).get("prog", {}).get("id")
+    fw = f", firewall program #{xdp}" if xdp else ""
+    if n == "lo":
+        extra = [a for a in global_addrs(n) if not a.startswith(("127.", "::1"))]
+        return "system", "Loopback: the box's own services talk to each other here" + (f" (also holds {', '.join(extra)})" if extra else "")
+    if kind in ("ipip", "gre", "gretap", "sit", "ip6tnl", "wireguard", "vxlan", "tun"):
+        if n == "tunl0":
+            return "tunnels", "Made automatically by the kernel's IPIP module; nobody configured it"
+        if n == "sentinel0":
+            return "tunnels", "Sentinel-Edge test tunnel (IPIP) for 198.51.100.2 (~/sentinal-tunnel-1.sh)"
+        return "tunnels", f"{kind.upper()} tunnel"
+    if kind == "vlan":
+        vid = info.get("info_data", {}).get("id")
+        side = {"vlan10": "WAN side, towards the router", "vlan20": "LAN side, your devices"}.get(n, f"VLAN {vid}")
+        return "firewall", f"{side}: VLAN {vid} on {l.get('link', 'the trunk')}, port of {l.get('master', '-')}{fw}"
+    if n == twingate_veth:
+        return "remote", f"Link of the Twingate connector container{fw}"
+    if kind == "bridge" and n == "docker0" and twingate_veth:
+        return "remote", "Docker's default network, where the Twingate connector runs"
+    if kind == "bridge" and not n.startswith(("docker", "br-")):
+        return "firewall", "Bridge joining the two VLANs (router <-> LAN); also the box's own LAN address (SSH, dashboard)"
+    if kind in ("bridge", "veth"):
+        net = n if kind == "bridge" else l.get("master", "")
+        what = ", ".join(apps.get(net, [])) or "a container"
+        return "containers", f"Docker network for {what}" if kind == "bridge" else f"A container's link into {net} ({what})"
+    if kind == "physical":
+        if n.startswith("wl"):
+            mine = [d for d in defaults if d["dev"] == n]
+            if mine and defaults and defaults[0]["dev"] == n:
+                return "uplink", "WiFi: the box's own internet (preferred default route)"
+            return "uplink", "WiFi" + (" (backup internet route)" if mine else "")
+        own = "" if global_addrs(n) else " (no address of its own)"
+        return "uplink", f"Network cable to the switch{own}: carries the VLANs"
+    return "system", kind
+
+
+rows = []
+for l in links:
+    group, role = classify(l)
+    st = l.get("stats64", {})
+    rx, tx = st.get("rx", {}).get("packets", 0), st.get("tx", {}).get("packets", 0)
+    rows.append({"l": l, "group": group, "role": role, "rx": rx, "tx": tx,
+                 "unused": l["ifname"] != "lo" and rx + tx < 50})
+
+order = [g[0] for g in GROUPS]
+rows.sort(key=lambda r: (order.index(r["group"]), r["l"]["ifname"]))
+
+for key, title, about in GROUPS:
+    members = [r for r in rows if r["group"] == key]
+    if not members:
+        continue
+    print(c("1;36", f"== {title}") + (c("2", f"  ({about})") if about else ""))
+    for r in members:
+        n = r["l"]["ifname"]
+        traffic = f"rx {human(r['rx'])} / tx {human(r['tx'])} packets since boot"
+        tag = c("1;31", "  UNUSED") if r["unused"] else ""
+        if BRIEF:
+            state = r["l"].get("operstate", "?")
+            print(f"  {n:<17} {state:<8} {' '.join(global_addrs(n)) or '-':<36} {traffic}{tag}")
+            print(c("2", f"  {'':<17} -> {r['role']}"))
+        else:
+            out = run("ip", "addr", "show", "dev", n).rstrip("\n")
+            first, _, rest = out.partition("\n")
+            print(first + tag)
+            print(c("33", f"    -> {r['role']}"))
+            print(c("2", f"    traffic: {traffic}"))
+            if rest:
+                print(rest)
+    print()

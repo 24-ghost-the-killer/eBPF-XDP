@@ -26,7 +26,8 @@ interface Chain { ok: boolean; entries: number; brokenAt?: { file: string; line:
 const CATS: { id: string; label: string }[] = [
   { id: 'auth', label: 'Sign-in' }, { id: 'access', label: 'Denied access' }, { id: 'users', label: 'Users' }, { id: 'groups', label: 'Groups' },
   { id: 'protect', label: 'Protection' }, { id: 'lockdown', label: 'Lockdown' }, { id: 'notes', label: 'Nicknames & log' },
-  { id: 'reports', label: 'Reports' }, { id: 'export', label: 'Exports' }, { id: 'query', label: 'Queries' }, { id: 'view', label: 'Page views' },
+  { id: 'reports', label: 'Reports' }, { id: 'attacks', label: 'False alarms' }, { id: 'devices', label: 'Devices' },
+  { id: 'export', label: 'Exports' }, { id: 'query', label: 'Queries' }, { id: 'view', label: 'Page views' },
 ]
 const RESULT_CLS: Record<string, string> = {
   ok: 'bg-st-good/10 text-st-good-fg ring-st-good/20',

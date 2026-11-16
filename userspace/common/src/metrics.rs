@@ -45,6 +45,12 @@ pub fn prom_family(name: &str) -> (&'static str, Option<(&'static str, &str)>) {
         "service_deny" => ("service", Some(("event", "deny"))),
         // ARP storm cap (L2 loop / broadcast storm): ARP frames dropped.
         "arp_rate_limited" => ("arp", Some(("event", "rate_limited"))),
+        // Scan detection: scanners flagged, packets dropped from blocked scanners.
+        "scan_detected" => ("scan", Some(("event", "detected"))),
+        "scan_drop" => ("scan", Some(("event", "drop"))),
+        // SYN authentication: first SYNs held back, sources verified.
+        "synauth_drop" => ("synauth", Some(("event", "held"))),
+        "synauth_pass" => ("synauth", Some(("event", "verified"))),
         // Every counter has a family (enforced by a test); keep a sane
         // fallback rather than panicking in an exporter.
         _ => ("other", Some(("counter", name))),
@@ -71,6 +77,8 @@ const PROM_HELP: &[(&str, &str)] = &[
     ("conntrack", "Connection tracking: TCP packets with no matching flow (ACK/RST flood)"),
     ("service", "Service allowlist denials (default-deny on a protected destination)"),
     ("arp", "ARP storm cap (event: rate_limited = ARP frames dropped over the per-interface cap)"),
+    ("scan", "Scan detection: sources flagged as scanners (detected) and packets dropped from blocked scanners (drop)"),
+    ("synauth", "SYN authentication: first SYNs held back (held) and sources verified by retransmitting (verified)"),
     ("other", "Unmapped counters"),
 ];
 

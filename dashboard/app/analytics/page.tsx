@@ -1,4 +1,5 @@
 'use client'
+import { LivePanel } from '@/components/globe/LivePanel'
 import { useMemo } from 'react'
 import Link from 'next/link'
 import { instantAt, rangeAbs, scalar, toSeries, type RangeResult } from '@/lib/prom'
@@ -191,6 +192,7 @@ export default function Overview() {
 
   return (
     <div className="space-y-6">
+      <LivePanel hideWhenCalm />
       {q.error && !d && (
         <div className="flex items-center gap-2 rounded-xl border border-st-crit/30 bg-st-crit/[0.06] px-4 py-3 text-[13px] text-st-crit-fg">
           <AlertTriangle className="h-4 w-4" /> Can&apos;t load data: {q.error}
