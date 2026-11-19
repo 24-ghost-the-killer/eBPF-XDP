@@ -338,4 +338,88 @@ struct {
 	__type(value, __u64);
 } xs_synauth_ok SEC(".maps");
 
+/* ---- Honeypot addresses (see struct xs_honeypot) ---- */
+/* Number of honeypot addresses; 0 keeps the whole feature off (one array read per packet). */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} xs_honeypot_on SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __be32);
+	__type(value, struct xs_honeypot);
+} xs_honeypot_v4 SEC(".maps");
+
+/* ---- LAN guard (struct xs_languard) ---- */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct xs_languard);
+} xs_languard_cfg SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __be32);
+	__type(value, struct xs_arp_bind);
+} xs_arp_bind SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct xs_spoof_key);
+	__type(value, struct xs_spoof);
+} xs_arp_spoof SEC(".maps");
+
+/* approved device MACs (value unused, presence = approved) */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 2048);
+	__type(key, struct xs_mac_key);
+	__type(value, __u32);
+} xs_nac_mac SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct xs_mac_key);
+	__type(value, struct xs_nac_seen);
+} xs_nac_seen SEC(".maps");
+
+/* ---- Attack signatures (struct xs_sig_key / xs_sig_rule) ---- */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct xs_sig_key);
+	__type(value, struct xs_sig_count);
+} xs_sig_seen SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, XS_SIG_RULES);
+	__type(key, __u32);
+	__type(value, struct xs_sig_rule);
+} xs_sig_rules SEC(".maps");
+
+/* number of enabled rules; 0 skips the rule check entirely */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} xs_sig_on SEC(".maps");
+
+/* Every source that touched a honeypot address. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __be32);
+	__type(value, struct xs_honeypot_hit);
+} xs_honeypot_src SEC(".maps");
+
 #endif /* XS_MAPS_H */

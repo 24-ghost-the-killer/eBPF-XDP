@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply honeypot addresses (a reloaded XDP program starts with empty maps)
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+Unit=xdp-sentinel-honeypot.service
+
+[Install]
+WantedBy=timers.target

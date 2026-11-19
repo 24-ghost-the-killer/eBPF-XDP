@@ -3,6 +3,7 @@ import { requirePerm } from '@/lib/api-auth'
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
 import { geoInit, geoReady, withGeo, summariseSources, type SourceGeo } from '@/lib/geo'
 import { readMarks } from '@/lib/marks'
+import { simulationAt } from '@/lib/sim'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -568,12 +569,19 @@ function geoWithBytes(b: Built): GeoC[] {
 }
 const withGeoBytes = (b: Built): Built => (b.sourceGeo ? { ...b, sourceGeo: { ...(b.sourceGeo as object), countries: geoWithBytes(b) } } : b)
 // stable id = start time in seconds; `mark` = a false-alarm mark, if any
+// An attack a dashboard simulation caused carries a "simulation" mark (not
+// stored: worked out from the simulation history), so it leaves the totals.
+const simMark = (startSec: number, endSec: number) => {
+  const r = simulationAt(startSec, endSec)
+  return r ? { reason: 'simulation', note: r.label, by: r.by, at: Math.round(r.started_at * 1000) } : null
+}
 const withId = (b: Built) => {
   const id = Math.floor(b.start / 1000)
-  const mark = readMarks()[String(id)]
+  const mark = readMarks()[String(id)] ?? simMark(b.start / 1000, (Number(b.end) || b.start) / 1000)
   return { ...withGeoBytes(b), id, ...(mark ? { mark } : {}) }
 }
-const isMarked = (startSec: number, marks: Record<string, unknown>) => !!marks[String(Math.floor(startSec))]
+const isMarked = (e: { start: number; end: number }, marks: Record<string, unknown>) =>
+  !!marks[String(Math.floor(e.start))] || !!simulationAt(e.start, e.end)
 const vectorsOf = (b: Built) => (b.vectors.length ? b.vectors : [((b.classifier as { label?: string } | null)?.label) ?? 'unknown'])
 const SORTS = new Set(['start', 'durationSec', 'peakBps', 'peakPps', 'droppedPackets', 'dropShare'])
 
@@ -617,9 +625,9 @@ export async function GET(req: NextRequest) {
     const timeWindow = all.filter((e) => e.end >= from && e.start <= to)
     // Summary over the REAL attacks in the window (marked false alarms are left
     // out): counts/time from the list, traffic numbers from the analysed ones.
-    const real = timeWindow.filter((e) => !isMarked(e.start, marks))
+    const real = timeWindow.filter((e) => !isMarked(e, marks))
     const builtAll = real.map(known).filter((b): b is Built => !!b)
-    const inWindow = markedFilter === 'hide' ? real : markedFilter === 'only' ? timeWindow.filter((e) => isMarked(e.start, marks)) : timeWindow
+    const inWindow = markedFilter === 'hide' ? real : markedFilter === 'only' ? timeWindow.filter((e) => isMarked(e, marks)) : timeWindow
     const builtList = inWindow.map(known).filter((b): b is Built => !!b)
     const num = (b: Built, k: string) => Number(b[k]) || 0
     const summary = {

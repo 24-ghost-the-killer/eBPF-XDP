@@ -43,7 +43,7 @@ export interface Store { groups: Group[]; users: StoredUser[] }
 const DEFAULT_FILE = '/etc/xdp-sentinel/dash-users.json'
 const DEFAULT_ADMIN_USER = 'admin'
 const DEFAULT_ADMIN_PASSWORD = 'admin'
-const STORE_VERSION = 4
+const STORE_VERSION = 6
 
 const preset = (id: string) => [...(PRESETS.find((p) => p.id === id)?.perms ?? [])]
 // Seeded when the store has no groups yet; become editable once anything is saved.
@@ -79,6 +79,21 @@ function parseStore(raw: string): Store {
           if (ver < 4) {
             if (perms.includes(ADMIN_PAGE)) perms = [...perms, 'devices', 'health', 'attacks.mark', 'devices.edit']
             else if (perms.includes('protect')) perms = [...perms, 'devices', 'health']
+          }
+          // v5 added Honeypot, Attack simulator, Show mode and their actions:
+          // admin groups get everything, groups that could see Protection (and
+          // the kiosk's viewers) get the three pages to look at.
+          if (ver < 5) {
+            if (perms.includes(ADMIN_PAGE)) perms = [...perms, 'honeypot', 'simulator', 'show', 'honeypot.edit', 'simulator.run']
+            else if (perms.includes('protect')) perms = [...perms, 'honeypot', 'simulator', 'show']
+          }
+          // v6 added Attacker profiles, Signature rules, Service uptime, Packet
+          // explainer, Red vs blue and the LAN guard: admins get everything,
+          // groups that could see Protection get the pages to look at.
+          if (ver < 6) {
+            const pages = ['attackers', 'rules', 'uptime', 'packets', 'game']
+            if (perms.includes(ADMIN_PAGE)) perms = [...perms, ...pages, 'devices.guard', 'rules.edit', 'uptime.edit', 'packets.capture']
+            else if (perms.includes('protect')) perms = [...perms, ...pages]
           }
           return { name: g.name, perms: effectivePerms(perms), ...(g.requireMfa === true ? { requireMfa: true } : {}) }
         })

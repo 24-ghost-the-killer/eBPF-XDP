@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply the LAN guard (a reloaded XDP program starts with empty maps)
+
+[Timer]
+OnBootSec=100s
+OnUnitActiveSec=5min
+Unit=xdp-sentinel-languard.service
+
+[Install]
+WantedBy=timers.target

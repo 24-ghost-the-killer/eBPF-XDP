@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""xs-honeypot-apply: load the dashboard's honeypot addresses into the dataplane.
+
+The dashboard (not root) writes the wanted state to
+    /home/test_server/xdp-sentinel-data/honeypot.json
+    {"addresses": [{"ip": "192.168.1.200", "block": true}, ...], "reset": ["192.168.1.201"]}
+and xdp-sentinel-honeypot.path runs this as root. For every interface the
+dataplane runs on it then:
+  * adds/updates each address in xs_honeypot_v4 (MAC 02:58:53:48:50:<last octet>),
+    keeping a recorded conflict unless the address is listed in "reset";
+  * removes addresses that are no longer wanted;
+  * sets xs_honeypot_on to the number of addresses (0 switches the feature off).
+
+Addresses are refused when they are not in one of the box's own LAN subnets,
+are the box itself, the network/broadcast address, a default gateway, or
+currently answer ARP (a real device lives there). Read-only for everything else.
+Also run by its timer, so a reloaded program gets its addresses back.
+
+    xs-honeypot-apply            apply
+    xs-honeypot-apply --check    print what would change, touch nothing
+"""
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+
+STATE = os.environ.get("XS_HONEYPOT_STATE", "/home/test_server/xdp-sentinel-data/honeypot.json")
+PIN_ROOT = os.environ.get("XS_PIN_ROOT", "/sys/fs/bpf/xdp-sentinel")
+MAX = 64
+RESET_DONE = "/run/xs-honeypot.reset-done"
+CHECK = "--check" in sys.argv
+
+
+def log(msg):
+    print(f"xs-honeypot-apply: {msg}", flush=True)
+
+
+def run(*args):
+    return subprocess.run(args, capture_output=True, text=True, timeout=10)
+
+
+def jrun(*args):
+    try:
+        return json.loads(run(*args).stdout or "[]")
+    except ValueError:
+        return []
+
+
+def lan_nets():
+    nets, own = [], set()
+    for link in jrun("ip", "-j", "-4", "addr", "show"):
+        name = link.get("ifname", "")
+        for a in link.get("addr_info", []):
+            own.add(a["local"])
+            if name.startswith(("docker", "br-", "veth", "lo", "wl")):
+                continue
+            n = ipaddress.ip_network(f"{a['local']}/{a['prefixlen']}", strict=False)
+            if n.is_private and 22 <= n.prefixlen <= 30:
+                nets.append((name, n))
+    gws = {r.get("gateway") for r in jrun("ip", "-j", "-4", "route", "show", "default")}
+    return nets, own, gws
+
+
+def in_use(ip, dev):
+    """True when a real device answers ARP for ip (arping is optional)."""
+    for n in jrun("ip", "-j", "neigh", "show", "to", ip):
+        if n.get("lladdr") and "FAILED" not in n.get("state", []) and "INCOMPLETE" not in n.get("state", []):
+            if not n["lladdr"].startswith("02:58:53:48:50:"):
+                return True
+    if dev and run("which", "arping").returncode == 0:
+        r = run("arping", "-c", "2", "-w", "2", "-I", dev, ip)
+        return r.returncode == 0 and "02:58:53:48:50" not in r.stdout.lower()
+    return False
+
+
+def hexb(b):
+    return [f"{x:02x}" for x in b]
+
+
+def dump(path):
+    out = {}
+    for e in jrun("bpftool", "-j", "map", "dump", "pinned", path):
+        k = bytes(int(x, 16) for x in e.get("key", []))
+        v = bytes(int(x, 16) for x in e.get("value", []))
+        if len(k) == 4:
+            out[k] = v
+    return out
+
+FAKE_PORTS = {22: 2222, 23: 2323, 80: 8081}
+LABEL_SUFFIX = ":hp"
+
+
+def interactive(wanted):
+    """Interactive decoys are real addresses of the box: add them to the bridge,
+    redirect 22/23/80 to the fake logins (xs-fakelogin) and let those ports in
+    through ufw. Decoys that are no longer interactive are taken down again."""
+    act = [w for w in wanted if w["interactive"]]
+    want_ips = {w["ip"]: w["dev"] for w in act}
+    # 1. addresses on the bridge, labelled <dev>:hp so only ours are touched
+    for link in jrun("ip", "-j", "-4", "addr", "show"):
+        for a in link.get("addr_info", []):
+            if str(a.get("label", "")).endswith(LABEL_SUFFIX) and a["local"] not in want_ips:
+                log(f"take down decoy address {a['local']} on {link['ifname']}")
+                if not CHECK:
+                    run("ip", "addr", "del", f"{a['local']}/32", "dev", link["ifname"])
+    have = {a["local"] for l in jrun("ip", "-j", "-4", "addr", "show") for a in l.get("addr_info", [])}
+    for ip, dev in want_ips.items():
+        if ip not in have:
+            log(f"bring up decoy address {ip} on {dev} (fake login)")
+            if not CHECK:
+                run("ip", "addr", "add", f"{ip}/32", "dev", dev, "label", f"{dev}{LABEL_SUFFIX}"[:15])
+    if CHECK:
+        return
+    # 2. nftables: decoy:22/23/80 -> the fake-login ports (one table, rebuilt whole)
+    rules = "\n".join(f"    ip daddr {ip} tcp dport {src} dnat ip to {ip}:{dst}"
+                      for ip in want_ips for src, dst in FAKE_PORTS.items())
+    conf = ("table inet xs_decoy {}\ndelete table inet xs_decoy\n"
+            "table inet xs_decoy {\n  chain pre {\n    type nat hook prerouting priority dstnat; policy accept;\n"
+            f"{rules}\n  }}\n}}\n") if want_ips else "table inet xs_decoy {}\ndelete table inet xs_decoy\n"
+    r = subprocess.run(["nft", "-f", "-"], input=conf, capture_output=True, text=True, timeout=10)
+    if r.returncode:
+        log(f"nft failed: {r.stderr.strip()[:200]}")
+    # 3. ufw drops new inbound connections by default: accept the redirected
+    #    fake-login ports, for decoy addresses only (re-added by the timer after a ufw reload)
+    if run("iptables", "-S", "ufw-before-input").returncode != 0:
+        return
+    ports = ",".join(str(p) for p in FAKE_PORTS.values())
+    for line in run("iptables", "-S", "ufw-before-input").stdout.splitlines():
+        if "xs-decoy" in line:
+            ip = line.split("-d ", 1)[1].split("/", 1)[0] if "-d " in line else ""
+            if ip not in want_ips:
+                run("iptables", *line.replace("-A ", "-D ", 1).split())
+    for ip in want_ips:
+        spec = ["-d", ip, "-p", "tcp", "-m", "multiport", "--dports", ports, "-m", "comment", "--comment", "xs-decoy", "-j", "ACCEPT"]
+        if run("iptables", "-C", "ufw-before-input", *spec).returncode != 0:
+            run("iptables", "-I", "ufw-before-input", "1", *spec)
+
+
+def main():
+    try:
+        want_doc = json.load(open(STATE))
+    except FileNotFoundError:
+        want_doc = {"addresses": []}
+    except ValueError as e:
+        log(f"{STATE}: not valid JSON ({e}); nothing changed")
+        return 1
+
+    nets, own, gws = lan_nets()
+    want = {}
+    for a in (want_doc.get("addresses") or [])[:MAX]:
+        try:
+            ip = ipaddress.ip_address(str(a.get("ip", "")).strip())
+        except ValueError:
+            log(f"skip {a.get('ip')!r}: not an IPv4 address")
+            continue
+        net = next(((d, n) for d, n in nets if ip in n), None)
+        why = None
+        if ip.version != 4:
+            why = "not IPv4"
+        elif not net:
+            why = "not in the box's LAN subnet(s): " + ", ".join(str(n) for _, n in nets)
+        elif str(ip) in own:
+            why = "that is the box itself"
+        elif ip in (net[1].network_address, net[1].broadcast_address):
+            why = "network/broadcast address"
+        elif str(ip) in gws:
+            why = "that is the default gateway"
+        if why:
+            log(f"skip {ip}: {why}")
+            continue
+        want[ipaddress.ip_address(ip).packed] = {"block": bool(a.get("block", True)), "dev": net[0], "ip": str(ip),
+                                                 "interactive": bool(a.get("interactive", False))}
+    # "reset" (clear a recorded conflict) is acted on once per dashboard save,
+    # not on every timer run: otherwise a real device could keep losing its
+    # address to the honeypot every few minutes.
+    token = str(want_doc.get("updatedAt", ""))
+    try:
+        done = open(RESET_DONE).read().strip()
+    except OSError:
+        done = ""
+    reset = set()
+    if token and token != done:
+        reset = {ipaddress.ip_address(r).packed for r in (want_doc.get("reset") or []) if r}
+
+    dirs = sorted(d for d in os.listdir(PIN_ROOT) if os.path.exists(f"{PIN_ROOT}/{d}/xs_honeypot_v4")) \
+        if os.path.isdir(PIN_ROOT) else []
+    if not dirs:
+        log(f"no dataplane with honeypot maps under {PIN_ROOT} (old XDP object?); nothing to do")
+        return 0
+
+    for key, w in want.items():
+        cur_anywhere = any(key in dump(f"{PIN_ROOT}/{d}/xs_honeypot_v4") for d in dirs)
+        if not cur_anywhere and in_use(w["ip"], w["dev"]):
+            log(f"skip {w['ip']}: a real device answers at that address")
+            w["skip"] = True
+    want = {k: w for k, w in want.items() if not w.get("skip")}
+
+    for d in dirs:
+        hp = f"{PIN_ROOT}/{d}/xs_honeypot_v4"
+        cur = dump(hp)
+        for key in cur:
+            if key not in want:
+                log(f"{d}: remove {ipaddress.ip_address(key)}")
+                if not CHECK:
+                    run("bpftool", "map", "delete", "pinned", hp, "key", "hex", *hexb(key))
+        for key, w in want.items():
+            mac = bytes([0x02, 0x58, 0x53, 0x48, 0x50, key[3]])
+            flags = ((1 if w["block"] else 0) | (2 if w["interactive"] else 0)).to_bytes(2, sys.byteorder)
+            old = cur.get(key)
+            conflict = old[8:16] if old and len(old) == 16 and key not in reset else bytes(8)
+            val = mac + flags + conflict
+            if old == val:
+                continue
+            log(f"{d}: {'update' if old else 'add'} {w['ip']} (block {'on' if w['block'] else 'off'}"
+                f"{', fake login' if w['interactive'] else ''}"
+                f"{', conflict cleared' if old and key in reset else ''})")
+            if not CHECK:
+                r = run("bpftool", "map", "update", "pinned", hp, "key", "hex", *hexb(key), "value", "hex", *hexb(val))
+                if r.returncode:
+                    log(f"{d}: bpftool failed: {r.stderr.strip()[:200]}")
+        on = f"{PIN_ROOT}/{d}/xs_honeypot_on"
+        if not CHECK:
+            run("bpftool", "map", "update", "pinned", on, "key", "hex", "00", "00", "00", "00",
+                "value", "hex", *hexb(len(want).to_bytes(4, sys.byteorder)))
+    interactive(list(want.values()))
+    if reset and not CHECK:
+        with open(RESET_DONE, "w") as f:
+            f.write(token)
+    log(f"{len(want)} honeypot address(es) active on {', '.join(dirs)}" + (" (check only)" if CHECK else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0 and not CHECK:
+        sys.exit("run as root (or with --check)")
+    sys.exit(main())

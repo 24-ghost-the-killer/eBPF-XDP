@@ -17,7 +17,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { NextRequest } from 'next/server'
 import { clientAddr, normIp, isValidIp, isTwingateConnector } from './client-addr'
 
-export type AuditCategory = 'auth' | 'access' | 'users' | 'groups' | 'protect' | 'lockdown' | 'notes' | 'reports' | 'export' | 'query' | 'view' | 'attacks' | 'devices'
+export type AuditCategory = 'auth' | 'access' | 'users' | 'groups' | 'protect' | 'lockdown' | 'notes' | 'reports' | 'export' | 'query' | 'view' | 'attacks' | 'devices' | 'honeypot' | 'simulator' | 'ai' | 'languard' | 'rules' | 'uptime' | 'packets'
 export type AuditResult = 'ok' | 'denied' | 'error' | 'conflict'
 export interface AuditEntry {
   id: string

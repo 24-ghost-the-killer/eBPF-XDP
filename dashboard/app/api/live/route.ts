@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { startUptime } from '@/lib/uptime'
 import { requirePerm } from '@/lib/api-auth'
 import { geoInit, geoReady, withGeo, summariseSources, type GeoCount } from '@/lib/geo'
 
@@ -101,6 +102,7 @@ async function build(withSources: boolean, at?: number) {
 }
 
 export async function GET(req: NextRequest) {
+  startUptime() // service checks run while anyone uses the dashboard (this is polled on every page)
   const auth = await requirePerm(req, null)
   if (auth.error) return auth.error
   const withSources = req.nextUrl.searchParams.get('sources') === '1'

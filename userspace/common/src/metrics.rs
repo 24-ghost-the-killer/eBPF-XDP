@@ -51,6 +51,16 @@ pub fn prom_family(name: &str) -> (&'static str, Option<(&'static str, &str)>) {
         // SYN authentication: first SYNs held back, sources verified.
         "synauth_drop" => ("synauth", Some(("event", "held"))),
         "synauth_pass" => ("synauth", Some(("event", "verified"))),
+        // Honeypot addresses: ARP answered, packets to them, conflicts.
+        "honeypot_arp" => ("honeypot", Some(("event", "arp_reply"))),
+        "honeypot_hit" => ("honeypot", Some(("event", "hit"))),
+        "honeypot_conflict" => ("honeypot", Some(("event", "conflict"))),
+        "honeypot_pass" => ("honeypot", Some(("event", "fake_login"))),
+        // LAN guard: ARP spoofing, unapproved devices dropped.
+        "arp_spoof" => ("languard", Some(("event", "arp_spoof"))),
+        "nac_drop" => ("languard", Some(("event", "unapproved_drop"))),
+        // Attack signature rules.
+        "sig_drop" => ("signature", Some(("event", "drop"))),
         // Every counter has a family (enforced by a test); keep a sane
         // fallback rather than panicking in an exporter.
         _ => ("other", Some(("counter", name))),
@@ -79,6 +89,9 @@ const PROM_HELP: &[(&str, &str)] = &[
     ("arp", "ARP storm cap (event: rate_limited = ARP frames dropped over the per-interface cap)"),
     ("scan", "Scan detection: sources flagged as scanners (detected) and packets dropped from blocked scanners (drop)"),
     ("synauth", "SYN authentication: first SYNs held back (held) and sources verified by retransmitting (verified)"),
+    ("languard", "LAN guard: ARP spoofing seen (arp_spoof) and packets dropped from unapproved devices (unapproved_drop)"),
+    ("signature", "Attack signature rules: packets dropped by an approved rule"),
+    ("honeypot", "Honeypot addresses: ARP requests answered (arp_reply), packets sent to them (hit), real devices claiming one (conflict)"),
     ("other", "Unmapped counters"),
 ];
 

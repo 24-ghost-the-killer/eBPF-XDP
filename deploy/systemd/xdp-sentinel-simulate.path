@@ -1,0 +1,9 @@
+[Unit]
+Description=Start/stop an attack simulation when the dashboard asks
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/simulate.json
+Unit=xdp-sentinel-simulate.service
+
+[Install]
+WantedBy=multi-user.target

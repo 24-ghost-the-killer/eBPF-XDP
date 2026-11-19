@@ -54,6 +54,9 @@ enum xs_counter_id {
 	XS_CNT_SCAN_DROP              = 58, /* packets dropped because their source is a blocked scanner */
 	XS_CNT_SYNAUTH_DROP           = 59, /* first SYNs held back by SYN authentication (client must retransmit) */
 	XS_CNT_SYNAUTH_PASS           = 60, /* sources that proved themselves with a retransmitted SYN */
+	XS_CNT_HONEYPOT_ARP           = 61, /* ARP requests for a honeypot address, answered (XDP_TX) */
+	XS_CNT_HONEYPOT_HIT           = 62, /* IP packets sent to a honeypot address (dropped) */
+	XS_CNT_HONEYPOT_CONFLICT      = 63, /* a real device used a honeypot address: that honeypot stood down */
 
 	/* L2 */
 	XS_CNT_L2_VLAN1               = 8,  /* exactly one 802.1Q/802.1ad tag */
@@ -64,6 +67,12 @@ enum xs_counter_id {
 	XS_CNT_L3_IPV6                = 17,
 	XS_CNT_L3_ARP                 = 18,
 	XS_CNT_L3_OTHER               = 19, /* any other ethertype / 802.3 length */
+
+	/* LAN guard, attack signatures, interactive honeypot. */
+	XS_CNT_ARP_SPOOF              = 20, /* ARP claiming a bound address from a foreign MAC */
+	XS_CNT_SIG_DROP               = 21, /* dropped by an operator-approved attack signature rule */
+	XS_CNT_NAC_DROP               = 22, /* dropped: from a device not yet approved (enforce mode) */
+	XS_CNT_HONEYPOT_PASS          = 23, /* let through to an interactive decoy's fake login */
 
 	/* L4: counted for fully parsed IP packets (parse rc == OK), including
 	 * non-first fragments (protocol known from the IP header). */
@@ -316,6 +325,123 @@ struct xs_scan {
 	__u64 bits[8];
 };
 
+/*
+ * Honeypot addresses: unused LAN IPv4 addresses the dataplane pretends to own.
+ * It answers ARP for them (so a scanner sees a live host), records every
+ * source that talks to them, and drops what they send. No real device uses
+ * these addresses, so any contact is a scan or an infected device.
+ *
+ * Value of xs_honeypot_v4 (key: the address, network order): 16 bytes.
+ */
+struct xs_honeypot {
+	__u8  mac[6];      /* MAC the honeypot answers ARP with (locally administered) */
+	__u16 flags;       /* XS_HP_* */
+	__u64 conflict_ns; /* set by the dataplane when a real device used the address; 0 = none */
+};
+#define XS_HP_BLOCK 1u    /* scan-block a source that sends TCP/UDP to this address */
+#define XS_HP_INTERACT 2u /* the box owns the address and runs a fake login on it: the kernel
+			   * answers ARP, and TCP 22/23/80 (+ ICMP) are let through to it */
+
+/* Per-source honeypot record (value of xs_honeypot_src, key: source IPv4): 48 bytes. */
+struct xs_honeypot_hit {
+	__u64  first_ns;   /* bpf_ktime_get_ns() of the first contact */
+	__u64  last_ns;    /* ... and of the latest */
+	__u64  packets;    /* IP packets sent to honeypot addresses */
+	__u32  arps;       /* ARP requests for honeypot addresses */
+	__be32 last_dst;   /* honeypot address last contacted */
+	__be16 last_dport; /* its TCP/UDP destination port (network order), 0 for other */
+	__u8   last_proto; /* IP protocol of the latest packet */
+	__u8   blocked;    /* 1 once the source was scan-blocked for it */
+	__u8   src_mac[6]; /* the source's MAC */
+	__u8   _pad[6];
+};
+
+/*
+ * LAN guard. ARP bindings (xs_arp_bind, key = IPv4) say which MAC really owns
+ * an address (the router, the box, approved devices); an ARP frame claiming a
+ * bound address from another MAC is spoofing (man-in-the-middle) and is
+ * recorded in xs_arp_spoof, and dropped when the binding has XS_BIND_DROP.
+ * New-device approval (xs_nac_mac, key = MAC): in watch mode every IP packet
+ * from an unapproved MAC is recorded in xs_nac_seen; in enforce mode it is also
+ * dropped, except DHCP, ICMPv6 neighbour discovery and traffic to the box.
+ */
+struct xs_arp_bind {
+	__u8 mac[6];
+	__u8 flags;          /* XS_BIND_* */
+	__u8 _pad;
+};
+#define XS_BIND_DROP 1u
+struct xs_spoof_key {
+	__be32 ip;
+	__u8   mac[6];
+	__u16  _pad;
+};
+struct xs_spoof {
+	__u64 first_ns;
+	__u64 last_ns;
+	__u32 frames;
+	__u32 dropped;
+};
+struct xs_languard {
+	__u32  bindings;     /* entries in xs_arp_bind; 0 = ARP check off */
+	__u32  nac;          /* XS_NAC_* */
+	__be32 lifeline;     /* the box: always reachable, even for unapproved devices */
+	__u32  _pad;
+};
+#define XS_NAC_OFF     0u
+#define XS_NAC_WATCH   1u
+#define XS_NAC_ENFORCE 2u
+struct xs_nac_seen {
+	__u64  first_ns;
+	__u64  last_ns;
+	__u64  packets;
+	__u64  dropped;
+	__be32 ip;           /* latest IPv4 source address it used */
+	__u32  _pad;
+};
+
+/*
+ * Attack signatures. Every 16th dropped packet is counted in xs_sig_seen by
+ * its shape (protocol, ports, TCP flags, TTL, size bucket); the agent turns the
+ * counts into per-minute history, and the dashboard suggests a rule for an
+ * attack's dominant shape. Approved rules (xs_sig_rules) drop matching packets
+ * from non-exempt sources at once, before the risk ladder has to climb.
+ */
+struct xs_sig_key {
+	__u8   proto;
+	__u8   tcp_flags;
+	__u8   ttl;
+	__u8   len64;        /* packet length / 64, capped at 255 */
+	__be16 dport;
+	__be16 sport;
+};
+struct xs_sig_count {
+	__u64 packets;
+	__u64 bytes;
+};
+struct xs_sig_rule {
+	__u8   on;
+	__u8   proto;
+	__u8   tcp_flags;    /* compared under flags_mask */
+	__u8   flags_mask;
+	__be16 dport;
+	__be16 sport;
+	__u16  len_lo;       /* packet length range, inclusive */
+	__u16  len_hi;
+	__u8   ttl_lo;
+	__u8   ttl_hi;
+	__u8   match;        /* XS_SIG_* fields that must match */
+	__u8   _pad;
+	__u64  hits;
+};
+#define XS_SIG_PROTO 1u
+#define XS_SIG_DPORT 2u
+#define XS_SIG_SPORT 4u
+#define XS_SIG_FLAGS 8u
+#define XS_SIG_LEN   16u
+#define XS_SIG_TTL   32u
+#define XS_SIG_RULES 16
+
 /* SYN authentication timing: a retransmitted SYN counts if it comes between
  * these two ages of the first one; a verified source stays verified this long. */
 #define XS_SYNAUTH_MIN_NS    200000000ULL    /* 0.2 s */
@@ -505,6 +631,15 @@ _Static_assert(sizeof(struct xs_lpm_v4) == 8, "xs_lpm_v4 ABI");
 _Static_assert(sizeof(struct xs_lpm_v6) == 20, "xs_lpm_v6 ABI");
 _Static_assert(sizeof(struct xs_scan) == 88, "xs_scan ABI");
 _Static_assert(sizeof(struct xs_service_key6) == 20, "xs_service_key6 ABI");
+_Static_assert(sizeof(struct xs_honeypot) == 16, "xs_honeypot ABI");
+_Static_assert(sizeof(struct xs_honeypot_hit) == 48, "xs_honeypot_hit ABI");
+_Static_assert(sizeof(struct xs_arp_bind) == 8, "xs_arp_bind ABI");
+_Static_assert(sizeof(struct xs_spoof_key) == 12, "xs_spoof_key ABI");
+_Static_assert(sizeof(struct xs_spoof) == 24, "xs_spoof ABI");
+_Static_assert(sizeof(struct xs_languard) == 16, "xs_languard ABI");
+_Static_assert(sizeof(struct xs_nac_seen) == 40, "xs_nac_seen ABI");
+_Static_assert(sizeof(struct xs_sig_key) == 8, "xs_sig_key ABI");
+_Static_assert(sizeof(struct xs_sig_rule) == 24, "xs_sig_rule ABI");
 
 _Static_assert(XS_CNT_PARSE_BASE + XS_PARSE_RC_MAX <= XS_CNT_SLOTS, "counter slots");
 #endif

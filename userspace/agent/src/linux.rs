@@ -28,7 +28,9 @@ use xs_common::iforest::Forest;
 use xs_common::risk::{Evidence, RiskEngine};
 use xs_common::metrics::prometheus;
 use xs_common::pin::{
-    PinLayout, MAP_ATTACKER_V4, MAP_ATTACKER_V6, MAP_CONFIG, MAP_POLICY_V4, MAP_POLICY_V6,
+    PinLayout, MAP_ARP_BIND, MAP_ARP_SPOOF, MAP_ATTACKER_V4, MAP_ATTACKER_V6, MAP_CONFIG, MAP_HONEYPOT_ON,
+    MAP_HONEYPOT_SRC, MAP_HONEYPOT_V4, MAP_LANGUARD, MAP_NAC_MAC, MAP_NAC_SEEN, MAP_POLICY_V4, MAP_POLICY_V6,
+    MAP_SIG_RULES, MAP_SIG_SEEN,
     MAP_PROTECTED_V4, MAP_SERVICE_V4, MAP_STATS, MAP_VICTIM_V4, MAP_VICTIM_V6, PROG_NAME,
 };
 use xs_common::{Config as DpConfig, ConfigFlags, Snapshot};
@@ -587,6 +589,303 @@ fn api_dataplane_json(cfg: &Config) -> String {
         "object": { "path": cfg.bpf_obj.display().to_string(), "mtime": mtime, "size": obj.map(|m| m.len()) },
         "configured": cfg.interfaces.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
         "interfaces": ifaces,
+    })
+    .to_string()
+}
+
+/// `/api/honeypot.json`: the honeypot addresses and every source that touched
+/// one, merged over the configured interfaces (each has its own maps). Times
+/// are wall-clock seconds; the dataplane stamps CLOCK_MONOTONIC nanoseconds.
+fn api_honeypot_json(cfg: &Config) -> String {
+    use std::collections::BTreeMap;
+    use std::net::Ipv4Addr;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let wall = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    // SAFETY: zero-initialised timespec is valid and clock_gettime only writes it.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: valid clock id and writable timespec.
+    let mono = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+        ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+    } else {
+        0.0
+    };
+    let at = |ns: u64| if ns == 0 { serde_json::Value::Null } else { serde_json::json!(wall - (mono - ns as f64 / 1e9)) };
+    let ip_of = |k: &[u8]| Ipv4Addr::new(k[0], k[1], k[2], k[3]).to_string();
+    let mac_of = |m: &[u8]| m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+    let u64_at = |v: &[u8], o: usize| u64::from_ne_bytes(v[o..o + 8].try_into().unwrap());
+
+    let mut active = 0u32;
+    let mut addrs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    // src -> (first, last, packets, arps, last_dst, last_dport, last_proto, blocked, mac)
+    let mut srcs: BTreeMap<String, (u64, u64, u64, u64, String, u16, u8, bool, String)> = BTreeMap::new();
+    let mut ifaces = Vec::new();
+    for iface in &cfg.interfaces {
+        let Ok(layout) = PinLayout::new(&cfg.pin_root, &iface.name) else { continue };
+        let Ok(on) = MapHandle::from_pinned_path(layout.map(MAP_HONEYPOT_ON)) else { continue };
+        ifaces.push(iface.name.clone());
+        if let Ok(Some(v)) = on.lookup(&0u32.to_ne_bytes(), MapFlags::ANY) {
+            if v.len() >= 4 {
+                active = active.max(u32::from_ne_bytes(v[0..4].try_into().unwrap()));
+            }
+        }
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_HONEYPOT_V4)) {
+            for k in m.keys() {
+                let (Ok(Some(v)), 4) = (m.lookup(&k, MapFlags::ANY), k.len()) else { continue };
+                if v.len() < 16 {
+                    continue;
+                }
+                let ip = ip_of(&k);
+                let conflict = u64_at(&v, 8);
+                let e = addrs.entry(ip.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "ip": ip, "mac": mac_of(&v[0..6]),
+                        "block": u16::from_ne_bytes([v[6], v[7]]) & 1 == 1, "conflict_at": null,
+                    })
+                });
+                if conflict != 0 && e["conflict_at"].is_null() {
+                    e["conflict_at"] = at(conflict);
+                }
+            }
+        }
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_HONEYPOT_SRC)) {
+            for k in m.keys() {
+                let (Ok(Some(v)), 4) = (m.lookup(&k, MapFlags::ANY), k.len()) else { continue };
+                if v.len() < 48 {
+                    continue;
+                }
+                let (first, last, pkts) = (u64_at(&v, 0), u64_at(&v, 8), u64_at(&v, 16));
+                let arps = u32::from_ne_bytes(v[24..28].try_into().unwrap()) as u64;
+                let dst = ip_of(&v[28..32]);
+                let dport = u16::from_be_bytes([v[32], v[33]]);
+                let (proto, blocked) = (v[34], v[35] != 0);
+                let mac = mac_of(&v[36..42]);
+                let e = srcs.entry(ip_of(&k)).or_insert((first, last, 0, 0, dst.clone(), dport, proto, false, mac));
+                e.0 = if e.0 == 0 { first } else { e.0.min(first) };
+                if last >= e.1 {
+                    e.1 = last;
+                    e.4 = dst;
+                    e.5 = dport;
+                    e.6 = proto;
+                }
+                e.2 += pkts;
+                e.3 += arps;
+                e.7 |= blocked;
+            }
+        }
+    }
+    let mut sources: Vec<_> = srcs.into_iter().collect();
+    sources.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let sources: Vec<serde_json::Value> = sources
+        .into_iter()
+        .map(|(ip, (first, last, pkts, arps, dst, dport, proto, blocked, mac))| {
+            serde_json::json!({
+                "ip": ip, "mac": mac, "first_at": at(first), "last_at": at(last),
+                "packets": pkts, "arps": arps, "last_dst": dst, "last_dport": dport,
+                "last_proto": proto, "blocked": blocked,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "now": wall, "active": active, "interfaces": ifaces,
+        "addresses": addrs.into_values().collect::<Vec<_>>(), "sources": sources,
+    })
+    .to_string()
+}
+
+/// Attack-signature history: (unix seconds, [(shape key, packets, bytes)]),
+/// one entry per minute that saw drops, 24 h deep. Filled by serve()'s recorder.
+type SigRow = ([u8; 8], u64, u64);
+static SIG_HISTORY: Mutex<std::collections::VecDeque<(u64, Vec<SigRow>)>> = Mutex::new(std::collections::VecDeque::new());
+
+fn mono_to_wall() -> (f64, f64) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let wall = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    // SAFETY: zero-initialised timespec is valid and clock_gettime only writes it.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: valid clock id and writable timespec.
+    let mono = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+        ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+    } else {
+        0.0
+    };
+    (wall, mono)
+}
+
+/// `/api/languard.json`: ARP bindings, spoofing seen, and devices that are not
+/// approved yet (with what the dataplane did with their traffic).
+fn api_languard_json(cfg: &Config) -> String {
+    use std::collections::BTreeMap;
+    use std::net::Ipv4Addr;
+    let (wall, mono) = mono_to_wall();
+    let at = |ns: u64| if ns == 0 { serde_json::Value::Null } else { serde_json::json!(wall - (mono - ns as f64 / 1e9)) };
+    let mac_of = |m: &[u8]| m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+    let ip_of = |k: &[u8]| Ipv4Addr::new(k[0], k[1], k[2], k[3]).to_string();
+    let u64_at = |v: &[u8], o: usize| u64::from_ne_bytes(v[o..o + 8].try_into().unwrap());
+    let u32_at = |v: &[u8], o: usize| u32::from_ne_bytes(v[o..o + 4].try_into().unwrap());
+
+    let (mut bindings, mut nac, mut approved) = (0u32, 0u32, 0usize);
+    let mut binds: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut spoof: BTreeMap<(String, String), (u64, u64, u64, u64)> = BTreeMap::new();
+    let mut seen: BTreeMap<String, (u64, u64, u64, u64, String)> = BTreeMap::new();
+    let mut ifaces = Vec::new();
+    for iface in &cfg.interfaces {
+        let Ok(layout) = PinLayout::new(&cfg.pin_root, &iface.name) else { continue };
+        let Ok(c) = MapHandle::from_pinned_path(layout.map(MAP_LANGUARD)) else { continue };
+        ifaces.push(iface.name.clone());
+        if let Ok(Some(v)) = c.lookup(&0u32.to_ne_bytes(), MapFlags::ANY) {
+            if v.len() >= 8 {
+                bindings = bindings.max(u32_at(&v, 0));
+                nac = nac.max(u32_at(&v, 4));
+            }
+        }
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_ARP_BIND)) {
+            for k in m.keys() {
+                let (Ok(Some(v)), 4) = (m.lookup(&k, MapFlags::ANY), k.len()) else { continue };
+                if v.len() >= 8 {
+                    binds.insert(ip_of(&k), serde_json::json!({ "ip": ip_of(&k), "mac": mac_of(&v[0..6]), "drop": v[6] & 1 == 1 }));
+                }
+            }
+        }
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_ARP_SPOOF)) {
+            for k in m.keys() {
+                let (Ok(Some(v)), 12) = (m.lookup(&k, MapFlags::ANY), k.len()) else { continue };
+                if v.len() < 24 {
+                    continue;
+                }
+                let e = spoof.entry((ip_of(&k[0..4]), mac_of(&k[4..10]))).or_insert((u64::MAX, 0, 0, 0));
+                e.0 = e.0.min(u64_at(&v, 0));
+                e.1 = e.1.max(u64_at(&v, 8));
+                e.2 += u32_at(&v, 16) as u64;
+                e.3 += u32_at(&v, 20) as u64;
+            }
+        }
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_NAC_MAC)) {
+            approved = approved.max(m.keys().count());
+        }
+        if let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_NAC_SEEN)) {
+            for k in m.keys() {
+                let (Ok(Some(v)), 8) = (m.lookup(&k, MapFlags::ANY), k.len()) else { continue };
+                if v.len() < 40 {
+                    continue;
+                }
+                let ip = if v[32..36] == [0, 0, 0, 0] { String::new() } else { ip_of(&v[32..36]) };
+                let e = seen.entry(mac_of(&k[0..6])).or_insert((u64::MAX, 0, 0, 0, String::new()));
+                e.0 = e.0.min(u64_at(&v, 0));
+                if u64_at(&v, 8) >= e.1 {
+                    e.1 = u64_at(&v, 8);
+                    if !ip.is_empty() {
+                        e.4 = ip;
+                    }
+                }
+                e.2 += u64_at(&v, 16);
+                e.3 += u64_at(&v, 24);
+            }
+        }
+    }
+    let mode = match nac {
+        0 => "off",
+        1 => "watch",
+        _ => "enforce",
+    };
+    serde_json::json!({
+        "now": wall, "interfaces": ifaces, "bindings": bindings, "nac": mode, "approved": approved,
+        "binds": binds.into_values().collect::<Vec<_>>(),
+        "spoofing": spoof.into_iter().map(|((ip, mac), (f, l, frames, dropped))| serde_json::json!({
+            "ip": ip, "mac": mac, "first_at": at(f), "last_at": at(l), "frames": frames, "dropped": dropped,
+        })).collect::<Vec<_>>(),
+        "unapproved": seen.into_iter().map(|(mac, (f, l, p, d, ip))| serde_json::json!({
+            "mac": mac, "ip": ip, "first_at": at(f), "last_at": at(l), "packets": p, "dropped": d,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn sig_key_json(k: &[u8; 8]) -> serde_json::Value {
+    let proto = k[0];
+    let dport = u16::from_be_bytes([k[4], k[5]]);
+    let sport = u16::from_be_bytes([k[6], k[7]]);
+    let icmp = proto == 1 || proto == 58;
+    serde_json::json!({
+        "proto": proto, "tcp_flags": k[1], "ttl": k[2], "len_lo": k[3] as u32 * 64, "len_hi": k[3] as u32 * 64 + 63,
+        "dport": if icmp { 0 } else { dport }, "sport": if icmp { 0 } else { sport },
+        "icmp_type": if icmp { Some(dport >> 8) } else { None }, "icmp_code": if icmp { Some(dport & 0xff) } else { None },
+    })
+}
+
+/// `/api/signatures.json?from=<unix>&to=<unix>`: the shapes of the packets the
+/// dataplane dropped in that window (from the per-minute history; 24 h deep,
+/// since the agent started), biggest first, plus the approved rules and their hits.
+fn api_signatures_json(cfg: &Config, path: &str) -> String {
+    use std::collections::HashMap;
+    let q = path.split_once('?').map(|x| x.1).unwrap_or("");
+    let arg = |name: &str| -> Option<u64> {
+        q.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == name).and_then(|(_, v)| v.parse().ok()))
+    };
+    let (wall, _) = mono_to_wall();
+    let to = arg("to").unwrap_or(wall as u64 + 60);
+    let from = arg("from").unwrap_or(to.saturating_sub(3600));
+    let mut sum: HashMap<[u8; 8], (u64, u64)> = HashMap::new();
+    let (mut oldest, mut minutes) = (0u64, 0usize);
+    if let Ok(h) = SIG_HISTORY.lock() {
+        oldest = h.front().map(|x| x.0).unwrap_or(0);
+        // a minute's entry covers the 60 s before its timestamp
+        for (t, rows) in h.iter().filter(|(t, _)| *t >= from && t.saturating_sub(60) <= to) {
+            let _ = t;
+            minutes += 1;
+            for (k, p, b) in rows {
+                let e = sum.entry(*k).or_insert((0, 0));
+                e.0 += p;
+                e.1 += b;
+            }
+        }
+    }
+    let total: u64 = sum.values().map(|v| v.0).sum();
+    let mut shapes: Vec<_> = sum.into_iter().collect();
+    shapes.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let shapes: Vec<serde_json::Value> = shapes
+        .into_iter()
+        .take(40)
+        .map(|(k, (p, b))| {
+            let mut j = sig_key_json(&k);
+            j["sampled_packets"] = serde_json::json!(p);
+            j["sampled_bytes"] = serde_json::json!(b);
+            j["share"] = serde_json::json!(if total > 0 { p as f64 / total as f64 } else { 0.0 });
+            j
+        })
+        .collect();
+
+    // approved rules + hits (summed over the interfaces)
+    let mut rules: Vec<serde_json::Value> = Vec::new();
+    let mut hits = [0u64; 16];
+    let mut seen_rule = [false; 16];
+    let mut raw: [Option<Vec<u8>>; 16] = Default::default();
+    for iface in &cfg.interfaces {
+        let Ok(layout) = PinLayout::new(&cfg.pin_root, &iface.name) else { continue };
+        let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_SIG_RULES)) else { continue };
+        for i in 0..16u32 {
+            if let Ok(Some(v)) = m.lookup(&i.to_ne_bytes(), MapFlags::ANY) {
+                if v.len() >= 24 && v[0] != 0 {
+                    hits[i as usize] += u64::from_ne_bytes(v[16..24].try_into().unwrap());
+                    seen_rule[i as usize] = true;
+                    raw[i as usize] = Some(v);
+                }
+            }
+        }
+    }
+    for i in 0..16 {
+        if let (true, Some(v)) = (seen_rule[i], &raw[i]) {
+            rules.push(serde_json::json!({
+                "slot": i, "proto": v[1], "tcp_flags": v[2], "flags_mask": v[3],
+                "dport": u16::from_be_bytes([v[4], v[5]]), "sport": u16::from_be_bytes([v[6], v[7]]),
+                "len_lo": u16::from_ne_bytes([v[8], v[9]]), "len_hi": u16::from_ne_bytes([v[10], v[11]]),
+                "ttl_lo": v[12], "ttl_hi": v[13], "match": v[14], "hits": hits[i],
+            }));
+        }
+    }
+    serde_json::json!({
+        "now": wall, "from": from, "to": to, "minutes": minutes, "history_since": oldest,
+        "sampled_total": total, "sample": 16, "shapes": shapes, "rules": rules,
     })
     .to_string()
 }
@@ -1801,6 +2100,64 @@ fn serve(cfg: &Config) -> Result<()> {
         });
     }
 
+    // Attack-signature history: once a minute, how many dropped packets of
+    // each shape the dataplane counted (delta of xs_sig_seen), kept for 24 h.
+    {
+        let ifaces: Vec<String> = cfg.interfaces.iter().map(|i| i.name.clone()).collect();
+        let pin_root = cfg.pin_root.clone();
+        thread::spawn(move || {
+            let mut prev: std::collections::HashMap<[u8; 8], (u64, u64)> = std::collections::HashMap::new();
+            let mut first = true;
+            while !STOP.load(Ordering::SeqCst) {
+                let mut cur: std::collections::HashMap<[u8; 8], (u64, u64)> = std::collections::HashMap::new();
+                for name in &ifaces {
+                    let Ok(layout) = PinLayout::new(&pin_root, name) else { continue };
+                    let Ok(m) = MapHandle::from_pinned_path(layout.map(MAP_SIG_SEEN)) else { continue };
+                    for k in m.keys() {
+                        let (Ok(Some(v)), Ok(key)) = (m.lookup(&k, MapFlags::ANY), <[u8; 8]>::try_from(k.as_slice())) else { continue };
+                        if v.len() < 16 {
+                            continue;
+                        }
+                        let e = cur.entry(key).or_insert((0, 0));
+                        e.0 += u64::from_ne_bytes(v[0..8].try_into().unwrap());
+                        e.1 += u64::from_ne_bytes(v[8..16].try_into().unwrap());
+                    }
+                }
+                if !first {
+                    let mut rows = Vec::new();
+                    for (k, (p, b)) in &cur {
+                        let (pp, pb) = prev.get(k).copied().unwrap_or((0, 0));
+                        // an LRU eviction or a reloaded program restarts a counter
+                        let (dp, db) = if *p >= pp { (p - pp, b.saturating_sub(pb)) } else { (*p, *b) };
+                        if dp > 0 {
+                            rows.push((*k, dp, db));
+                        }
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Ok(mut h) = SIG_HISTORY.lock() {
+                        if !rows.is_empty() {
+                            h.push_back((now, rows));
+                        }
+                        while h.front().is_some_and(|(t, _)| now.saturating_sub(*t) > 24 * 3600) {
+                            h.pop_front();
+                        }
+                    }
+                }
+                first = false;
+                prev = cur;
+                for _ in 0..60 {
+                    if STOP.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        });
+    }
+
     while !STOP.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
@@ -1851,6 +2208,11 @@ fn handle(
             }
             "/api/services.json" => ("200 OK", "application/json", api_services_json(cfg)),
             "/api/dataplane.json" => ("200 OK", "application/json", api_dataplane_json(cfg)),
+            "/api/honeypot.json" => ("200 OK", "application/json", api_honeypot_json(cfg)),
+            "/api/languard.json" => ("200 OK", "application/json", api_languard_json(cfg)),
+            p if p == "/api/signatures.json" || p.starts_with("/api/signatures.json?") => {
+                ("200 OK", "application/json", api_signatures_json(cfg, p))
+            }
             "/healthz" => ("200 OK", "text/plain", "ok\n".into()),
             "/readyz" => {
                 if ready(cfg) {

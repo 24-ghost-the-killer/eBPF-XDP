@@ -1,0 +1,9 @@
+[Unit]
+Description=Record packets when the dashboard's packet explainer asks
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/capture.json
+Unit=xdp-sentinel-capture.service
+
+[Install]
+WantedBy=multi-user.target

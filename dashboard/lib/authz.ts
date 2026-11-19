@@ -44,6 +44,14 @@ export const PAGES: PageDef[] = [
   { id: 'ip', label: 'IP lookup', path: '/analytics/ip', hint: 'investigate one address' },
   { id: 'devices', label: 'Devices', path: '/analytics/devices', hint: 'every device seen on the network, named or flagged as new' },
   { id: 'health', label: 'Dataplane health', path: '/analytics/health', hint: 'which firewall program each interface runs, and whether it is stale' },
+  { id: 'honeypot', label: 'Honeypot', path: '/analytics/honeypot', hint: 'decoy addresses and every device that touched one' },
+  { id: 'simulator', label: 'Attack simulator', path: '/analytics/simulator', hint: 'start a simulated attack and watch the system react' },
+  { id: 'show', label: 'Show mode', path: '/analytics/show', hint: 'full-screen live view for a big screen or the kiosk' },
+  { id: 'attackers', label: 'Attacker profiles', path: '/analytics/attackers', hint: 'who attacks you: networks, countries and repeat offenders' },
+  { id: 'rules', label: 'Signature rules', path: '/analytics/rules', hint: 'precise blocking rules learned from earlier attacks' },
+  { id: 'uptime', label: 'Service uptime', path: '/analytics/uptime', hint: 'are your services up: Proxmox, cameras, printers, Pis' },
+  { id: 'packets', label: 'Packet explainer', path: '/analytics/packets', hint: 'every header field of a packet, explained' },
+  { id: 'game', label: 'Red vs blue', path: '/analytics/game', hint: 'attack game: how fast does the firewall stop you' },
   { id: 'query', label: 'Query console', path: '/analytics/query', hint: 'run raw PromQL against Prometheus' },
   { id: 'users', label: 'Users & groups', path: '/analytics/users', hint: 'manage accounts and permissions (admin)' },
   { id: 'audit', label: 'Audit log', path: '/analytics/audit', hint: 'every action taken on the dashboard — who, what, when' },
@@ -65,6 +73,12 @@ export const ACTIONS: ActionDef[] = [
   { id: 'protect.delete', page: 'protect', label: 'Delete reports & log entries', hint: 'permanently remove reports and log entries', danger: true },
   { id: 'attacks.mark', page: 'attacks', label: 'Mark false alarms', hint: 'mark an attack as not an attack (it then leaves the totals)' },
   { id: 'devices.edit', page: 'devices', label: 'Name & trust devices', hint: 'name devices, mark them known, forget old ones' },
+  { id: 'honeypot.edit', page: 'honeypot', label: 'Change honeypot addresses', hint: 'add or remove decoy addresses and choose whether touching one blocks the device' , danger: true },
+  { id: 'devices.guard', page: 'devices', label: 'Change the LAN guard', hint: 'switch new-device approval between off, watch and enforce, and the ARP-spoofing guard', danger: true },
+  { id: 'rules.edit', page: 'rules', label: 'Add & remove signature rules', hint: 'block traffic that matches an attack’s packet shape', danger: true },
+  { id: 'uptime.edit', page: 'uptime', label: 'Edit uptime checks', hint: 'add, change and remove the services that are checked' },
+  { id: 'packets.capture', page: 'packets', label: 'Capture packets', hint: 'record up to 50 packet headers from the live network' },
+  { id: 'simulator.run', page: 'simulator', label: 'Run simulations', hint: 'start simulated attacks; the real mitigations arm for a minute, like during a real attack', danger: true },
 ]
 export const ACTION_IDS = ACTIONS.map((a) => a.id)
 export const PERM_IDS = [...PAGE_IDS, ...ACTION_IDS]
@@ -75,9 +89,9 @@ export const actionsOf = (page: string) => ACTIONS.filter((a) => a.page === page
 
 // Pages grouped for the permission editor.
 export const AREAS: { id: string; label: string; pages: string[] }[] = [
-  { id: 'monitor', label: 'Monitoring', pages: ['overview', 'explore', 'attacks', 'ai', 'ip', 'devices'] },
-  { id: 'protect', label: 'Protection', pages: ['protect'] },
-  { id: 'tools', label: 'Tools', pages: ['query', 'health'] },
+  { id: 'monitor', label: 'Monitoring', pages: ['overview', 'explore', 'attacks', 'ai', 'ip', 'devices', 'honeypot', 'attackers', 'uptime', 'show'] },
+  { id: 'protect', label: 'Protection', pages: ['protect', 'rules'] },
+  { id: 'tools', label: 'Tools', pages: ['query', 'health', 'simulator', 'packets', 'game'] },
   { id: 'admin', label: 'Administration', pages: ['users', 'audit'] },
 ]
 
@@ -89,7 +103,7 @@ export function effectivePerms(perms: unknown): string[] {
 }
 
 // One-click starting points in the group editor.
-const MONITOR = ['overview', 'explore', 'attacks', 'ai', 'ip', 'devices', 'health']
+const MONITOR = ['overview', 'explore', 'attacks', 'ai', 'ip', 'devices', 'health', 'honeypot', 'simulator', 'show', 'attackers', 'rules', 'uptime', 'packets', 'game']
 export const PRESETS: { id: string; label: string; hint: string; perms: string[] }[] = [
   { id: 'viewer', label: 'Viewer', hint: 'all dashboards and Protection, read-only', perms: [...MONITOR, 'protect'] },
   { id: 'operator', label: 'Operator', hint: 'viewer + manage protection, notes and reports', perms: [...MONITOR, 'protect', 'query', ...ACTION_IDS] },
@@ -105,6 +119,12 @@ const EXTRA_ROUTES: Array<[string, string]> = [
   ['/api/lockdown', 'protect'], // read/write the lockdown kill-switch
   ['/api/devices', 'devices'], // device list (edits need devices.edit)
   ['/api/health', 'health'], // dataplane health
+  ['/api/honeypot', 'honeypot'], // honeypot addresses and hits (changes need honeypot.edit)
+  ['/api/simulate', 'simulator'], // attack simulator (starting one needs simulator.run)
+  ['/api/languard', 'devices'], // LAN guard (changes need devices.guard)
+  ['/api/rules', 'rules'], // signature rules (changes need rules.edit)
+  ['/api/uptime', 'uptime'], // uptime checks (changes need uptime.edit)
+  ['/api/packets', 'packets'], // packet capture (needs packets.capture)
   ['/analytics/groups', 'users'], // groups is its own page, still an admin surface
   ['/api/users', 'users'],
   ['/api/groups', 'users'],

@@ -7,6 +7,7 @@ import {
   LayoutDashboard, LineChart, ShieldAlert, Fingerprint, TerminalSquare, Search, Moon, Sun, RefreshCw,
   CalendarRange, Lock, MonitorSmartphone, HeartPulse, ChevronRight, Clock, Zap, BrainCircuit, LogOut, Users, UsersRound, ArrowLeft, History, UserRound,
   Server, FileText, type LucideIcon,
+  Bug, FlaskConical, MonitorPlay, Crosshair, Wand2, Activity, Binary, Swords,
 } from 'lucide-react'
 import { PAGES } from '@/lib/authz'
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from '@/components/ui/command'
@@ -90,6 +91,10 @@ const NAV: { group: string; items: NavItem[] }[] = [
       { href: '/analytics/protect', label: 'Protection', icon: Lock, hint: 'Protected hosts and allowed services (default-deny)' },
       { href: '/analytics/ip', label: 'IP lookup', icon: Fingerprint, hint: 'Investigate one address' },
       { href: '/analytics/devices', label: 'Devices', icon: MonitorSmartphone, hint: 'Every device seen on the network — name them, spot new ones' },
+      { href: '/analytics/honeypot', label: 'Honeypot', icon: Bug, hint: 'Decoy addresses that catch scanners and infected devices' },
+      { href: '/analytics/attackers', label: 'Attacker profiles', icon: Crosshair, hint: 'Who attacks you: networks, countries, repeat offenders' },
+      { href: '/analytics/rules', label: 'Signature rules', icon: Wand2, hint: 'Precise blocking rules learned from earlier attacks' },
+      { href: '/analytics/uptime', label: 'Service uptime', icon: Activity, hint: 'Are Proxmox, cameras, printers and Pis up' },
     ],
   },
   {
@@ -97,6 +102,10 @@ const NAV: { group: string; items: NavItem[] }[] = [
     items: [
       { href: '/analytics/query', label: 'Query console', icon: TerminalSquare, hint: 'Run raw PromQL' },
       { href: '/analytics/health', label: 'Dataplane health', icon: HeartPulse, hint: 'Which firewall program each interface runs, and whether it is current' },
+      { href: '/analytics/simulator', label: 'Attack simulator', icon: FlaskConical, hint: 'Start a simulated attack and watch the system react' },
+      { href: '/analytics/packets', label: 'Packet explainer', icon: Binary, hint: 'Every header field of a packet, explained' },
+      { href: '/analytics/game', label: 'Red vs blue', icon: Swords, hint: 'Attack game: how fast does the firewall stop you' },
+      { href: '/analytics/show', label: 'Show mode', icon: MonitorPlay, hint: 'Full-screen live view for a big screen or the kiosk' },
     ],
   },
   {

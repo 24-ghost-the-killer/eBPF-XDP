@@ -1,0 +1,8 @@
+[Unit]
+Description=Load the honeypot addresses into the XDP dataplane
+After=sentinel-agent.service
+Wants=sentinel-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xs-honeypot-apply

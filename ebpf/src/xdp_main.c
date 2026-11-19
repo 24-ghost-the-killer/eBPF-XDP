@@ -347,6 +347,313 @@ static __always_inline const struct xs_l2_trust *xs_upstream_router(void *data, 
 	return bpf_map_lookup_elem(&xs_untrusted_l2, &k);
 }
 
+/* ---- Honeypot addresses (struct xs_honeypot) ---- */
+
+static __always_inline int xs_mac_eq(const __u8 *a, const __u8 *b)
+{
+	return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] &&
+	       a[3] == b[3] && a[4] == b[4] && a[5] == b[5];
+}
+
+static __always_inline struct xs_honeypot_hit *xs_honeypot_src_of(__be32 src, const __u8 *mac, __u64 now)
+{
+	struct xs_honeypot_hit *h = bpf_map_lookup_elem(&xs_honeypot_src, &src);
+
+	if (!h) {
+		struct xs_honeypot_hit n = {};
+
+		n.first_ns = now;
+		__builtin_memcpy(n.src_mac, mac, 6);
+		bpf_map_update_elem(&xs_honeypot_src, &src, &n, BPF_ANY);
+		h = bpf_map_lookup_elem(&xs_honeypot_src, &src);
+	}
+	return h;
+}
+
+/*
+ * ARP for a honeypot address. Returns XDP_TX after turning a request into the
+ * reply in place, XDP_PASS for an ARP the honeypot does not answer, or -1 when
+ * the frame has nothing to do with a honeypot (normal processing continues).
+ *
+ * A real device that uses a honeypot address (its own request, reply or
+ * gratuitous ARP with that sender address) stands the honeypot down at once,
+ * so a device that got the address from DHCP keeps working. Address probes
+ * (sender 0.0.0.0, RFC 5227) are never answered for the same reason.
+ */
+static __always_inline int xs_honeypot_arp(struct xs_stats *st, void *data, void *data_end,
+					   const struct xs_pkt *p, __u64 now, __u64 len)
+{
+	__u8 *eth = data;
+	__u8 *a = (__u8 *)data + 14 + 4 * (p->vlan_depth & 3);
+	__be32 spa, tpa;
+
+	if ((void *)(eth + 14) > data_end || (void *)(a + 28) > data_end)
+		return -1;
+	/* Ethernet/IPv4 ARP only: htype 1, ptype 0x0800, hlen 6, plen 4 */
+	if (a[0] != 0 || a[1] != 1 || a[2] != 0x08 || a[3] != 0 || a[4] != 6 || a[5] != 4)
+		return -1;
+	__builtin_memcpy(&spa, a + 14, 4);
+	__builtin_memcpy(&tpa, a + 24, 4);
+
+	struct xs_honeypot *own = bpf_map_lookup_elem(&xs_honeypot_v4, &spa);
+
+	if (own && !xs_mac_eq(a + 8, own->mac)) {
+		if (!own->conflict_ns) {
+			own->conflict_ns = now;
+			xs_count(st, XS_CNT_HONEYPOT_CONFLICT, len);
+		}
+		return -1;
+	}
+
+	/* requests only (op 1), never probes or gratuitous ARP */
+	if (a[6] != 0 || a[7] != 1 || spa == 0 || spa == tpa)
+		return -1;
+	struct xs_honeypot *hp = bpf_map_lookup_elem(&xs_honeypot_v4, &tpa);
+
+	/* an interactive decoy is a real address of the box: its kernel answers */
+	if (!hp || hp->conflict_ns || (hp->flags & XS_HP_INTERACT))
+		return -1;
+
+	struct xs_honeypot_hit *h = xs_honeypot_src_of(spa, a + 8, now);
+
+	if (h) {
+		h->arps++;
+		h->last_ns = now;
+		h->last_dst = tpa;
+	}
+
+	/* request -> reply, in place */
+	__u8 req_mac[6];
+
+	__builtin_memcpy(req_mac, a + 8, 6);
+	__builtin_memcpy(eth, req_mac, 6);          /* eth dst = asker */
+	__builtin_memcpy(eth + 6, hp->mac, 6);      /* eth src = honeypot */
+	a[7] = 2;                                   /* op = reply */
+	__builtin_memcpy(a + 8, hp->mac, 6);        /* sender = honeypot */
+	__builtin_memcpy(a + 14, &tpa, 4);
+	__builtin_memcpy(a + 18, req_mac, 6);       /* target = asker */
+	__builtin_memcpy(a + 24, &spa, 4);
+	xs_count(st, XS_CNT_HONEYPOT_ARP, len);
+	return XDP_TX;
+}
+
+/*
+ * An IPv4 packet to a honeypot address: record its source and drop it. When
+ * the honeypot has XS_HP_BLOCK, a source that sends TCP or UDP to it is
+ * scan-blocked from the internal network (enforced by XS_CFG_SCAN_BLOCK, which
+ * never touches traffic to the box itself or to the internet). ICMP alone never
+ * blocks: a router's DHCP "is this address free?" ping must not get it blocked,
+ * and neither does a registered upstream router.
+ */
+static __always_inline int xs_honeypot_ip(struct xs_stats *st, void *data, void *data_end,
+					  const struct xs_pkt *p, const struct xs_config *cfg, __u64 now, __u64 len)
+{
+	__be32 dst = p->daddr.v4;
+	struct xs_honeypot *hp = bpf_map_lookup_elem(&xs_honeypot_v4, &dst);
+	__u8 *eth = data;
+
+	if (!hp || hp->conflict_ns || (void *)(eth + 14) > data_end)
+		return -1;
+
+	__be32 src = p->saddr.v4;
+	struct xs_honeypot_hit *h = xs_honeypot_src_of(src, eth + 6, now);
+
+	xs_count(st, XS_CNT_HONEYPOT_HIT, len);
+	if (!h)
+		return XDP_DROP;
+	h->packets++;
+	h->last_ns = now;
+	h->last_dst = dst;
+	h->last_proto = p->l4_proto;
+	h->last_dport = p->l4_parsed && (p->l4_proto == XS_IPPROTO_TCP || p->l4_proto == XS_IPPROTO_UDP) ? p->dport : 0;
+
+	if ((hp->flags & XS_HP_BLOCK) && h->last_dport && !h->blocked &&
+	    !(cfg && cfg->lifeline_v4 && src == cfg->lifeline_v4) && !xs_upstream_router(data, data_end)) {
+		__u64 block = (__u64)(cfg && cfg->scan_block_s ? cfg->scan_block_s : XS_SCAN_DEFAULT_BLOCK_S) * 1000000000ULL;
+		struct xs_scan *s = bpf_map_lookup_elem(&xs_scan_v4, &src);
+
+		if (s) {
+			s->blocked_until_ns = now + block;
+		} else {
+			struct xs_scan n = {};
+
+			n.window_ns = now;
+			n.blocked_until_ns = now + block;
+			bpf_map_update_elem(&xs_scan_v4, &src, &n, BPF_ANY);
+		}
+		h->blocked = 1;
+		xs_count(st, XS_CNT_SCAN_DETECTED, len);
+	}
+	/* Interactive decoy: let the fake logins (SSH 22, telnet 23, web 80) and
+	 * ping through to the box, which owns the address; drop everything else so
+	 * the box's real services never show up behind the decoy. */
+	if (hp->flags & XS_HP_INTERACT) {
+		__u16 dp = xs_ntohs_bounded(p->dport);
+
+		if (p->l4_proto == 1 /* ICMP */ ||
+		    (p->l4_parsed && p->l4_proto == XS_IPPROTO_TCP && (dp == 22 || dp == 23 || dp == 80))) {
+			xs_count(st, XS_CNT_HONEYPOT_PASS, len);
+			return XDP_PASS;
+		}
+	}
+	return XDP_DROP;
+}
+
+/* ---- LAN guard (struct xs_languard) ---- */
+
+/*
+ * ARP that claims a bound address (router, box, approved device) from a
+ * different MAC: someone is trying to become the man in the middle. Recorded
+ * per {address, MAC}; dropped when the binding has XS_BIND_DROP. Returns
+ * XDP_DROP or -1 (carry on).
+ */
+static __always_inline int xs_arp_guard(struct xs_stats *st, void *data, void *data_end,
+					const struct xs_pkt *p, __u64 now, __u64 len)
+{
+	__u8 *a = (__u8 *)data + 14 + 4 * (p->vlan_depth & 3);
+	struct xs_spoof_key k = {};
+
+	if ((void *)(a + 28) > data_end)
+		return -1;
+	if (a[0] != 0 || a[1] != 1 || a[2] != 0x08 || a[3] != 0 || a[4] != 6 || a[5] != 4)
+		return -1;
+	__builtin_memcpy(&k.ip, a + 14, 4);
+	if (k.ip == 0)
+		return -1; /* address probe (RFC 5227): claims nothing */
+
+	struct xs_arp_bind *b = bpf_map_lookup_elem(&xs_arp_bind, &k.ip);
+
+	if (!b || xs_mac_eq(a + 8, b->mac))
+		return -1;
+	__builtin_memcpy(k.mac, a + 8, 6);
+	struct xs_spoof *sp = bpf_map_lookup_elem(&xs_arp_spoof, &k);
+
+	if (sp) {
+		sp->last_ns = now;
+		sp->frames++;
+	} else {
+		struct xs_spoof n = { .first_ns = now, .last_ns = now, .frames = 1 };
+
+		bpf_map_update_elem(&xs_arp_spoof, &k, &n, BPF_ANY);
+		sp = bpf_map_lookup_elem(&xs_arp_spoof, &k);
+	}
+	xs_count(st, XS_CNT_ARP_SPOOF, len);
+	if (b->flags & XS_BIND_DROP) {
+		if (sp)
+			sp->dropped++;
+		return XDP_DROP;
+	}
+	return -1;
+}
+
+/*
+ * New-device approval. An IP packet from a MAC that is not approved is
+ * recorded (watch mode) and, in enforce mode, dropped -- except DHCP (so it can
+ * get an address), ICMPv6 (neighbour discovery) and anything to the box itself.
+ * Returns XDP_DROP or -1.
+ */
+static __always_inline int xs_nac(struct xs_stats *st, void *data, void *data_end,
+				  const struct xs_pkt *p, const struct xs_languard *lg, __u64 now, __u64 len)
+{
+	struct xs_mac_key k = {};
+
+	if ((void *)((__u8 *)data + 12) > data_end)
+		return -1;
+	__builtin_memcpy(k.addr, (__u8 *)data + 6, 6);
+	if (bpf_map_lookup_elem(&xs_nac_mac, &k))
+		return -1;
+
+	struct xs_nac_seen *s = bpf_map_lookup_elem(&xs_nac_seen, &k);
+
+	if (!s) {
+		struct xs_nac_seen n = { .first_ns = now };
+
+		bpf_map_update_elem(&xs_nac_seen, &k, &n, BPF_ANY);
+		s = bpf_map_lookup_elem(&xs_nac_seen, &k);
+	}
+	if (s) {
+		s->packets++;
+		s->last_ns = now;
+		if (p->l3 == XS_L3_IPV4 && p->saddr.v4)
+			s->ip = p->saddr.v4;
+	}
+	if (lg->nac != XS_NAC_ENFORCE)
+		return -1;
+	if (p->l4_parsed && p->l4_proto == XS_IPPROTO_UDP &&
+	    (xs_ntohs_bounded(p->dport) == 67 || xs_ntohs_bounded(p->dport) == 68))
+		return -1;
+	if (p->l3 == XS_L3_IPV6 && p->l4_proto == 58)
+		return -1;
+	if (p->l3 == XS_L3_IPV4 && lg->lifeline && p->daddr.v4 == lg->lifeline)
+		return -1;
+	if (s)
+		s->dropped++;
+	xs_count(st, XS_CNT_NAC_DROP, len);
+	return XDP_DROP;
+}
+
+/* ---- Attack signatures (struct xs_sig_key / xs_sig_rule) ---- */
+
+/* Count a dropped packet by its shape (called on the 1-in-16 drop sample). */
+static __always_inline void xs_sig_note(const struct xs_pkt *p, __u64 len)
+{
+	struct xs_sig_key k = {};
+	struct xs_sig_count *c;
+
+	k.proto = p->l4_proto;
+	k.ttl = p->ttl;
+	k.len64 = len / 64 > 255 ? 255 : (__u8)(len / 64);
+	if (p->l4_parsed && (p->l4_proto == XS_IPPROTO_TCP || p->l4_proto == XS_IPPROTO_UDP)) {
+		k.dport = p->dport;
+		k.sport = p->sport;
+		if (p->l4_proto == XS_IPPROTO_TCP)
+			k.tcp_flags = p->tcp_flags;
+	} else if (p->l4_parsed) {
+		/* ICMP / ICMPv6: type and code ride in dport */
+		k.dport = bpf_htons(((__u16)p->icmp_type << 8) | p->icmp_code);
+	}
+	c = bpf_map_lookup_elem(&xs_sig_seen, &k);
+	if (c) {
+		__sync_fetch_and_add(&c->packets, 1);
+		__sync_fetch_and_add(&c->bytes, len);
+	} else {
+		struct xs_sig_count n = { .packets = 1, .bytes = len };
+
+		bpf_map_update_elem(&xs_sig_seen, &k, &n, BPF_ANY);
+	}
+}
+
+/* True when an approved signature rule matches (and counts the hit). */
+static __always_inline int xs_sig_match(const struct xs_pkt *p, __u64 len)
+{
+	const __u32 zero = 0;
+	__u32 *on = bpf_map_lookup_elem(&xs_sig_on, &zero);
+
+	if (!on || !*on)
+		return 0;
+	for (__u32 i = 0; i < XS_SIG_RULES; i++) {
+		struct xs_sig_rule *r = bpf_map_lookup_elem(&xs_sig_rules, &i);
+
+		if (!r || !r->on)
+			continue;
+		if ((r->match & XS_SIG_PROTO) && r->proto != p->l4_proto)
+			continue;
+		if ((r->match & XS_SIG_DPORT) && (!p->l4_parsed || r->dport != p->dport))
+			continue;
+		if ((r->match & XS_SIG_SPORT) && (!p->l4_parsed || r->sport != p->sport))
+			continue;
+		if ((r->match & XS_SIG_FLAGS) && (p->tcp_flags & r->flags_mask) != r->tcp_flags)
+			continue;
+		if ((r->match & XS_SIG_LEN) && (len < r->len_lo || len > r->len_hi))
+			continue;
+		if ((r->match & XS_SIG_TTL) && (p->ttl < r->ttl_lo || p->ttl > r->ttl_hi))
+			continue;
+		__sync_fetch_and_add(&r->hits, 1);
+		return 1;
+	}
+	return 0;
+}
+
 /* True when the destination is under default-deny (listed in xs_protected_v4). */
 static __always_inline int xs_is_protected(const struct xs_pkt *p)
 {
@@ -432,8 +739,30 @@ int xs_xdp_main(struct xdp_md *ctx)
 	 * reaches the IP-only stages below, so this is its only guard. */
 	int arp_drop = rc == XS_PARSE_NOT_IP && pkt.eth_proto == bpf_htons(XS_ETH_P_ARP) &&
 		       xs_arp_rl_drop(now);
+	/* Honeypot addresses: decided ahead of the policy stage so even trusted
+	 * sources are recorded (nothing legitimate ever talks to them). */
+	int honey = -1;
+	__u32 *hp_on = bpf_map_lookup_elem(&xs_honeypot_on, &zero);
+	/* LAN guard: ARP spoofing and new-device approval, ahead of everything
+	 * that trusts LAN addresses. */
+	int guard = -1;
+	const struct xs_languard *lg = bpf_map_lookup_elem(&xs_languard_cfg, &zero);
 
-	if (!arp_drop && (flags & (XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT)))
+	if (lg && !arp_drop) {
+		if (lg->bindings && rc == XS_PARSE_NOT_IP && pkt.eth_proto == bpf_htons(XS_ETH_P_ARP))
+			guard = xs_arp_guard(st, data, data_end, &pkt, now, len);
+		else if (lg->nac && rc == XS_PARSE_OK && (pkt.l3 == XS_L3_IPV4 || pkt.l3 == XS_L3_IPV6))
+			guard = xs_nac(st, data, data_end, &pkt, lg, now, len);
+	}
+
+	if (hp_on && *hp_on && !arp_drop && guard < 0) {
+		if (rc == XS_PARSE_NOT_IP && pkt.eth_proto == bpf_htons(XS_ETH_P_ARP))
+			honey = xs_honeypot_arp(st, data, data_end, &pkt, now, len);
+		else if (rc == XS_PARSE_OK && pkt.l3 == XS_L3_IPV4)
+			honey = xs_honeypot_ip(st, data, data_end, &pkt, cfg, now, len);
+	}
+
+	if (!arp_drop && guard < 0 && honey < 0 && (flags & (XS_CFG_CHECK_ALLOW | XS_CFG_CHECK_POLICY | XS_CFG_RATELIMIT)))
 		decision = xs_policy_stage(st, &pkt, flags, &rl, now, len,
 					   (flags & XS_CFG_CHECK_ALLOW) ? xs_upstream_router(data, data_end) : NULL);
 
@@ -445,6 +774,10 @@ int xs_xdp_main(struct xdp_md *ctx)
 	if (arp_drop) {
 		xs_count(st, XS_CNT_ARP_RATE_LIMITED, len);
 		verdict = XDP_DROP;
+	} else if (guard >= 0) {
+		verdict = guard;
+	} else if (honey >= 0) {
+		verdict = honey;
 	} else if (decision == XS_POL_PASS)
 		verdict = XDP_PASS;
 	else if (decision == XS_POL_DROP)
@@ -485,6 +818,15 @@ int xs_xdp_main(struct xdp_md *ctx)
 		 * is spent only on the ambiguous volumetric remainder.
 		 */
 		verdict = xs_validity_verdict(rc, &pkt, flags);
+		/*
+		 * Attack signatures the operator approved (from an earlier attack's
+		 * dominant packet shape): matching traffic from outside is dropped at
+		 * once, before the risk ladder has to climb. Exempt sources never.
+		 */
+		if (verdict != XDP_DROP && !exempt && rc == XS_PARSE_OK && xs_sig_match(&pkt, len)) {
+			xs_count(st, XS_CNT_SIG_DROP, len);
+			verdict = XDP_DROP;
+		}
 		/*
 		 * Scan detection: a source probing many internal targets is cut off from
 		 * the internal network for a while. Runs for allowlist-exempt LAN sources
@@ -536,7 +878,10 @@ int xs_xdp_main(struct xdp_md *ctx)
 		}
 	}
 
-	xs_count(st, verdict == XDP_DROP ? XS_CNT_VERDICT_DROP : XS_CNT_VERDICT_PASS, len);
+	xs_count(st, verdict == XDP_DROP ? XS_CNT_VERDICT_DROP :
+		     verdict == XDP_TX ? XS_CNT_VERDICT_TX : XS_CNT_VERDICT_PASS, len);
+	if (verdict == XDP_TX)
+		return XDP_TX; /* a honeypot ARP reply: nothing more to account */
 
 	/*
 	 * Per-destination victim accounting. Only on a drop (so an un-attacked
@@ -553,6 +898,8 @@ int xs_xdp_main(struct xdp_md *ctx)
 	 * was just incremented, so its low nibble cycles 0..15 across drops.)
 	 */
 	if (verdict == XDP_DROP && (st->c[XS_CNT_VERDICT_DROP].packets & 0xF) == 0) {
+		if (rc == XS_PARSE_OK && (pkt.l3 == XS_L3_IPV4 || pkt.l3 == XS_L3_IPV6))
+			xs_sig_note(&pkt, len);
 		if (pkt.l3 == XS_L3_IPV4) {
 			__be32 dkey = pkt.daddr.v4;
 			struct xs_victim *v = bpf_map_lookup_elem(&xs_victim_v4, &dkey);

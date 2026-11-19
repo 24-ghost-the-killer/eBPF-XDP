@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""xs-simulate: run one attack simulation for the dashboard's Simulator page.
+
+The dashboard (not root) writes a request to
+    /home/test_server/xdp-sentinel-data/simulate.json
+    {"id": "<uuid>", "action": "start", "scenario": "tcp-syn", "duration": 20, "by": "lucas"}
+    {"id": "<uuid>", "action": "stop"}
+and xdp-sentinel-simulate.path runs this as root. It feeds synthetic attack
+packets of the chosen kind straight into the LIVE XDP program with
+BPF_PROG_RUN (the pentest suite's packet builders) -- nothing is sent on the
+wire -- and writes live progress to simulate.status.json, which the page
+polls: packets injected, the risk engine's threat level, which detector fired,
+which mitigations armed, and how long each step took. When the attack stops it
+keeps watching until the system has stood down again (recovery time).
+
+The detector and mitigations react exactly as to a real attack, so for the
+length of a run the real interface gets the same temporary mitigations a real
+attack would arm (the LAN allowlist keeps your own devices exempt).
+
+Finished runs are kept in simulate.history.json (last 200; game runs carry the player), so the Attacks page
+can label the attacks they caused as simulations.
+"""
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import time
+
+DATA = os.environ.get("XS_DATA_DIR", "/home/test_server/xdp-sentinel-data")
+REQ = f"{DATA}/simulate.json"
+STATUS = f"{DATA}/simulate.status.json"
+HISTORY = f"{DATA}/simulate.history.json"
+LOCK = "/run/xs-simulate.lock"
+PENTEST_DIRS = [os.environ.get("XS_PENTEST_DIR", ""), "/usr/lib/xdp-sentinel/pentest"]
+
+# What the page may start: pentest test id -> label shown on the page.
+SCENARIOS = {
+    "tcp-syn": "SYN flood",
+    "tcp-ack": "ACK flood",
+    "tcp-xmas": "XMAS scan flood (bad TCP flags)",
+    "udp-std": "UDP flood",
+    "udp-large": "UDP flood, large packets",
+    "icmp-echo": "Ping flood",
+    "ip-frag": "Fragment flood",
+    "ip-malformed": "Malformed packets",
+    "refl-dns": "DNS amplification",
+    "refl-ntp": "NTP amplification",
+    "refl-memcached": "Memcached amplification",
+    "multi-carpet": "Carpet bombing (many vectors)",
+    "evasion-spoofed-udp": "Spoofed-source UDP flood",
+    "ipv6-icmpv6": "ICMPv6 flood",
+}
+MIN_S, MAX_S = 5, 60
+RECOVERY_S = 45
+
+
+def first_iface():
+    try:
+        for line in open("/etc/xdp-sentinel/config.toml"):
+            s = line.strip()
+            if s.startswith("name") and "=" in s:
+                return s.split("=", 1)[1].strip().split('"')[1]
+    except (OSError, IndexError):
+        pass
+    return "vlan10"
+
+
+def write_json(path, obj):
+    """Atomic, symlink-safe write into the (user-owned) data directory."""
+    fd, tmp = tempfile.mkstemp(dir=DATA, prefix=".sim-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)  # replaces a symlink itself, never its target
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def load_pentest(iface):
+    os.environ["XS_IFACE"] = iface
+    for d in PENTEST_DIRS:
+        if d and os.path.isfile(f"{d}/xdp_pentest.py"):
+            st = os.stat(f"{d}/xdp_pentest.py")
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                sys.exit(f"xs-simulate: {d}/xdp_pentest.py must be root-owned and not group/world-writable")
+            sys.path.insert(0, d)
+            import xdp_pentest  # noqa: E402
+            return xdp_pentest
+    sys.exit("xs-simulate: pentest framework not found (install it to /usr/lib/xdp-sentinel/pentest)")
+
+
+def stop_requested(run_id):
+    r = read_json(REQ) or {}
+    return r.get("action") == "stop" and r.get("id") in (run_id, None, "")
+
+
+def main():
+    req = read_json(REQ)
+    if not req or req.get("action") != "start":
+        return 0
+    scenario = str(req.get("scenario", ""))
+    if scenario not in SCENARIOS:
+        write_json(STATUS, {"state": "error", "id": req.get("id"), "error": f"unknown scenario {scenario!r}"[:120]})
+        return 1
+    try:
+        duration = max(MIN_S, min(MAX_S, int(req.get("duration", 20))))
+    except (TypeError, ValueError):
+        duration = 20
+    run_id = str(req.get("id", ""))[:64]
+    prev = read_json(STATUS) or {}
+    if prev.get("id") == run_id and prev.get("state") in ("done", "stopped", "error"):
+        return 0  # this request already ran (e.g. the unit was re-triggered without a new request)
+
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # a simulation is already running; it reads stop requests itself
+
+    iface = first_iface()
+    pt = load_pentest(iface)
+    tc = next((t for t in pt.suite() if t.test_id == scenario), None)
+    if tc is None:
+        write_json(STATUS, {"state": "error", "id": run_id, "error": f"scenario {scenario} missing from the suite"})
+        return 1
+    errs = [e for e in pt.preflight() if "map pin" not in e]
+    if errs:
+        write_json(STATUS, {"state": "error", "id": run_id, "error": "; ".join(errs)[:300]})
+        return 1
+
+    st = {
+        "state": "running", "id": run_id, "scenario": scenario, "label": SCENARIOS[scenario],
+        "by": str(req.get("by", ""))[:64], "iface": iface, "duration": duration,
+        "player": "".join(ch for ch in str(req.get("player") or "")[:24] if ch.isprintable()).strip() or None,
+        "game": bool(req.get("game")),
+        "started_at": time.time(), "attack_ends_at": time.time() + duration, "ended_at": None,
+        "phase": "attack", "sent": 0, "target_pps": tc.target_pps, "sources": tc.source_distribution,
+        "victim": pt.VICTIM, "live": {}, "timeline": [], "detected_at": None, "classified_at": None,
+        "mitigated_at": None, "recovered_at": None, "types": [], "flags": [], "peak_threat": 0,
+        "peak_pps": 0.0, "dropped": 0, "passed": 0, "error": None,
+    }
+    base = pt.scrape()
+    base_flags = set(base.flags) if base else set()
+    base_drop = base.drop if base else 0.0
+    base_pass = base.passed if base else 0.0
+    srcs = pt.gen_sources(tc.source_distribution, tc.source_count)
+    dsts = pt.gen_dests(tc.destination_distribution, tc.destination_count)
+    fams = tc.families or [tc.attack_family]
+    repeat = max(20, tc.target_pps // 10) if tc.target_pps else 50_000
+    t0 = st["started_at"]
+    i = 0
+    last_poll = last_write = 0.0
+    stopped = False
+
+    def observe(s):
+        el = round(s.t - t0, 2)
+        st["live"] = {"threat": s.threat, "risk": s.risk, "pps": round(s.pps),
+                      "types": sorted(s.det_types), "flags": sorted(s.flags - base_flags)}
+        st["peak_threat"] = max(st["peak_threat"], s.threat)
+        st["peak_pps"] = max(st["peak_pps"], round(s.pps))
+        st["dropped"] = int(s.drop - base_drop)
+        st["passed"] = int(s.passed - base_pass)
+        for ty in s.det_types:
+            if ty not in st["types"]:
+                st["types"].append(ty)
+        for fl in sorted(s.flags - base_flags):
+            if fl not in st["flags"]:
+                st["flags"].append(fl)
+        if st["detected_at"] is None and s.threat >= 2:
+            st["detected_at"] = el
+        if st["classified_at"] is None and s.det_types:
+            st["classified_at"] = el
+        if st["mitigated_at"] is None and (s.flags - base_flags):
+            st["mitigated_at"] = el
+        st["timeline"].append({"t": el, "pps": round(s.pps), "threat": s.threat, "risk": s.risk,
+                               "dropped": st["dropped"]})
+        st["timeline"] = st["timeline"][-400:]
+
+    try:
+        while time.time() - t0 < duration:
+            fam = fams[i % len(fams)]
+            src = pt._rand_ip() if tc.source_distribution == "spoofed" else srcs[i % len(srcs)]
+            err = pt.send_burst(pt._build(fam, src, dsts[i % len(dsts)]), repeat)
+            if err:
+                st["state"], st["error"] = "error", f"inject: {err}"
+                break
+            st["sent"] += repeat
+            i += 1
+            if tc.target_pps:
+                slack = st["sent"] / tc.target_pps - (time.time() - t0)
+                if slack > 0:
+                    time.sleep(min(slack, 0.5))
+            now = time.time()
+            if now - last_poll >= 0.5:
+                last_poll = now
+                s = pt.scrape()
+                if s:
+                    observe(s)
+                if stop_requested(run_id):
+                    stopped = True
+                    break
+            if now - last_write >= 1.0:
+                last_write = now
+                write_json(STATUS, st)
+
+        # attack over: watch the system stand down
+        st["attack_ends_at"] = time.time()
+        st["phase"] = "recovery"
+        while st["state"] == "running" and time.time() - st["attack_ends_at"] < RECOVERY_S:
+            time.sleep(1.0)
+            s = pt.scrape()
+            if s:
+                observe(s)
+                if s.threat == 0 and not (s.flags - base_flags) & pt.ATTACK_FLAGS:
+                    st["recovered_at"] = round(s.t - t0, 2)
+                    break
+            write_json(STATUS, st)
+    except Exception as e:  # keep the page informed whatever happens
+        st["state"], st["error"] = "error", str(e)[:300]
+
+    st["ended_at"] = time.time()
+    if st["state"] == "running":
+        st["state"] = "stopped" if stopped else "done"
+    st["phase"] = "finished"
+    write_json(STATUS, st)
+
+    hist = read_json(HISTORY)
+    hist = hist if isinstance(hist, list) else []
+    hist.append({k: st[k] for k in ("id", "scenario", "label", "by", "player", "game", "duration", "started_at",
+                                    "attack_ends_at", "ended_at", "state", "sent", "detected_at", "classified_at",
+                                    "mitigated_at", "recovered_at", "types", "flags", "peak_threat", "peak_pps", "dropped")})
+    write_json(HISTORY, hist[-200:])
+    return 0
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run as root (it injects into the live XDP program)")
+    sys.exit(main())

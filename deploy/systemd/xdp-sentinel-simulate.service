@@ -1,0 +1,10 @@
+[Unit]
+Description=Run one dashboard attack simulation (BPF_PROG_RUN into the live XDP program)
+After=sentinel-agent.service
+Requires=sentinel-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xs-simulate
+TimeoutStartSec=180
+Nice=5

@@ -1,0 +1,8 @@
+[Unit]
+Description=Load ARP bindings and approved devices into the XDP dataplane
+After=sentinel-agent.service
+Wants=sentinel-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xs-languard-apply

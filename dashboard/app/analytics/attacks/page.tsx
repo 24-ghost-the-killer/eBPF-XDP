@@ -21,6 +21,7 @@ import { AttackGlobe } from '@/components/globe/AttackGlobe'
 import { LivePanel } from '@/components/globe/LivePanel'
 import { flagOf } from '@/lib/country-centroids'
 import { WhyPanel } from '@/components/attacks/Explain'
+import { SignaturePanel } from '@/components/attacks/Signature'
 import { Replay } from '@/components/attacks/Replay'
 import { markLabel, type AttackMark } from '@/lib/attacks'
 
@@ -224,7 +225,7 @@ function Drawer({ a, retentionDays, onClose, onExplore, onMarked }: { a: Episode
               <Badge tone="bad" icon={ShieldAlert}>Attack {new Date(a.start).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}</Badge>
               {archivedOnly && <Badge icon={Archive}>archived</Badge>}
               <Badge tone={blockedTone(a.dropShare)}>{(a.dropShare * 100).toFixed(0)}% blocked</Badge>
-              {a.mark && <Badge>False alarm · {markLabel(a.mark.reason)}</Badge>}
+              {a.mark && <Badge>{a.mark.reason === 'simulation' ? `Simulation · ${a.mark.note ?? ''}` : `False alarm · ${markLabel(a.mark.reason)}`}</Badge>}
             </div>
             <h2 className="mt-2 text-[20px] font-semibold tracking-[-0.02em] text-nd-fg">{vectorsOf(a).map(pretty).slice(0, 3).join(', ')}</h2>
             <p className="mt-1 text-[13px] text-nd-dim">{when(a.start)} · lasted {duration(a.durationSec)}{a.target ? ` · hit ${a.target.label}` : ''}</p>
@@ -242,6 +243,7 @@ function Drawer({ a, retentionDays, onClose, onExplore, onMarked }: { a: Episode
             <Stat label="Peak risk" icon={Gauge} value={`L${a.peakRiskLevel}`} sub={`threat state ${a.peakThreatState}`} />
           </div>
           <WhyPanel a={a} onMarked={onMarked} />
+          <SignaturePanel key={a.id} a={a} />
           {archivedOnly && (
             <div className="flex items-start gap-2 rounded-xl border border-nd-line bg-nd-panel px-4 py-3 text-[12.5px] text-nd-dim">
               <Archive className="mt-0.5 h-4 w-4 shrink-0" />

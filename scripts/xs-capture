@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""xs-capture: record a few packets for the dashboard's packet explainer.
+
+The dashboard writes /home/test_server/xdp-sentinel-data/capture.json
+    {"id": "<uuid>", "count": 30, "filter": "all"|"tcp"|"udp"|"icmp"|"arp"|"dns", "by": "..."}
+and xdp-sentinel-capture.path runs this as root: tcpdump on the interface the
+firewall runs on, at most 50 packets or 20 seconds, headers only (first 128
+bytes of each packet), saved as capture-<id>.pcap next to the request. Only the
+newest 5 captures are kept.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+DATA = os.environ.get("XS_DATA_DIR", "/home/test_server/xdp-sentinel-data")
+FILTERS = {"all": [], "tcp": ["tcp"], "udp": ["udp"], "icmp": ["icmp", "or", "icmp6"], "arp": ["arp"],
+           "dns": ["port", "53"]}
+
+
+def first_iface():
+    try:
+        for line in open("/etc/xdp-sentinel/config.toml"):
+            s = line.strip()
+            if s.startswith("name") and "=" in s and '"' in s:
+                return s.split('"')[1]
+    except OSError:
+        pass
+    return "br0"
+
+
+def main():
+    try:
+        fd = os.open(f"{DATA}/capture.json", os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            req = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    rid = str(req.get("id", ""))
+    if not re.fullmatch(r"[0-9a-f-]{8,40}", rid):
+        return 1
+    out = f"{DATA}/capture-{rid}.pcap"
+    if os.path.exists(out):
+        return 0
+    count = max(1, min(50, int(req.get("count") or 30)))
+    flt = FILTERS.get(str(req.get("filter", "all")), [])
+    tmp = tempfile.mktemp(dir="/run", prefix="xs-capture-", suffix=".pcap")
+    subprocess.run(["timeout", "20", "tcpdump", "-Z", "root", "-i", first_iface(), "-c", str(count), "-s", "128", "-U", "-n",
+                    "-w", tmp, *flt], capture_output=True, timeout=30)
+    if os.path.exists(tmp):
+        fd, t2 = tempfile.mkstemp(dir=DATA, prefix=".cap-")
+        with os.fdopen(fd, "wb") as f, open(tmp, "rb") as src:
+            f.write(src.read())
+        os.chmod(t2, 0o644)
+        os.replace(t2, out)
+        os.unlink(tmp)
+    caps = sorted((f for f in os.listdir(DATA) if f.startswith("capture-") and f.endswith(".pcap")),
+                  key=lambda f: os.path.getmtime(f"{DATA}/{f}"), reverse=True)
+    for old in caps[5:]:
+        os.unlink(f"{DATA}/{old}")
+    return 0
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    sys.exit(main())

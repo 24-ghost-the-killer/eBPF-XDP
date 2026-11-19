@@ -11,6 +11,7 @@ import {
 import { usePoll } from '@/hooks/usePoll'
 import { Panel, Stat, Badge, Empty, btn, type Tone } from '@/components/aa/kit'
 import { useMe } from '@/components/aa/Shell'
+import { LanGuard } from '@/components/devices/LanGuard'
 
 interface Device {
   mac: string; vendor: string | null; name: string | null; note: string | null; known: boolean
@@ -99,6 +100,7 @@ export default function DevicesPage() {
 
   return (
     <div className="space-y-6">
+      <LanGuard onApproved={() => setRev((x) => x + 1)} />
       {fresh.length > 0 && (
         <div className="flex items-start gap-3 rounded-2xl border border-st-warn/30 bg-st-warn/[0.07] px-5 py-3.5">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-st-warn-fg" />

@@ -40,7 +40,7 @@ export const MARK_REASONS: { id: string; label: string; hint: string }[] = [
   { id: 'other', label: 'Something else', hint: 'explain in the note' },
 ]
 export interface AttackMark { reason: string; note?: string; by: string; at: number }
-export const markLabel = (r: string) => MARK_REASONS.find((m) => m.id === r)?.label ?? r
+export const markLabel = (r: string) => (r === 'simulation' ? 'Simulation' : MARK_REASONS.find((m) => m.id === r)?.label ?? r)
 
 export interface Attacker extends Geo { ip: string; scope: string; bytes: number; packets: number; pps: number; bps: number }
 export interface Episode {

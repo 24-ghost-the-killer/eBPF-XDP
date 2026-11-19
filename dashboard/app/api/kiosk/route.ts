@@ -18,7 +18,7 @@ import { audit } from '@/lib/audit'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const KIOSK_FALLBACK = ['overview', 'explore', 'attacks', 'ai', 'ip', 'query'].filter((p) => PAGE_IDS.includes(p))
+const KIOSK_FALLBACK = ['overview', 'explore', 'attacks', 'ai', 'ip', 'query', 'show', 'honeypot', 'uptime', 'game', 'attackers'].filter((p) => PAGE_IDS.includes(p))
 
 function keyMatches(given: string | null): boolean {
   const want = process.env.DASH_KIOSK_KEY || ''

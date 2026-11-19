@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply signature rules (expiry; a reloaded XDP program starts with empty maps)
+
+[Timer]
+OnBootSec=110s
+OnUnitActiveSec=5min
+Unit=xdp-sentinel-rules.service
+
+[Install]
+WantedBy=timers.target

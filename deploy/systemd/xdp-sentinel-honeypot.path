@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply honeypot addresses when the dashboard changes them
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/honeypot.json
+Unit=xdp-sentinel-honeypot.service
+
+[Install]
+WantedBy=multi-user.target

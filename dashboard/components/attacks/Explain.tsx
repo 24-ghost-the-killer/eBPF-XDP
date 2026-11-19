@@ -57,6 +57,9 @@ function MarkControl({ a, onMarked }: { a: Episode; onMarked: (mark: AttackMark 
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  if (a.mark?.reason === 'simulation') {
+    return <span className="rounded-full bg-nd-fill px-2.5 py-1 text-[11.5px] font-medium text-nd-fg-3">Simulation · {a.mark.note}{a.mark.by ? ` · started by ${a.mark.by}` : ''}</span>
+  }
   if (!can('attacks.mark')) {
     return a.mark ? <span className="rounded-full bg-nd-fill px-2.5 py-1 text-[11.5px] font-medium text-nd-dim">False alarm · {markLabel(a.mark.reason)}</span> : null
   }

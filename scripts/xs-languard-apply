@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""xs-languard-apply: load the LAN guard into the dataplane.
+
+Reads (both written by the dashboard, user-owned):
+    /home/test_server/xdp-sentinel-data/languard.json  {"nac": "off"|"watch"|"enforce", "arpGuard": true}
+    /home/test_server/xdp-sentinel-data/devices.json   the device registry; "known": true = approved
+and writes, on every interface the agent runs XDP on (not the Twingate veth):
+  * xs_arp_bind: who owns which address. The router and the box are bound with
+    "drop" (nobody else may ever claim them); approved devices that keep one
+    address are bound "alert only" (a DHCP reshuffle must not cut anyone off).
+  * xs_nac_mac: the approved devices' MACs (+ the router and the box itself).
+  * xs_languard_cfg: number of bindings, approval mode, the box's address.
+
+Enforce mode is refused while fewer than 2 devices are approved (it would cut
+off the whole LAN). Run by xdp-sentinel-languard.path when either file changes,
+and by its timer.
+
+    xs-languard-apply           apply
+    xs-languard-apply --check   print what would change, touch nothing
+"""
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+import time
+
+DATA = os.environ.get("XS_DATA_DIR", "/home/test_server/xdp-sentinel-data")
+PIN_ROOT = os.environ.get("XS_PIN_ROOT", "/sys/fs/bpf/xdp-sentinel")
+CHECK = "--check" in sys.argv
+MODES = {"off": 0, "watch": 1, "enforce": 2}
+
+
+def log(m):
+    print(f"xs-languard-apply: {m}", flush=True)
+
+
+def run(*a, **kw):
+    return subprocess.run(a, capture_output=True, text=True, timeout=15, **kw)
+
+
+def jrun(*a):
+    try:
+        return json.loads(run(*a).stdout or "[]")
+    except ValueError:
+        return []
+
+
+def read_json(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def mac_bytes(m):
+    try:
+        b = bytes(int(x, 16) for x in m.split(":"))
+        return b if len(b) == 6 else None
+    except ValueError:
+        return None
+
+
+def hexb(b):
+    return [f"{x:02x}" for x in b]
+
+
+def configured_ifaces():
+    names = []
+    try:
+        for line in open("/etc/xdp-sentinel/config.toml"):
+            s = line.strip()
+            if s.startswith("name") and "=" in s and '"' in s:
+                names.append(s.split('"')[1])
+    except OSError:
+        pass
+    return names
+
+
+def dump(path):
+    out = {}
+    for e in jrun("bpftool", "-j", "map", "dump", "pinned", path):
+        out[bytes(int(x, 16) for x in e.get("key", []))] = bytes(int(x, 16) for x in e.get("value", []))
+    return out
+
+
+def sync(path, want, label):
+    """Make a pinned hash map hold exactly `want` {key bytes: value bytes}."""
+    cur = dump(path)
+    changes = 0
+    for k in cur:
+        if k not in want:
+            changes += 1
+            if not CHECK:
+                run("bpftool", "map", "delete", "pinned", path, "key", "hex", *hexb(k))
+    for k, v in want.items():
+        if cur.get(k) != v:
+            changes += 1
+            if not CHECK:
+                r = run("bpftool", "map", "update", "pinned", path, "key", "hex", *hexb(k), "value", "hex", *hexb(v))
+                if r.returncode:
+                    log(f"{label}: bpftool failed: {r.stderr.strip()[:160]}")
+    return changes
+
+
+def main():
+    cfg = read_json(f"{DATA}/languard.json") or {}
+    mode = cfg.get("nac", "off") if cfg.get("nac") in MODES else "off"
+    arp_guard = cfg.get("arpGuard", True) is not False
+    reg = read_json(f"{DATA}/devices.json") or {}
+    devices = reg.get("devices") or {}
+
+    # the box itself and the router
+    br = next((l for l in jrun("ip", "-j", "-4", "addr", "show") if l.get("ifname") == "br0"), None)
+    box_ip = next((a["local"] for a in (br or {}).get("addr_info", []) if a.get("family") == "inet"
+                   and not str(a.get("label", "")).endswith(":hp")), None)
+    box_mac = mac_bytes((br or {}).get("address", ""))
+    gw = next((r.get("gateway") for r in jrun("ip", "-j", "-4", "route", "show", "default") if r.get("dev") == "br0"), None)
+    # The router is "locked" (spoofing it is dropped) only while the box can
+    # still reach it at a known MAC. If that fails -- e.g. the router was
+    # replaced -- the binding is left out, so the new router's ARP gets
+    # through and is learned within one run (5 min timer at the latest).
+    gw_mac = None
+    if gw:
+        for n in jrun("ip", "-j", "neigh", "show", "to", gw):
+            if set(n.get("state", [])) & {"REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"}:
+                gw_mac = mac_bytes(n.get("lladdr", "")) or gw_mac
+        if not gw_mac:
+            log(f"router {gw}: no current MAC in the neighbour table; not locking it this run")
+
+    approved = {}
+    for mac, d in devices.items():
+        b = mac_bytes(mac)
+        if b and d.get("known"):
+            approved[b + b"\0\0"] = (1).to_bytes(4, sys.byteorder)
+    for b in (box_mac, gw_mac):
+        if b:
+            approved[b + b"\0\0"] = (1).to_bytes(4, sys.byteorder)
+    if mode == "enforce" and len(approved) < 3:
+        log(f"enforce refused: only {len(approved)} approved MAC(s) -- that would cut off the LAN; using watch")
+        mode = "watch"
+
+    binds = {}
+    if arp_guard:
+        # approved devices that hold one address and nobody else claims it: alert only
+        owners = {}
+        now = time.time() * 1000
+        for mac, d in devices.items():
+            ips = d.get("ips") or []
+            if d.get("known") and ips and now - (d.get("lastSeen") or 0) < 7 * 86400e3:
+                owners.setdefault(ips[0], []).append(mac)
+        for ip, macs in owners.items():
+            b = mac_bytes(macs[0])
+            if len(macs) == 1 and b:
+                try:
+                    binds[ipaddress.ip_address(ip).packed] = b + bytes([0, 0])
+                except ValueError:
+                    pass
+        for ip, b in ((gw, gw_mac), (box_ip, box_mac)):  # never anyone else: drop
+            if ip and b:
+                binds[ipaddress.ip_address(ip).packed] = b + bytes([1, 0])
+
+    skip = set()
+    tg = read_json("/var/lib/xdp-sentinel/twingate.applied.json") or {}
+    if tg.get("veth"):
+        skip.add(tg["veth"])
+    dirs = [d for d in configured_ifaces() if d not in skip and os.path.exists(f"{PIN_ROOT}/{d}/xs_languard_cfg")]
+    if not dirs:
+        log("no dataplane with LAN-guard maps (old XDP object?); nothing to do")
+        return 0
+    lifeline = ipaddress.ip_address(box_ip).packed if box_ip else bytes(4)
+    for d in dirs:
+        n1 = sync(f"{PIN_ROOT}/{d}/xs_arp_bind", binds, f"{d} bindings")
+        n2 = sync(f"{PIN_ROOT}/{d}/xs_nac_mac", approved, f"{d} approved")
+        val = len(binds).to_bytes(4, sys.byteorder) + MODES[mode].to_bytes(4, sys.byteorder) + lifeline + bytes(4)
+        if not CHECK:
+            run("bpftool", "map", "update", "pinned", f"{PIN_ROOT}/{d}/xs_languard_cfg", "key", "hex", "00", "00", "00", "00",
+                "value", "hex", *hexb(val))
+        log(f"{d}: {len(binds)} ARP binding(s), {len(approved)} approved MAC(s), approval mode {mode}"
+            f" ({n1 + n2} change(s)){' (check only)' if CHECK else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0 and not CHECK:
+        sys.exit("run as root (or with --check)")
+    sys.exit(main())

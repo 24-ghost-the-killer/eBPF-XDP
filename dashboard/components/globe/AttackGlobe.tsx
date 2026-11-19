@@ -70,7 +70,7 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   )
 }
 
-export function AttackGlobe({ countries, className, height = 360, selected, onSelect, onShowAttacks, scope = 'all' }: {
+export function AttackGlobe({ countries, className, height = 360, selected, onSelect, onShowAttacks, scope = 'all', bare = false }: {
   countries: GeoCount[]
   className?: string
   height?: number
@@ -81,6 +81,8 @@ export function AttackGlobe({ countries, className, height = 360, selected, onSe
   onShowAttacks?: (c: GeoCount) => void
   /** Wording of the card: totals over every attack, one attack, or live rates (packets = packets/s, bytes = bytes/s). */
   scope?: 'all' | 'attack' | 'live'
+  /** Just the globe: no hint line, zoom buttons or details card (Show mode). */
+  bare?: boolean
 }) {
   const ref = useRef<HTMLDivElement | null>(null)
   const api = useRef<DotGlobeApi | null>(null)
@@ -144,7 +146,7 @@ export function AttackGlobe({ countries, className, height = 360, selected, onSe
         />
       </div>
 
-      {pinsShown === 0 ? (
+      {bare ? null : pinsShown === 0 ? (
         <p className="mt-2 text-center text-[12px] text-nd-dim">No geolocated internet sources yet: attacks so far came from inside the network.</p>
       ) : (
         <>
@@ -213,7 +215,7 @@ export function AttackGlobe({ countries, className, height = 360, selected, onSe
           </div>
         </>
       )}
-      {unplaced > 0 && (
+      {!bare && unplaced > 0 && (
         <p className="mt-2 text-center text-[11px] text-nd-faint">{unplaced} countr{unplaced === 1 ? 'y' : 'ies'} could not be placed on the map.</p>
       )}
     </div>

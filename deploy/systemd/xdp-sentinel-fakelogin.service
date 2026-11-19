@@ -1,0 +1,25 @@
+[Unit]
+Description=Fake SSH/telnet/web logins behind the interactive honeypot decoys
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/bin/xs-fakelogin
+User=nobody
+Group=nogroup
+StateDirectory=xs-fakelogin
+StateDirectoryMode=0755
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

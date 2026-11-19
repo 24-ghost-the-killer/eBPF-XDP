@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""xs-rules-apply: load the approved attack-signature rules into the dataplane.
+
+The dashboard writes /home/test_server/xdp-sentinel-data/rules.json:
+    {"rules": [{"id": "...", "on": true, "proto": 17, "dport": 11211, "sport": 0,
+                "tcp_flags": 0, "flags_mask": 0, "len_lo": 64, "len_hi": 1500,
+                "ttl_lo": 0, "ttl_hi": 255, "match": ["proto", "dport", "len"],
+                "expires_at": 1795000000 | null}, ...]}
+and xdp-sentinel-rules.path runs this as root. Up to 16 rules go into
+xs_sig_rules (slot = order in the file) on every interface the agent runs XDP
+on; expired or switched-off rules are cleared. A rule whose fields did not
+change keeps its hit counter. The timer re-runs it, so expiry is applied.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+DATA = os.environ.get("XS_DATA_DIR", "/home/test_server/xdp-sentinel-data")
+PIN_ROOT = os.environ.get("XS_PIN_ROOT", "/sys/fs/bpf/xdp-sentinel")
+CHECK = "--check" in sys.argv
+BITS = {"proto": 1, "dport": 2, "sport": 4, "flags": 8, "len": 16, "ttl": 32}
+SLOTS = 16
+
+
+def log(m):
+    print(f"xs-rules-apply: {m}", flush=True)
+
+
+def run(*a):
+    return subprocess.run(a, capture_output=True, text=True, timeout=15)
+
+
+def hexb(b):
+    return [f"{x:02x}" for x in b]
+
+
+def num(v, lo, hi, default=0):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def encode(r):
+    """struct xs_sig_rule without the hit counter (16 bytes)."""
+    match = 0
+    for m in r.get("match") or []:
+        match |= BITS.get(m, 0)
+    if not match:
+        return None  # a rule that matches everything is never loaded
+    bo = sys.byteorder
+    return (bytes([1, num(r.get("proto"), 0, 255), num(r.get("tcp_flags"), 0, 255), num(r.get("flags_mask"), 0, 255)])
+            + num(r.get("dport"), 0, 65535).to_bytes(2, "big") + num(r.get("sport"), 0, 65535).to_bytes(2, "big")
+            + num(r.get("len_lo"), 0, 65535).to_bytes(2, bo) + num(r.get("len_hi"), 0, 65535, 65535).to_bytes(2, bo)
+            + bytes([num(r.get("ttl_lo"), 0, 255), num(r.get("ttl_hi"), 0, 255, 255), match, 0]))
+
+
+def configured_ifaces():
+    names = []
+    try:
+        for line in open("/etc/xdp-sentinel/config.toml"):
+            s = line.strip()
+            if s.startswith("name") and "=" in s and '"' in s:
+                names.append(s.split('"')[1])
+    except OSError:
+        pass
+    return names
+
+
+def main():
+    try:
+        fd = os.open(f"{DATA}/rules.json", os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        doc = {"rules": []}
+    except (OSError, ValueError) as e:
+        log(f"rules.json unreadable ({e}); nothing changed")
+        return 1
+    now = time.time()
+    want = []
+    for r in (doc.get("rules") or [])[:SLOTS]:
+        live = r.get("on", True) and not (r.get("expires_at") and float(r["expires_at"]) < now)
+        want.append(encode(r) if live else None)
+    want += [None] * (SLOTS - len(want))
+    active = sum(1 for w in want if w)
+
+    dirs = [d for d in configured_ifaces() if os.path.exists(f"{PIN_ROOT}/{d}/xs_sig_rules")]
+    if not dirs:
+        log("no dataplane with signature maps (old XDP object?); nothing to do")
+        return 0
+    for d in dirs:
+        path = f"{PIN_ROOT}/{d}/xs_sig_rules"
+        changed = 0
+        for i, w in enumerate(want):
+            key = i.to_bytes(4, sys.byteorder)
+            cur = run("bpftool", "-j", "map", "lookup", "pinned", path, "key", "hex", *hexb(key))
+            try:
+                old = bytes(int(x, 16) for x in json.loads(cur.stdout).get("value", []))
+            except ValueError:
+                old = b""
+            body = w or bytes(16)
+            if old[:16] == body:
+                continue  # unchanged: keep the hit counter
+            changed += 1
+            if not CHECK:
+                run("bpftool", "map", "update", "pinned", path, "key", "hex", *hexb(key), "value", "hex", *hexb(body + bytes(8)))
+        if not CHECK:
+            run("bpftool", "map", "update", "pinned", f"{PIN_ROOT}/{d}/xs_sig_on", "key", "hex", "00", "00", "00", "00",
+                "value", "hex", *hexb(active.to_bytes(4, sys.byteorder)))
+        log(f"{d}: {active} rule(s) active ({changed} slot(s) changed){' (check only)' if CHECK else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0 and not CHECK:
+        sys.exit("run as root (or with --check)")
+    sys.exit(main())

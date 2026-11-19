@@ -44,6 +44,19 @@ pub const MAP_SERVICE_V4: &str = "xs_service_v4";
 /// IPv6 twins of the service allowlist maps.
 pub const MAP_PROTECTED_V6: &str = "xs_protected_v6";
 pub const MAP_SERVICE_V6: &str = "xs_service_v6";
+/// Honeypot addresses: the on-switch, the addresses, and every source that touched one.
+pub const MAP_HONEYPOT_ON: &str = "xs_honeypot_on";
+pub const MAP_HONEYPOT_V4: &str = "xs_honeypot_v4";
+pub const MAP_HONEYPOT_SRC: &str = "xs_honeypot_src";
+/// LAN guard: config, ARP bindings, spoof records, approved MACs, unapproved devices seen.
+pub const MAP_LANGUARD: &str = "xs_languard_cfg";
+pub const MAP_ARP_BIND: &str = "xs_arp_bind";
+pub const MAP_ARP_SPOOF: &str = "xs_arp_spoof";
+pub const MAP_NAC_MAC: &str = "xs_nac_mac";
+pub const MAP_NAC_SEEN: &str = "xs_nac_seen";
+/// Attack signatures: drop-shape counts and the approved rules.
+pub const MAP_SIG_SEEN: &str = "xs_sig_seen";
+pub const MAP_SIG_RULES: &str = "xs_sig_rules";
 
 /// Linux IFNAMSIZ including the terminating NUL.
 const IFNAMSIZ: usize = 16;

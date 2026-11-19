@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply the LAN guard when its settings or the device registry change
+
+[Path]
+PathChanged=/home/test_server/xdp-sentinel-data/languard.json
+PathChanged=/home/test_server/xdp-sentinel-data/devices.json
+Unit=xdp-sentinel-languard.service
+
+[Install]
+WantedBy=multi-user.target

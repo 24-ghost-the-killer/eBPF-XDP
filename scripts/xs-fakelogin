@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""xs-fakelogin: fake logins behind the interactive honeypot decoys.
+
+Runs as an unprivileged user (xdp-sentinel-fakelogin.service). Traffic to an
+interactive decoy address is redirected here by xs-honeypot-apply (nftables):
+    decoy:22 -> 2222  SSH  (needs python3-paramiko; without it only the client banner is logged)
+    decoy:23 -> 2323  telnet
+    decoy:80 -> 8081  web login page
+Nothing can actually log in: every attempt is refused after it is written to
+/var/lib/xs-fakelogin/attempts.jsonl (one JSON object per line), which the
+dashboard's Honeypot page reads. Nothing legitimate knows these addresses, so
+every attempt is an attacker, a scanner, or an infected device.
+"""
+import html
+import json
+import os
+import socket
+import socketserver
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = os.environ.get("XS_FAKELOGIN_DIR", "/var/lib/xs-fakelogin")
+LOG = f"{STATE}/attempts.jsonl"
+MAX_LOG = 5 * 1024 * 1024
+LOCK = threading.Lock()
+HOSTNAME = os.environ.get("XS_FAKELOGIN_NAME", "nas-01")
+
+
+def record(service, client, decoy, **kw):
+    e = {"at": time.time(), "service": service, "src": client[0], "src_port": client[1], "decoy": decoy}
+    e.update({k: (v[:200] if isinstance(v, str) else v) for k, v in kw.items()})
+    line = json.dumps(e, ensure_ascii=False) + "\n"
+    with LOCK:
+        try:
+            if os.path.exists(LOG) and os.path.getsize(LOG) > MAX_LOG:
+                os.replace(LOG, LOG + ".1")
+            fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            with os.fdopen(fd, "a") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+
+def decoy_of(sock):
+    try:
+        return sock.getsockname()[0]
+    except OSError:
+        return ""
+
+
+# ---- telnet ---------------------------------------------------------------
+class Telnet(socketserver.BaseRequestHandler):
+    def readline(self, echo=True):
+        buf = b""
+        self.request.settimeout(60)
+        while len(buf) < 200:
+            c = self.request.recv(1)
+            if not c:
+                raise ConnectionError
+            if c == b"\xff":  # telnet option negotiation: skip IAC x y
+                self.request.recv(2)
+                continue
+            if c in (b"\r", b"\n"):
+                if buf:
+                    break
+                continue
+            buf += c
+        return buf.decode("utf-8", "replace").strip()
+
+    def handle(self):
+        decoy = decoy_of(self.request)
+        try:
+            self.request.sendall(f"\r\n{HOSTNAME} login: ".encode())
+            for _ in range(3):
+                user = self.readline()
+                self.request.sendall(b"Password: ")
+                pw = self.readline()
+                record("telnet", self.client_address, decoy, username=user, password=pw)
+                time.sleep(1.5)
+                self.request.sendall(f"\r\nLogin incorrect\r\n{HOSTNAME} login: ".encode())
+        except (OSError, ConnectionError):
+            pass
+
+
+# ---- web ------------------------------------------------------------------
+PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>{name} - Sign in</title>
+<style>body{{font-family:system-ui,sans-serif;background:#eef1f5;display:grid;place-items:center;height:100vh;margin:0}}
+form{{background:#fff;padding:32px 36px;border-radius:10px;box-shadow:0 6px 24px #0002;width:300px}}
+h1{{font-size:18px;margin:0 0 4px}}p{{color:#666;font-size:13px;margin:0 0 18px}}
+input{{width:100%;box-sizing:border-box;padding:9px;margin:6px 0 12px;border:1px solid #ccc;border-radius:6px}}
+button{{width:100%;padding:10px;border:0;border-radius:6px;background:#2563eb;color:#fff;font-weight:600}}
+.e{{color:#b91c1c;font-size:13px}}</style></head><body><form method="post" action="/login">
+<h1>{name}</h1><p>Storage management</p>{err}
+<label>Username<input name="username" autocomplete="username"></label>
+<label>Password<input name="password" type="password" autocomplete="current-password"></label>
+<button>Sign in</button></form></body></html>"""
+
+
+class Web(BaseHTTPRequestHandler):
+    server_version = "nginx"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def page(self, err=""):
+        body = PAGE.format(name=html.escape(HOSTNAME.upper()), err=f'<p class="e">{err}</p>' if err else "").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        record("web", self.client_address, decoy_of(self.connection), path=self.path, agent=self.headers.get("User-Agent", ""))
+        self.page()
+
+    def do_POST(self):
+        n = min(int(self.headers.get("Content-Length") or 0), 4096)
+        form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        record("web", self.client_address, decoy_of(self.connection), username=(form.get("username") or [""])[0],
+               password=(form.get("password") or [""])[0], agent=self.headers.get("User-Agent", ""))
+        time.sleep(1.0)
+        self.page("Wrong username or password.")
+
+
+# ---- ssh ------------------------------------------------------------------
+def ssh_server(port):
+    try:
+        import paramiko
+    except ImportError:
+        paramiko = None
+    keyfile = f"{STATE}/ssh_host_rsa_key"
+    key = None
+    if paramiko:
+        try:
+            key = paramiko.RSAKey(filename=keyfile)
+        except Exception:
+            key = paramiko.RSAKey.generate(2048)
+            key.write_private_key_file(keyfile)
+
+        class Iface(paramiko.ServerInterface):
+            def __init__(self, client, decoy, version):
+                self.client, self.decoy, self.version = client, decoy, version
+
+            def get_allowed_auths(self, username):
+                return "password"
+
+            def check_auth_password(self, username, password):
+                record("ssh", self.client, self.decoy, username=username, password=password, client=self.version)
+                time.sleep(1.0)
+                return paramiko.AUTH_FAILED
+
+            def check_auth_publickey(self, username, key):
+                record("ssh", self.client, self.decoy, username=username, password=None, key=key.get_name(), client=self.version)
+                return paramiko.AUTH_FAILED
+
+    def serve(conn, addr):
+        decoy = decoy_of(conn)
+        conn.settimeout(60)
+        try:
+            if not paramiko:
+                conn.sendall(b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10\r\n")
+                version = conn.recv(256).split(b"\r\n")[0].decode("utf-8", "replace")
+                record("ssh", addr, decoy, client=version, note="banner only (python3-paramiko not installed)")
+                return
+            t = paramiko.Transport(conn)
+            t.local_version = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10"
+            t.add_server_key(key)
+            iface = Iface(addr, decoy, "")
+            t.start_server(server=iface)
+            iface.version = t.remote_version or ""
+            t.accept(30)
+            t.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(32)
+    while True:
+        conn, addr = s.accept()
+        threading.Thread(target=serve, args=(conn, addr), daemon=True).start()
+
+
+class TServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    threading.Thread(target=ssh_server, args=(2222,), daemon=True).start()
+    threading.Thread(target=TServer(("0.0.0.0", 2323), Telnet).serve_forever, daemon=True).start()
+    web = ThreadingHTTPServer(("0.0.0.0", 8081), Web)
+    web.daemon_threads = True
+    print("xs-fakelogin: ssh :2222, telnet :2323, web :8081 (reached only through decoy addresses)", flush=True)
+    web.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+[Unit]
+Description=Record up to 50 packet headers for the dashboard's packet explainer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xs-capture
+TimeoutStartSec=40
